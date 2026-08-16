@@ -414,6 +414,8 @@ async function tick(){
       (s.ssid||'-')+'</b> ('+s.bssid+')'+
       ' &middot; Ethernet: <span class="'+(s.eth?'ok':'bad')+'">'+(s.eth?'verbunden':'kein Link')+
       '</span> &middot; Reconnects: <b>'+s.wifi_disc+'</b>'+
+      (s.wd_probe ? ' &middot; Watchdog-Sonde: <span class="'+(s.wd_probe===1?'ok':'bad')+'">'+
+        (s.wd_probe===1?'Gateway erreicht':'Gateway nicht erreicht')+'</span>' : '')+
       ' &middot; Heap: <b>'+Math.round(s.heap/1024)+' kB</b>'+
       (s.heap_min!==undefined
         ? ' (Tiefststand '+Math.round(s.heap_min/1024)+' kB, DMA '+
@@ -528,7 +530,7 @@ static esp_err_t h_status(httpd_req_t *r) {
   snprintf(buf, sizeof(buf),
     "{\"prov\":%d,\"wifi\":%d,\"eth\":%d,\"rssi\":%d,\"ch\":%u,"
     "\"kbps_up\":%lu,\"kbps_down\":%lu,\"pkt_up\":%lu,\"pkt_down\":%lu,"
-    "\"drop_up\":%lu,\"drop_down\":%lu,\"wifi_disc\":%lu,\"uptime\":%lu,"
+    "\"drop_up\":%lu,\"drop_down\":%lu,\"wifi_disc\":%lu,\"wd_probe\":%u,\"uptime\":%lu,"
     "\"client_mac\":\"%s\",\"client_ip\":\"%s\",\"client_name\":\"%s\","
     "\"ssid\":\"%s\",\"bssid\":\"%s\","
     "\"at\":%d,\"at_s\":%u,\"at_n\":%u,\"at_r\":%u,"
@@ -539,7 +541,7 @@ static esp_err_t h_status(httpd_req_t *r) {
     (unsigned long)st.kbps_eth2wifi, (unsigned long)st.kbps_wifi2eth,
     (unsigned long)st.pkt_eth2wifi,  (unsigned long)st.pkt_wifi2eth,
     (unsigned long)st.drop_eth2wifi, (unsigned long)st.drop_wifi2eth,
-    (unsigned long)st.wifi_disc_count,
+    (unsigned long)st.wifi_disc_count, (unsigned)st.wd_probe,
     (unsigned long)(millis() / 1000), st.client_mac, st.client_ip, st.client_name, st.ssid, st.bssid,
     (int)bridge_autotune_state(), bridge_autotune_schritt(),
     bridge_autotune_anzahl(), bridge_autotune_ergebnis(),
