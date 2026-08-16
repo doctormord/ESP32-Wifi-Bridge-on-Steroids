@@ -22,6 +22,7 @@
 #include "esp_eth_mac.h"
 #include "esp_eth_phy.h"
 #include "esp_mac.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 
 #include "freertos/FreeRTOS.h"
@@ -139,6 +140,13 @@ static volatile uint32_t s_pkt_e2w = 0, s_pkt_w2e = 0;
 static volatile uint32_t s_drop_e2w = 0, s_drop_w2e = 0;
 static volatile uint64_t s_by_e2w = 0, s_by_w2e = 0;
 static uint32_t s_kbps_e2w = 0, s_kbps_w2e = 0;
+
+/* Fuer den Watchdog (siehe unten) und zur Diagnose im Portal: wie oft die
+ * STA seit dem Boot die Assoziation verloren hat. Reine Reassoziierungs-
+ * Haeufigkeit sagt etwas, das die Drop-Zaehler allein nicht zeigen - naemlich
+ * ob der Funkkanal die Verbindung selbst wegreisst, nicht nur einzelne
+ * Frames verliert. */
+static volatile uint32_t s_wifi_disc_count = 0;
 
 static char s_bssid_str[18] = "-";
 
@@ -394,6 +402,7 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
   } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
     s_wifi_up = false;
     strcpy(s_bssid_str, "-");
+    s_wifi_disc_count = s_wifi_disc_count + 1;
     wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
     printf("[WIFI] Getrennt (reason %d)\n", d ? d->reason : -1);
     if (s_active) esp_wifi_connect();     /* im Betrieb dauerhaft nachfassen */
@@ -1056,11 +1065,78 @@ static void autotune_tick(void) {
 }
 
 /* ===========================================================================
+ * Watchdog
+ *
+ * Ausgangspunkt war ein RF-Stoertest (2,4-GHz-Jammer, ca. 1 Minute aktiv):
+ * die STA blieb laut Treiber verbunden (wifi_up=true, RSSI unauffaellig),
+ * aber die Bruecke stellte kaum noch Pakete zu - Stunden spaeter noch, bis
+ * ein manueller Reboot den Zustand geloest hat. Weder RSSI noch wifi_up
+ * haetten das erkannt; die einzigen Groessen, die den Einbruch zeigten,
+ * waren die Verlustrate im LAN->WLAN-Pfad unter Last und (waere es dazu
+ * gekommen) gehaeufte Reassoziierungen. Beides wird hier pro Zeitfenster
+ * bewertet, mehrere schlechte Fenster hintereinander loesen einen Neustart
+ * aus. Bewusst NICHT erkannt wird ein Stillstand ganz ohne Verkehr (zu wenig
+ * Pakete fuer eine Aussage) - das waeren aktive Sondierungen wert, die diese
+ * Erweiterung (noch) nicht macht.
+ * ========================================================================= */
+
+#define WD_WINDOW_MS           10000u  /* Messfenster                        */
+#define WD_MIN_PAKETE             200u  /* darunter keine Aussage moeglich    */
+#define WD_VERLUST_PROMILLE      150u  /* 15% Verlust im Fenster = "schlecht" */
+#define WD_DISC_JE_FENSTER          4  /* so viele Reconnects im Fenster = "schlecht" */
+#define WD_SCHLECHTE_FENSTER        3  /* so oft hintereinander -> Neustart  */
+
+static uint32_t s_wd_t0 = 0, s_wd_pkt0 = 0, s_wd_drop0 = 0, s_wd_disc0 = 0;
+static uint8_t  s_wd_bad = 0;
+
+static void watchdog_tick(void) {
+  /* Waehrend OTA (s_paused) oder ausserhalb des Bridge-Betriebs keine
+   * Bewertung - ein Neustart mitten im Firmware-Flash waere fatal, und ohne
+   * aktiven Datenpfad sind die Zaehler ohnehin bedeutungslos. */
+  if (!g_cfg.wd_enable || !s_active || s_paused) {
+    s_wd_bad = 0; s_wd_t0 = 0;
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (s_wd_t0 == 0) {
+    s_wd_t0 = now; s_wd_pkt0 = s_pkt_e2w; s_wd_drop0 = s_drop_e2w;
+    s_wd_disc0 = s_wifi_disc_count;
+    return;
+  }
+  if (now - s_wd_t0 < WD_WINDOW_MS) return;
+
+  const uint32_t dp    = s_pkt_e2w - s_wd_pkt0;
+  const uint32_t dd    = s_drop_e2w - s_wd_drop0;
+  const uint32_t ddisc = s_wifi_disc_count - s_wd_disc0;
+  s_wd_t0 = now; s_wd_pkt0 = s_pkt_e2w; s_wd_drop0 = s_drop_e2w;
+  s_wd_disc0 = s_wifi_disc_count;
+
+  bool schlecht = false;
+  if (dp + dd >= WD_MIN_PAKETE) {
+    const uint32_t promille = (1000ULL * dd) / (dp + dd);
+    if (promille >= WD_VERLUST_PROMILLE) schlecht = true;
+  }
+  if (ddisc >= WD_DISC_JE_FENSTER) schlecht = true;
+
+  s_wd_bad = schlecht ? (uint8_t)(s_wd_bad + 1) : 0;
+  printf("[WD  ] Fenster: %u Pakete, %u Verlust, %u Reconnects -> %s (%u/%u)\n",
+         (unsigned)(dp + dd), (unsigned)dd, (unsigned)ddisc,
+         schlecht ? "schlecht" : "ok", (unsigned)s_wd_bad, (unsigned)WD_SCHLECHTE_FENSTER);
+
+  if (s_wd_bad >= WD_SCHLECHTE_FENSTER) {
+    printf("[WD  ] %u schlechte Fenster in Folge - Neustart\n", (unsigned)s_wd_bad);
+    esp_restart();
+  }
+}
+
+/* ===========================================================================
  * Statistik
  * ========================================================================= */
 
 void bridge_tick(void) {
   autotune_tick();
+  watchdog_tick();
 
   static uint32_t last = 0;
   static uint64_t le = 0, lw = 0;
@@ -1084,6 +1160,7 @@ void bridge_get_stats(BridgeStats *o) {
   o->drop_wifi2eth = s_drop_w2e;
   o->kbps_eth2wifi = s_kbps_e2w;
   o->kbps_wifi2eth = s_kbps_w2e;
+  o->wifi_disc_count = s_wifi_disc_count;
   o->eth_link      = s_eth_link;
   o->wifi_up       = s_wifi_up;
   strcpy(o->bssid, s_bssid_str);

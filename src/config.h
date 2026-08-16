@@ -106,6 +106,17 @@ struct BridgeConfig {
   uint8_t  mgmt_ip3[4];
   uint8_t  mgmt_mask3[4];
   uint8_t  mgmt_gw3[4];
+
+  /* --- Watchdog (angehaengt 2026-08-16) ------------------------------------
+   * Nach dem 2,4-GHz-Jammer-Test blieb wifi_up=true und RSSI unauffaellig,
+   * aber die Bruecke stellte kaum noch Pakete zu - erst ein manueller Reboot
+   * hat den haengenden Treiberzustand geloest. Der Watchdog erkennt dieses
+   * Muster (siehe bridge.cpp: hohe Verlustrate LAN->WLAN bzw. haeufige
+   * Reassoziierungen) und startet dann selbststaendig neu.
+   * Default aus: ein automatischer Reboot kann waehrend eines laufenden
+   * OTA-Uploads oder einer gezielten Diagnose unerwuenscht sein - deshalb
+   * ausdruecklich ein Portal-Schalter statt fest einprogrammiert. */
+  uint8_t  wd_enable;          /* 1 = Watchdog aktiv, 0 = aus (Default)      */
 };
 
 extern BridgeConfig g_cfg;
