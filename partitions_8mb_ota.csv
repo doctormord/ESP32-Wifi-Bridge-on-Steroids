@@ -1,0 +1,39 @@
+# ============================================================================
+#  Partitionstabelle fuer WT32-ETH01 mit 8 MB Flash, mit OTA
+# ============================================================================
+#  Ersetzt partitions_2mb_ota.csv. Hintergrund: die Projektnotiz ging von
+#  2 MB Flash aus, das Board hat aber tatsaechlich 8 MB. Am 2026-08-13 direkt
+#  an der Hardware nachgemessen, mit zwei unabhaengigen Verfahren:
+#    - esptool flash-id: Zbit 0x5E, Device 0x4017 - Kapazitaetsbyte 0x17 = 8 MiB
+#    - Aliasing-Test: 0x001000 und 0x401000 liefern verschiedene Daten, ein
+#      4-MB-Chip muesste dort spiegeln
+#
+#  Damit entfaellt der Grund fuer die alten 960-KB-Slots. 3 MB pro Slot sind
+#  beim aktuellen Image (~800 KB) das Vierfache dessen, was gebraucht wird -
+#  das ist bewusst grosszuegig, weil eine Partitionstabelle NICHT per OTA
+#  aenderbar ist. Wer sie spaeter vergroessern will, braucht das Board wieder
+#  am Kabel. Lieber jetzt Luft lassen.
+#
+#    nvs        24 KB  - Konfiguration (BridgeConfig) + WiFi-Kalibrierung
+#    otadata     8 KB  - merkt sich, welcher App-Slot aktiv ist
+#    app0        3 MB  - OTA-Slot 0
+#    app1        3 MB  - OTA-Slot 1
+#    coredump   64 KB  - Absturzabbild, siehe unten
+#    (ab 0x630000 bleiben 1,8 MB unbelegt - Reserve)
+#
+#  Zur Coredump-Partition: Das Board sitzt im Betrieb ohne seriellen Zugang.
+#  Ohne Coredump ist ein Absturz genau eine Information ("es startete neu"),
+#  mit Coredump liegt der Stacktrace im Flash und ist spaeter auslesbar
+#  (esp_core_dump_image_get() bzw. per Kabel mit espcoredump.py). Kostet
+#  64 KB Flash und etwas Code - bei 8 MB kein Thema mehr, bei 2 MB war es
+#  bewusst abgeschaltet.
+#
+#  App-Partitionen muessen auf 64-KB-Grenzen beginnen (MMU-Anforderung) -
+#  daher die Luecke zwischen otadata-Ende (0x11000) und app0-Start (0x20000).
+# ----------------------------------------------------------------------------
+# Name,     Type, SubType,   Offset,   Size,     Flags
+nvs,        data, nvs,       0x9000,   0x6000,
+otadata,    data, ota,       0xF000,   0x2000,
+app0,       app,  ota_0,     0x20000,  0x300000,
+app1,       app,  ota_1,     0x320000, 0x300000,
+coredump,   data, coredump,  0x620000, 0x10000,

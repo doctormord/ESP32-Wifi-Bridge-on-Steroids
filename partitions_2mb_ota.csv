@@ -1,0 +1,25 @@
+# ============================================================================
+#  Partitionstabelle fuer WT32-ETH01 mit 2 MB Flash, mit OTA
+# ============================================================================
+#  Die Espressif-Standardtabellen (min_spiffs.csv, default_16MB.csv etc.)
+#  sind fuer 4 MB+ ausgelegt und passen nicht in 2 MB. Diese Tabelle ist
+#  von Hand auf exakt 2 MB (0x200000 Byte) zugeschnitten:
+#
+#    nvs      24 KB   - Konfiguration (BridgeConfig) + WiFi-Kalibrierung
+#    otadata   8 KB   - merkt sich, welcher App-Slot aktiv ist
+#    app0    960 KB   - OTA-Slot 0
+#    app1    960 KB   - OTA-Slot 1
+#
+#  App-Partitionen muessen auf 64-KB-Grenzen beginnen (mmap-Anforderung der
+#  MMU) - deshalb die Luecke zwischen otadata-Ende (0x11000) und app0-Start
+#  (0x20000). Ergebnis nutzt die 2 MB bis auf das letzte Byte aus.
+#
+#  960 KB pro Slot ist mit lwIP + HTTP-Server + MQTT + WiFi + Ethernet-Treiber
+#  eng, aber machbar. Falls der Build zu gross wird, siehe Kommentar in
+#  platformio.ini unter [env:wt32-eth01].
+# ----------------------------------------------------------------------------
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+otadata,    data, ota,      0xf000,   0x2000,
+app0,       app,  ota_0,    0x20000,  0xF0000,
+app1,       app,  ota_1,    0x110000, 0xF0000,

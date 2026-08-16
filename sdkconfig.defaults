@@ -1,0 +1,188 @@
+# ============================================================================
+#  sdkconfig.defaults  -  abgeleitet aus dem Rust-Original
+# ============================================================================
+
+# --- FreeRTOS ---------------------------------------------------------------
+# FREERTOS_HZ bleibt beim Standard (100 Hz). Die 1000 Hz waren nur fuer das
+# vTaskDelay(1) der alten Flusskontrolle da - die ist raus, weil sie sich als
+# schaedlich erwiesen hat. Ein 10x haeufigerer Scheduler-Tick kostet Rechenzeit
+# im Paketpfad, ohne dass ihn noch jemand braucht. Das Rust-Original hat die
+# Zeile ebenfalls auskommentiert.
+
+# --- Wi-Fi Puffer und Block-Ack-Fenster ------------------------------------
+# DIESE DATEI IST DIE EINZIGE QUELLE FUER DIE PUFFERGROESSEN.
+# bridge.cpp hat die drei Werte frueher zusaetzlich zur Laufzeit in
+# wifi_init_config_t gesetzt - das war nicht "doppelt abgesichert", sondern
+# hat die Kconfig-Werte ueberschrieben und damit jede Erhoehung hier wirkungslos
+# gemacht. Die Zuweisungen sind raus, WIFI_INIT_CONFIG_DEFAULT() liest die
+# Werte von hier.
+#
+# Exakt die Werte des Rust-Originals (16/32/32, RX_BA_WIN=32).
+#
+# Der Umweg dorthin ist lehrreich: Zwischendurch standen hier 24/48/48, in der
+# Annahme "mehr Puffer = weniger Drops". Am 2026-08-13 auf echter Hardware
+# gemessen war das falsch. Eine Erhoehung von DYNAMIC_TX auf 64 riss den freien
+# Heap von 111 kB auf 9 kB und HALBIERTE den Download, weil Sende- und
+# Empfangspuffer um denselben Speicher konkurrieren. Das Original ist mit
+# KLEINEREN Puffern fuenfmal schneller - der Engpass lag nie hier.
+#
+# RX_BA_WIN=32 trotz STATIC_RX=16: die oft zitierte Regel
+# "RX_BA_WIN <= STATIC_RX und <= DYNAMIC_RX/2" wird von der IDF nicht
+# erzwungen, und das Original faehrt seit jeher gut damit. Ein groesseres
+# Block-Ack-Fenster heisst weniger Quittungs-Overhead im Download.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=y
+CONFIG_ESP_WIFI_TX_BA_WIN=32
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
+CONFIG_ESP_WIFI_RX_BA_WIN=32
+
+# --- IRAM-Optimierung -------------------------------------------------------
+# Kritische WiFi-/Ethernet-Pfade ins IRAM statt Flash. Senkt Interrupt-Latenz
+# spuerbar.
+CONFIG_ESP_WIFI_IRAM_OPT=y
+CONFIG_ESP_WIFI_SLP_IRAM_OPT=y
+CONFIG_ESP_WIFI_RX_IRAM_OPT=y
+CONFIG_ESP_WIFI_EXTRA_IRAM_OPT=y
+CONFIG_ETH_IRAM_OPTIMIZATION=y
+
+# --- Ethernet DMA -----------------------------------------------------------
+# Default ist 512 Byte x 10 Puffer.
+# Ein 1514-Byte-Frame belegt damit 3 Deskriptoren. Mit 1522 x 30 passt jedes
+# Frame in genau einen Puffer und es gibt echte Burst-Reserve.
+# Beide zurueck auf die 30 des Originals (2026-08-13). Die Absenkung auf 20
+# war ein Zugestaendnis an lwIP + HTTP-Server + MQTT, mit der Notiz "falls die
+# Drop-Zaehler hochgehen: hier ansetzen" - genau das ist eingetreten.
+CONFIG_ETH_DMA_BUFFER_SIZE=1522
+CONFIG_ETH_DMA_RX_BUFFER_NUM=30
+CONFIG_ETH_DMA_TX_BUFFER_NUM=30
+
+# --- Sonstiges --------------------------------------------------------------
+CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=768
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# CPU auf voller Taktrate, kein Powermanagement
+CONFIG_ESP32_DEFAULT_CPU_FREQ_240=y
+CONFIG_PM_ENABLE=n
+
+# Compiler auf GESCHWINDIGKEIT (2026-08-13).
+# Vorher stand hier OPTIMIZATION_SIZE, weil die Firmware nicht in einen
+# 960-KB-OTA-Slot passte. Dieser Zwang ist entfallen: der Flash hat 8 MB, die
+# Slots je 3 MB, die Belegung liegt bei 26 %. Damit gab es keinen Grund mehr,
+# IDF, lwIP und die WLAN-/Ethernet-Treiber auf Groesse statt Tempo zu
+# uebersetzen - in einem Projekt, dessen einzige Aufgabe Paketdurchsatz ist.
+# Die urspruengliche Annahme im alten Kommentar ("der Datenpfad haengt kaum an
+# dieser Einstellung") war eine Vermutung, keine Messung.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# --- Optional: Logging im Produktivbetrieb abschalten -----------------------
+# Spart etwas CPU und Flash. Zum Debuggen auskommentiert lassen.
+#CONFIG_LOG_DEFAULT_LEVEL_NONE=y
+#CONFIG_LOG_DEFAULT_LEVEL=0
+#CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
+#CONFIG_BOOTLOADER_LOG_LEVEL=0
+
+# --- lwIP / HTTP / MQTT -----------------------------------------------------
+# Der Management-Stack ist bewusst klein gehalten - er bedient nur ein
+# Webinterface und eine MQTT-Verbindung, nicht den Bridge-Verkehr.
+# 8 war zu knapp und hat den Webserver komplett verhindert (am 2026-08-13 auf
+# echter Hardware gesehen: "max_open_sockets is too large (max allowed 5)",
+# danach "[WEB ] Start fehlgeschlagen" - das Board bot das Setup-WLAN an, war
+# darueber aber nicht konfigurierbar).
+# Rechnung: der HTTP-Server belegt 3 Sockets intern PLUS max_open_sockets,
+# und MQTT und DNS wollen auch noch welche. Bei 12 gehen 3+7 an den httpd
+# (web.cpp rechnet sich das selbst aus) und es bleiben 2 uebrig.
+CONFIG_LWIP_MAX_SOCKETS=12
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
+CONFIG_LWIP_TCP_WND_DEFAULT=2880
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+
+# PFLICHT fuer den Management-Zugang von der Ethernet-Seite (siehe eth_rx_cb).
+# Ohne diese Option referenziert wlanif_input() den uebergebenen Puffer nur
+# (PBUF_REF), statt ihn zu kopieren - eth_rx_cb gibt seinen Puffer aber
+# unmittelbar danach frei, und lwIP wuerde auf totem Speicher arbeiten.
+# bridge.cpp hat dazu ein #error, das Abschalten faellt also beim Bauen auf.
+# Die Kopie kostet hier praktisch nichts: durch lwIP laeuft in diesem Entwurf
+# nur Management-Verkehr, der eigentliche Bridge-Strom geht daran vorbei.
+CONFIG_LWIP_L2_TO_L3_COPY=y
+CONFIG_MQTT_TRANSPORT_SSL=n
+CONFIG_MQTT_TRANSPORT_WEBSOCKET=n
+
+# --- OTA mit automatischem Rollback -----------------------------------------
+# Entscheidend fuer ein Board ohne seriellen Zugang: bootet die neue Firmware
+# nicht sauber durch und ruft nie esp_ota_mark_app_valid_cancel_rollback(),
+# faellt der Bootloader beim naechsten Start auf den alten Slot zurueck.
+# Ohne das bedeutet ein misslungenes Update: Board ausbauen.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+CONFIG_BOOTLOADER_WDT_ENABLE=y
+CONFIG_BOOTLOADER_WDT_TIME_MS=9000
+
+# --- Flash-Diaet ------------------------------------------------------------
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n
+
+# Bluetooth wird nirgends benutzt.
+CONFIG_BT_ENABLED=n
+
+# printf/scanf ohne Fliesskomma-Maschinerie. Der Code benutzt ausschliesslich
+# %d/%u/%s/%02x/%lu - kein %f, kein %g, kein %ll. Die volle newlib-Variante
+# zieht _vfprintf_r (11,4 kB), _svfprintf_r (11,2 kB), __ssvfscanf_r (8,7 kB)
+# und _dtoa_r/_strtod_l (6,5 kB) ins Image, also ~35 kB fuer nichts.
+# Falls hier je eine Fliesskommaausgabe dazukommt: Wert wieder auf n, sonst
+# erscheint statt der Zahl nur Buchstabensalat.
+CONFIG_LIBC_NEWLIB_NANO_FORMAT=y
+
+# WPA2-Enterprise (802.1X / EAP) wird hier nie gebraucht - die Bridge haengt
+# an einem WLAN mit normalem PSK. Abschalten wirft den kompletten EAP-Stack
+# raus UND dessen mbedTLS-Abhaengigkeit (TLS-Handshake plus X.509-Parser).
+# Der Kconfig-Hilfetext beziffert das selbst mit rund 60 kB.
+# ACHTUNG: Soll die Bridge je in ein Firmennetz mit 802.1X, muss das zurueck
+# auf y - die esp_wifi_sta_wpa2_ent_*-APIs existieren sonst nicht.
+CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=n
+
+# Kein IPv6. Die Management-Schnittstelle hat eine feste IPv4-Adresse, und der
+# gebridgte Verkehr laeuft als rohe Frames komplett an lwIP vorbei - der Client
+# hinter der Bridge kann also weiterhin ungestoert IPv6 sprechen, das beruehrt
+# diese Einstellung nicht.
+CONFIG_LWIP_IPV6=n
+
+# Die WLAN-Zugangsdaten liegen in unserem eigenen NVS-Blob, und bridge.cpp
+# ruft esp_wifi_set_storage(WIFI_STORAGE_RAM) - die separate WiFi-eigene
+# NVS-Ablage der IDF ist damit toter Code.
+CONFIG_ESP_WIFI_NVS_ENABLED=n
+
+# Asserts bleiben scharf (Absturz statt stillem Weiterlaufen -> der OTA-
+# Rollback greift), aber ohne die eingebetteten Datei- und Zeilen-Strings.
+# Bei einem Board ohne seriellen Zugang liest den Assert-Text ohnehin niemand.
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
+
+# NICHT setzen: CONFIG_MBEDTLS_TLS_DISABLED=y
+# Verlockend, weil im Projekt nirgends TLS laeuft (MQTT im Klartext, Portal
+# per HTTP, OTA roh per POST) und der mbedTLS-Handshake trotzdem rund 30 kB
+# im Image belegt. Getestet am 2026-08-11: bricht beim Linken ab.
+# Grund: die Komponente esp-tls kompiliert esp_tls_mbedtls.c bedingungslos
+# und referenziert mbedtls_ssl_* hart; sie haengt ueber tcp_transport an
+# esp-mqtt. Der Linker kann die Pfade deshalb auch mit --gc-sections nicht
+# wegwerfen. Loesbar waere das nur, indem man esp-mqtt/tcp_transport aus dem
+# Abhaengigkeitsgraph nimmt (also MQTT-Telemetrie opfert) oder eine
+# IDF-Komponente patcht - beides den Platz aktuell nicht wert.
+
+# Coredump ins Flash. Die alte Begruendung fuer "aus" ("koennen wir ohne
+# seriellen Zugang ohnehin nicht auswerten") war ein Trugschluss: gerade
+# WEIL das Board im Betrieb keinen seriellen Zugang hat, ist ein Absturz
+# sonst genau eine Information - "es hat neu gestartet". Mit Coredump liegt
+# der Stacktrace in der dafuer vorgesehenen Partition und ist spaeter
+# auslesbar (esp_core_dump_image_get() im Betrieb, espcoredump.py am Kabel).
+# Abgeschaltet war es urspruenglich wegen der 960-KB-Slots - bei 8 MB Flash
+# und 3-MB-Slots ist das kein Argument mehr.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
+# Nur die abgestuerzte Task sichern statt aller - passt bequem in 64 KB und
+# haelt den Schreibvorgang im Panic-Handler kurz.
+CONFIG_ESP_COREDUMP_MAX_TASKS_NUM=32
+
+# Log-Strings der IDF-Treiber auf WARN. Unsere eigenen printf-Ausgaben sind
+# davon nicht betroffen, die bleiben immer sichtbar.
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+CONFIG_LOG_DEFAULT_LEVEL=2

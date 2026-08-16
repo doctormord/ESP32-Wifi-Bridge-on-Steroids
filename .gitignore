@@ -1,0 +1,21 @@
+# PlatformIO
+.pio/
+
+# Generierter, vollstaendig aufgeloester sdkconfig-Cache.
+# Wird aus sdkconfig.defaults erzeugt; einchecken fuehrt zu genau der Drift,
+# die in docs/content/history.md mehrfach Zeit gekostet hat.
+sdkconfig.wt32-eth01
+sdkconfig.wt32-eth01-minimal
+sdkconfig.*.old
+
+# Build-Artefakte und Vergleichs-Images.
+# Die Rust-Vergleichsfirmware wurde mit einkompilierten WLAN-Zugangsdaten
+# gebaut - gehoert unter keinen Umstaenden in ein oeffentliches Repo.
+vergleich/
+*.bin
+*.elf
+
+# Aus der Arduino-Zeit uebrig, wird nicht mehr gelesen
+dependencies.lock
+
+.DS_Store
