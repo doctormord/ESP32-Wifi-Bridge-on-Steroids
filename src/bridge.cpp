@@ -22,6 +22,7 @@
 #include "esp_eth_mac.h"
 #include "esp_eth_phy.h"
 #include "esp_mac.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 
 #include "freertos/FreeRTOS.h"
@@ -139,6 +140,13 @@ static volatile uint32_t s_pkt_e2w = 0, s_pkt_w2e = 0;
 static volatile uint32_t s_drop_e2w = 0, s_drop_w2e = 0;
 static volatile uint64_t s_by_e2w = 0, s_by_w2e = 0;
 static uint32_t s_kbps_e2w = 0, s_kbps_w2e = 0;
+
+/* Fuer den Watchdog (siehe unten) und zur Diagnose im Portal: wie oft die
+ * STA seit dem Boot die Assoziation verloren hat. Reine Reassoziierungs-
+ * Haeufigkeit sagt etwas, das die Drop-Zaehler allein nicht zeigen - naemlich
+ * ob der Funkkanal die Verbindung selbst wegreisst, nicht nur einzelne
+ * Frames verliert. */
+static volatile uint32_t s_wifi_disc_count = 0;
 
 static char s_bssid_str[18] = "-";
 
@@ -394,6 +402,7 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
   } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
     s_wifi_up = false;
     strcpy(s_bssid_str, "-");
+    s_wifi_disc_count = s_wifi_disc_count + 1;
     wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
     printf("[WIFI] Getrennt (reason %d)\n", d ? d->reason : -1);
     if (s_active) esp_wifi_connect();     /* im Betrieb dauerhaft nachfassen */
@@ -1056,11 +1065,121 @@ static void autotune_tick(void) {
 }
 
 /* ===========================================================================
+ * Watchdog
+ *
+ * Ausgangspunkt war ein RF-Stoertest (2,4-GHz-Jammer, ca. 1 Minute aktiv):
+ * die STA blieb laut Treiber verbunden (wifi_up=true, RSSI unauffaellig),
+ * aber die Bruecke stellte kaum noch Pakete zu - Stunden spaeter noch, bis
+ * ein manueller Reboot den Zustand geloest hat. Weder RSSI noch wifi_up
+ * haetten das erkannt; die einzigen Groessen, die den Einbruch zeigten,
+ * waren die Verlustrate im LAN->WLAN-Pfad unter Last und (waere es dazu
+ * gekommen) gehaeufte Reassoziierungen. Beides wird hier pro Zeitfenster
+ * bewertet, mehrere schlechte Fenster hintereinander loesen einen Neustart
+ * aus.
+ *
+ * Bei zu wenig echtem Verkehr fuer eine Aussage (z.B. Kamera streamt gerade
+ * nicht) waere die Bruecke sonst blind genau fuer den Fall, der den ersten
+ * Vorfall ausgemacht hat: wifi_up blieb durchgehend true, RSSI unauffaellig,
+ * aber Stunden nach dem Stoertest kam kaum noch etwas durch. Deshalb wird in
+ * genau diesem Fall aktiv nachgefragt - ein Ping an das WLAN-Gateway ueber
+ * das Management-Netif (gateway_erreichbar(), sonst nur beim Boot zur
+ * Standorterkennung genutzt). Bewusst NICHT die Kamera selbst: die Bruecke
+ * traegt deren geklonte MAC auf dem STA-Interface, ein ICMP vom
+ * Management-Stack an die Kamera-IP wuerde also eine ARP-Aufloesung auf die
+ * EIGENE MAC ausloesen - ein Rundlauf ueber sich selbst, kein Test von
+ * irgendetwas. Das Gateway zu erreichen, durchlaeuft dagegen denselben
+ * lwIP/Netif/Funk-Pfad, ueber den auch das Management-HTTP laeuft, das beim
+ * Vorfall tatsaechlich unerreichbar war - ein brauchbarer Stellvertreter,
+ * ohne den fragilen Rohframe-Pfad in eth_rx_cb/wifi_rx_cb anzufassen.
+ * ========================================================================= */
+
+#define WD_WINDOW_MS           10000u  /* Messfenster                        */
+#define WD_MIN_PAKETE             200u  /* darunter keine Aussage aus Zaehlern moeglich */
+#define WD_VERLUST_PROMILLE      150u  /* 15% Verlust im Fenster = "schlecht" */
+#define WD_DISC_JE_FENSTER          4  /* so viele Reconnects im Fenster = "schlecht" */
+#define WD_SCHLECHTE_FENSTER        3  /* so oft hintereinander -> Neustart  */
+#define WD_PROBE_BUDGET_MS      1200u  /* Obergrenze fuer die Gateway-Sonde -
+                                        * blockiert bridge_tick() kurzzeitig,
+                                        * siehe Kommentar dort                */
+
+static uint32_t s_wd_t0 = 0, s_wd_pkt0 = 0, s_wd_drop0 = 0, s_wd_disc0 = 0;
+static uint8_t  s_wd_bad = 0;
+static uint8_t  s_wd_probe = 0;   /* 0=nicht noetig/aus, 1=ok, 2=fehlgeschlagen -
+                                   * fuer /api/status, siehe BridgeStats.wd_probe */
+
+/* Aktuell auf dem Management-Netif eingetragenes Gateway auslesen - nicht
+ * erneut aus g_cfg/Profilwahl ableiten (drei moegliche Profile), sondern
+ * direkt beim Netif nachfragen, das nach mgmt_apply_ip() die verbindliche
+ * Quelle ist. */
+static bool wd_gateway_holen(uint8_t gw[4]) {
+  if (!s_mgmt_netif) return false;
+  esp_netif_ip_info_t ip = {};
+  if (esp_netif_get_ip_info(s_mgmt_netif, &ip) != ESP_OK) return false;
+  memcpy(gw, &ip.gw.addr, 4);
+  return gw[0] || gw[1] || gw[2] || gw[3];
+}
+
+static void watchdog_tick(void) {
+  /* Waehrend OTA (s_paused) oder ausserhalb des Bridge-Betriebs keine
+   * Bewertung - ein Neustart mitten im Firmware-Flash waere fatal, und ohne
+   * aktiven Datenpfad sind die Zaehler ohnehin bedeutungslos. */
+  if (!g_cfg.wd_enable || !s_active || s_paused) {
+    s_wd_bad = 0; s_wd_t0 = 0; s_wd_probe = 0;
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (s_wd_t0 == 0) {
+    s_wd_t0 = now; s_wd_pkt0 = s_pkt_e2w; s_wd_drop0 = s_drop_e2w;
+    s_wd_disc0 = s_wifi_disc_count;
+    return;
+  }
+  if (now - s_wd_t0 < WD_WINDOW_MS) return;
+
+  const uint32_t dp    = s_pkt_e2w - s_wd_pkt0;
+  const uint32_t dd    = s_drop_e2w - s_wd_drop0;
+  const uint32_t ddisc = s_wifi_disc_count - s_wd_disc0;
+  s_wd_t0 = now; s_wd_pkt0 = s_pkt_e2w; s_wd_drop0 = s_drop_e2w;
+  s_wd_disc0 = s_wifi_disc_count;
+
+  bool schlecht = false;
+  if (dp + dd >= WD_MIN_PAKETE) {
+    /* Genug echter Verkehr - die Verlustquote entscheidet, keine Sonde
+     * noetig (spart Luftzeit waehrend eines laufenden Streams). */
+    s_wd_probe = 0;
+    const uint32_t promille = (1000ULL * dd) / (dp + dd);
+    if (promille >= WD_VERLUST_PROMILLE) schlecht = true;
+  } else {
+    uint8_t gw[4];
+    if (!wd_gateway_holen(gw)) {
+      s_wd_probe = 0;   /* kein Gateway bekannt - keine Aussage moeglich */
+    } else if (gateway_erreichbar(gw, WD_PROBE_BUDGET_MS)) {
+      s_wd_probe = 1;
+    } else {
+      s_wd_probe = 2;
+      schlecht = true;
+    }
+  }
+  if (ddisc >= WD_DISC_JE_FENSTER) schlecht = true;
+
+  s_wd_bad = schlecht ? (uint8_t)(s_wd_bad + 1) : 0;
+  printf("[WD  ] Fenster: %u Pakete, %u Verlust, %u Reconnects, Sonde=%u -> %s (%u/%u)\n",
+         (unsigned)(dp + dd), (unsigned)dd, (unsigned)ddisc, (unsigned)s_wd_probe,
+         schlecht ? "schlecht" : "ok", (unsigned)s_wd_bad, (unsigned)WD_SCHLECHTE_FENSTER);
+
+  if (s_wd_bad >= WD_SCHLECHTE_FENSTER) {
+    printf("[WD  ] %u schlechte Fenster in Folge - Neustart\n", (unsigned)s_wd_bad);
+    esp_restart();
+  }
+}
+
+/* ===========================================================================
  * Statistik
  * ========================================================================= */
 
 void bridge_tick(void) {
   autotune_tick();
+  watchdog_tick();
 
   static uint32_t last = 0;
   static uint64_t le = 0, lw = 0;
@@ -1084,6 +1203,8 @@ void bridge_get_stats(BridgeStats *o) {
   o->drop_wifi2eth = s_drop_w2e;
   o->kbps_eth2wifi = s_kbps_e2w;
   o->kbps_wifi2eth = s_kbps_w2e;
+  o->wifi_disc_count = s_wifi_disc_count;
+  o->wd_probe      = s_wd_probe;
   o->eth_link      = s_eth_link;
   o->wifi_up       = s_wifi_up;
   strcpy(o->bssid, s_bssid_str);

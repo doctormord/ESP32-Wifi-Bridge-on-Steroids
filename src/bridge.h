@@ -14,6 +14,10 @@ struct BridgeStats {
   uint32_t drop_wifi2eth;
   uint32_t kbps_eth2wifi;     /* gleitend, alle 1 s aktualisiert */
   uint32_t kbps_wifi2eth;
+  uint32_t wifi_disc_count;   /* WIFI_EVENT_STA_DISCONNECTED seit Boot, fuer
+                               * den Watchdog und zur Diagnose im Portal    */
+  uint8_t  wd_probe;          /* Ergebnis der letzten Watchdog-Gateway-Sonde:
+                               * 0=nicht noetig/aus, 1=ok, 2=fehlgeschlagen  */
   int8_t   rssi;
   uint8_t  channel;
   bool     eth_link;

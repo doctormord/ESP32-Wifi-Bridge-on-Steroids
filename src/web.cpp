@@ -301,6 +301,21 @@ button.sec{background:#2f3542;color:var(--fg)}
     <div id="atmsg" style="margin-top:10px;font-size:13px"></div>
   </div>
 
+  <div style="margin-top:14px;padding:12px;background:#232833;border-radius:8px">
+    <b style="font-size:13px">Watchdog</b>
+    <div class="sub" style="margin:4px 0 8px">
+      Erkennt, wenn die Bruecke trotz "verbunden" kaum noch Pakete zustellt
+      (hohe Verlustrate LAN&rarr;WLAN unter Last, oder gehaeufte
+      Reassoziierungen - so wie nach einem 2,4-GHz-Stoertest beobachtet) und
+      startet dann selbststaendig neu. Reagiert bewusst NICHT auf einen
+      Stillstand ganz ohne Verkehr, dafuer fehlt die Datengrundlage.
+    </div>
+    <select id="wd_enable">
+      <option value="0">Aus (Standard)</option>
+      <option value="1">An - bei anhaltendem Paketverlust automatisch neu starten</option>
+    </select>
+  </div>
+
   <div class="tag reboot">&#9679; erst nach NEUSTART wirksam</div>
   <div class="row">
     <div><label>Statische RX-Puffer</label>
@@ -398,7 +413,10 @@ async function tick(){
       ' &middot; Name: <b>'+(s.client_name||'-')+'</b><br>Verbunden mit: <b>'+
       (s.ssid||'-')+'</b> ('+s.bssid+')'+
       ' &middot; Ethernet: <span class="'+(s.eth?'ok':'bad')+'">'+(s.eth?'verbunden':'kein Link')+
-      '</span> &middot; Heap: <b>'+Math.round(s.heap/1024)+' kB</b>'+
+      '</span> &middot; Reconnects: <b>'+s.wifi_disc+'</b>'+
+      (s.wd_probe ? ' &middot; Watchdog-Sonde: <span class="'+(s.wd_probe===1?'ok':'bad')+'">'+
+        (s.wd_probe===1?'Gateway erreicht':'Gateway nicht erreicht')+'</span>' : '')+
+      ' &middot; Heap: <b>'+Math.round(s.heap/1024)+' kB</b>'+
       (s.heap_min!==undefined
         ? ' (Tiefststand '+Math.round(s.heap_min/1024)+' kB, DMA '+
           Math.round(s.heap_dma/1024)+' kB, groesster Block '+
@@ -413,7 +431,7 @@ const CFG=['name','ssid1','ssid2','ssid3','ip','mask','gw','ip2','mask2','gw2','
            'mqtt_host','mqtt_port','mqtt_user','telemetry_s',
            'tx_power','eth_tx_retries','wifi_tx_retries',
            'static_rx_buf','dynamic_rx_buf','dynamic_tx_buf','rx_ba_win',
-           'ht40','no_11b'];
+           'ht40','no_11b','wd_enable'];
 async function load(){
   const c=await(await fetch('/api/config')).json();
   DEF=c.def||null;
@@ -444,7 +462,7 @@ async function save(rb){
     tgt.textContent='Gespeichert. Im Provisionierungsmodus greift noch nichts davon - '
       +'die Werte werden beim ersten Bridge-Start uebernommen.';
   }else{
-    tgt.textContent='Gespeichert. Sendeleistung und Retries sind sofort aktiv - '
+    tgt.textContent='Gespeichert. Sendeleistung, Retries und Watchdog sind sofort aktiv - '
       +'Puffer, Kanalbreite und 802.11b erst nach einem Neustart.';
   }
 }
@@ -512,7 +530,7 @@ static esp_err_t h_status(httpd_req_t *r) {
   snprintf(buf, sizeof(buf),
     "{\"prov\":%d,\"wifi\":%d,\"eth\":%d,\"rssi\":%d,\"ch\":%u,"
     "\"kbps_up\":%lu,\"kbps_down\":%lu,\"pkt_up\":%lu,\"pkt_down\":%lu,"
-    "\"drop_up\":%lu,\"drop_down\":%lu,\"uptime\":%lu,"
+    "\"drop_up\":%lu,\"drop_down\":%lu,\"wifi_disc\":%lu,\"wd_probe\":%u,\"uptime\":%lu,"
     "\"client_mac\":\"%s\",\"client_ip\":\"%s\",\"client_name\":\"%s\","
     "\"ssid\":\"%s\",\"bssid\":\"%s\","
     "\"at\":%d,\"at_s\":%u,\"at_n\":%u,\"at_r\":%u,"
@@ -523,6 +541,7 @@ static esp_err_t h_status(httpd_req_t *r) {
     (unsigned long)st.kbps_eth2wifi, (unsigned long)st.kbps_wifi2eth,
     (unsigned long)st.pkt_eth2wifi,  (unsigned long)st.pkt_wifi2eth,
     (unsigned long)st.drop_eth2wifi, (unsigned long)st.drop_wifi2eth,
+    (unsigned long)st.wifi_disc_count, (unsigned)st.wd_probe,
     (unsigned long)(millis() / 1000), st.client_mac, st.client_ip, st.client_name, st.ssid, st.bssid,
     (int)bridge_autotune_state(), bridge_autotune_schritt(),
     bridge_autotune_anzahl(), bridge_autotune_ergebnis(),
@@ -605,7 +624,7 @@ static esp_err_t h_config_get(httpd_req_t *r) {
     "\"telemetry_s\":%u,"
     "\"tx_power\":%d,\"eth_tx_retries\":%u,\"wifi_tx_retries\":%u,"
     "\"static_rx_buf\":%u,\"dynamic_rx_buf\":%u,\"dynamic_tx_buf\":%u,"
-    "\"rx_ba_win\":%u,\"ht40\":%u,\"no_11b\":%u,"
+    "\"rx_ba_win\":%u,\"ht40\":%u,\"no_11b\":%u,\"wd_enable\":%u,"
     "\"def\":{\"eth_tx_retries\":%u,\"wifi_tx_retries\":%u,"
     "\"static_rx_buf\":%u,\"dynamic_rx_buf\":%u,\"dynamic_tx_buf\":%u,"
     "\"rx_ba_win\":%u}}",
@@ -616,7 +635,7 @@ static esp_err_t h_config_get(httpd_req_t *r) {
      * uebernommen; der "Standardwerte"-Knopf setzt sie zurueck. */
     (int)g_cfg.tx_power, eff.eth_retries, eff.wifi_retries,
     eff.static_rx, eff.dyn_rx, eff.dyn_tx,
-    eff.ba_win, g_cfg.ht40, g_cfg.no_11b,
+    eff.ba_win, g_cfg.ht40, g_cfg.no_11b, g_cfg.wd_enable,
     def.eth_retries, def.wifi_retries,
     def.static_rx, def.dyn_rx, def.dyn_tx, def.ba_win);
 
@@ -738,6 +757,10 @@ static esp_err_t h_config_post(httpd_req_t *r) {
   }
   if (form_get(body, "ht40",   v, sizeof(v))) g_cfg.ht40   = (uint8_t)(atoi(v) ? 1 : 0);
   if (form_get(body, "no_11b", v, sizeof(v))) g_cfg.no_11b = (uint8_t)(atoi(v) ? 1 : 0);
+
+  /* Wirkt sofort - watchdog_tick() liest g_cfg.wd_enable direkt, kein
+   * Neustart noetig, damit "ausschalten" auch sofort greift. */
+  if (form_get(body, "wd_enable", v, sizeof(v))) g_cfg.wd_enable = (uint8_t)(atoi(v) ? 1 : 0);
 
   g_cfg.configured = (g_cfg.ssid1[0] != '\0');
 
