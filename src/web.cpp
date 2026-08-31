@@ -15,6 +15,8 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "esp_heap_caps.h"
+#include "esp_core_dump.h"
+#include "build_info.h"
 
 #define AP_PASSWORD   "bridgesetup"   /* mind. 8 Zeichen, sonst offen */
 
@@ -185,6 +187,12 @@ button.sec{background:#2f3542;color:var(--fg)}
     <div class="m"><div class="k">Kanalbreite</div><div class="v" id="bw">-</div></div>
   </div>
   <div class="sub" style="margin:12px 0 0" id="detail"></div>
+  <div id="cdbox" style="display:none;margin-top:10px;padding:10px;background:rgba(255,107,107,.08);
+       border-radius:8px;border:1px solid rgba(255,107,107,.3)">
+    <b class="bad">Absturz-Abbild vorhanden</b> <span class="hint">letzter unerwarteter Neustart</span>
+    <div id="cdtext" class="sub" style="margin:4px 0 8px"></div>
+    <button class="sec" onclick="cdErase()" style="margin-top:0">Abbild loeschen</button>
+  </div>
 </div>
 
 <div class="card">
@@ -223,7 +231,7 @@ button.sec{background:#2f3542;color:var(--fg)}
   <div class="row"><input id="mqtt_user" placeholder="Benutzer"><input id="mqtt_pass" type="password" placeholder="Passwort"></div>
 
   <label>Telemetrie-Intervall (s)</label><input id="telemetry_s">
-  <label>Admin-Schluessel (schuetzt Firmware-Update, leer = offen)</label>
+  <label>Admin-Schluessel (schuetzt Firmware-Update und Absturz-Abbild, leer = offen)</label>
   <input id="admin_pass" type="password" placeholder="unveraendert lassen = leer">
 
   <button onclick="save(true)">Speichern &amp; neu starten</button>
@@ -421,7 +429,8 @@ async function tick(){
         ? ' (Tiefststand '+Math.round(s.heap_min/1024)+' kB, DMA '+
           Math.round(s.heap_dma/1024)+' kB, groesster Block '+
           Math.round(s.heap_blk/1024)+' kB)'
-        : '');
+        : '')+
+      (s.build ? ' &middot; Build: <b>'+s.build+'</b>' : '');
   }catch(e){}
 }
 /* Ein Feldname pro Eintrag, genau in dieser Reihenfolge auch beim Speichern.
@@ -484,6 +493,27 @@ async function autotune(){
   }catch(e){$('atmsg').textContent='Fehler beim Starten'}
 }
 async function reboot(){await fetch('/api/reboot',{method:'POST'});$('msg').textContent='Neustart...';}
+/* Einmalig beim Laden pruefen, nicht im 2s-Intervall - ein Coredump aendert
+   sich nur nach einem Absturz, staendiges Nachfragen waere reine Last. */
+function cdHeaders(){const h={};if($('okey')&&$('okey').value)h['X-Admin-Key']=$('okey').value;return h}
+async function checkCoredump(){
+  try{
+    const r=await fetch('/api/coredump',{headers:cdHeaders()});
+    if(!r.ok){$('cdbox').style.display='none';return}
+    const j=await r.json();
+    if(!j.present){$('cdbox').style.display='none';return}
+    $('cdbox').style.display='block';
+    $('cdtext').textContent=j.readable===false
+      ? 'Vorhanden, aber nicht lesbar ('+(j.err||'?')+')'
+      : 'Task: '+j.task+' @ '+j.pc+(j.reason?' - '+j.reason:'')+
+        (j.bt&&j.bt.length?' | Backtrace: '+j.bt.join(' '):'')+
+        (j.corrupted?' (Abbild beschaedigt)':'');
+  }catch(e){}
+}
+async function cdErase(){
+  await fetch('/api/coredump',{method:'DELETE',headers:cdHeaders()});
+  $('cdbox').style.display='none';
+}
 function upload(){
   const f=$('fw').files[0];
   if(!f){$('omsg').textContent='Keine Datei gewaehlt';return}
@@ -504,7 +534,7 @@ function upload(){
   $('omsg').textContent='Starte Upload...';
   x.send(f);
 }
-load();tick();setInterval(tick,2000);
+load();tick();checkCoredump();setInterval(tick,2000);
 </script></body></html>)HTML";
 
 /* ===========================================================================
@@ -526,7 +556,7 @@ static esp_err_t h_status(httpd_req_t *r) {
   BridgeStats st;
   bridge_get_stats(&st);
 
-  char buf[576];
+  char buf[608];
   snprintf(buf, sizeof(buf),
     "{\"prov\":%d,\"wifi\":%d,\"eth\":%d,\"rssi\":%d,\"ch\":%u,"
     "\"kbps_up\":%lu,\"kbps_down\":%lu,\"pkt_up\":%lu,\"pkt_down\":%lu,"
@@ -535,7 +565,7 @@ static esp_err_t h_status(httpd_req_t *r) {
     "\"ssid\":\"%s\",\"bssid\":\"%s\","
     "\"at\":%d,\"at_s\":%u,\"at_n\":%u,\"at_r\":%u,"
     "\"heap\":%lu,\"heap_min\":%lu,\"heap_dma\":%lu,\"heap_blk\":%lu,"
-    "\"txp\":%d,\"bw\":%u}",
+    "\"txp\":%d,\"bw\":%u,\"build\":\"" GIT_REV "\"}",
     s_provisioning ? 1 : 0, st.wifi_up ? 1 : 0, st.eth_link ? 1 : 0,
     (int)st.rssi, (unsigned)st.channel,
     (unsigned long)st.kbps_eth2wifi, (unsigned long)st.kbps_wifi2eth,
@@ -841,17 +871,21 @@ static esp_err_t h_scan(httpd_req_t *r) {
  * Update nur aus dem eigenen Netz anzustossen.
  * ========================================================================= */
 
+/* Minimalschutz, gemeinsam fuer Firmware-Update und Coredump-Abruf. Ueber
+ * Klartext-HTTP ist das kein echter Schutz gegen jemanden, der mitliest -
+ * aber es verhindert versehentliches Flashen/Auslesen und Zugriffe von
+ * Geraeten, die den Schluessel nicht kennen. */
+static bool admin_key_ok(httpd_req_t *r) {
+  if (!g_cfg.admin_pass[0]) return true;
+  char key[48] = "";
+  return httpd_req_get_hdr_value_str(r, "X-Admin-Key", key, sizeof(key)) == ESP_OK &&
+         strcmp(key, g_cfg.admin_pass) == 0;
+}
+
 static esp_err_t h_update(httpd_req_t *r) {
-  /* Minimalschutz. Ueber Klartext-HTTP ist das kein echter Schutz gegen
-   * jemanden, der mitliest - aber es verhindert versehentliches Flashen
-   * und Zugriffe von Geraeten, die den Schluessel nicht kennen. */
-  if (g_cfg.admin_pass[0]) {
-    char key[48] = "";
-    if (httpd_req_get_hdr_value_str(r, "X-Admin-Key", key, sizeof(key)) != ESP_OK ||
-        strcmp(key, g_cfg.admin_pass) != 0) {
-      httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "falscher Schluessel");
-      return ESP_FAIL;
-    }
+  if (!admin_key_ok(r)) {
+    httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "falscher Schluessel");
+    return ESP_FAIL;
   }
 
   const esp_partition_t *target = esp_ota_get_next_update_partition(NULL);
@@ -951,6 +985,92 @@ static esp_err_t h_update(httpd_req_t *r) {
 }
 
 /* ===========================================================================
+ * Absturz-Abbild (Coredump)
+ * ---------------------------------------------------------------------------
+ * Das Board haengt ohne seriellen Zugang - ein Absturz war bisher genau eine
+ * Information ("es startete neu"). Die Coredump-Partition (siehe
+ * partitions_8mb_ota.csv) faengt Panic-Grund, betroffenen Task und Backtrace
+ * ab; dieser Endpoint macht sie per HTTP abrufbar statt nur per Kabel.
+ * ========================================================================= */
+
+#if CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH && CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF
+
+static esp_err_t h_coredump_get(httpd_req_t *r) {
+  if (!admin_key_ok(r)) {
+    httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "falscher Schluessel");
+    return ESP_FAIL;
+  }
+
+  httpd_resp_set_type(r, "application/json");
+  httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+
+  /* Nicht esp_core_dump_image_check() fuer die Praesenzpruefung nehmen -
+   * meldet nach dem Loeschen einen anderen Fehler als "nicht vorhanden".
+   * esp_core_dump_image_get() ist auch nicht sauber: der Header-Kommentar
+   * verspricht ESP_ERR_NOT_FOUND nach esp_core_dump_image_erase(), aber die
+   * tatsaechliche Implementierung (core_dump_flash.c) schreibt beim Loeschen
+   * 0xFFFFFFFF als Groessenfeld und liefert dafuer ESP_ERR_INVALID_SIZE -
+   * ESP_ERR_NOT_FOUND gilt dort nur, wenn die Partition selbst fehlt. Am
+   * 2026-08-31 auf echter Hardware verifiziert: nach dem Loeschen kam
+   * tatsaechlich INVALID_SIZE zurueck, nicht NOT_FOUND. Beide zaehlen hier
+   * als "kein Abbild da". */
+  size_t cd_addr = 0, cd_size = 0;
+  esp_err_t ge = esp_core_dump_image_get(&cd_addr, &cd_size);
+  if (ge == ESP_ERR_NOT_FOUND || ge == ESP_ERR_INVALID_SIZE) {
+    return httpd_resp_send(r, "{\"present\":false}", HTTPD_RESP_USE_STRLEN);
+  }
+
+  esp_core_dump_summary_t sum;
+  esp_err_t se = esp_core_dump_get_summary(&sum);
+  if (se != ESP_OK) {
+    /* Vorhanden (Check oben war nicht NOT_FOUND), aber nicht auswertbar -
+     * z.B. beschaedigt. Trotzdem melden, statt so zu tun als gaebe es nichts. */
+    char buf[112];
+    snprintf(buf, sizeof(buf), "{\"present\":true,\"readable\":false,\"err\":\"%s\"}",
+             esp_err_to_name(se));
+    return httpd_resp_send(r, buf, HTTPD_RESP_USE_STRLEN);
+  }
+
+  char reason[200] = "";
+  esp_core_dump_get_panic_reason(reason, sizeof(reason));
+  char reason_esc[410];
+  json_escape(reason, reason_esc, sizeof(reason_esc));
+
+  char task_esc[40];
+  json_escape(sum.exc_task, task_esc, sizeof(task_esc));
+
+  /* Backtrace als Hex-Adressen - mit dem lokalen firmware.elf per
+   * xtensa-esp32-elf-addr2line auf Datei+Zeile aufloesbar. */
+  char bt[400] = "";
+  size_t o = 0;
+  for (uint32_t i = 0; i < sum.exc_bt_info.depth && i < 16 && o + 13 < sizeof(bt); i++) {
+    o += snprintf(bt + o, sizeof(bt) - o, "%s\"0x%08lx\"", i ? "," : "",
+                  (unsigned long)sum.exc_bt_info.bt[i]);
+  }
+
+  char buf[1200];
+  snprintf(buf, sizeof(buf),
+    "{\"present\":true,\"readable\":true,\"corrupted\":%s,"
+    "\"task\":\"%s\",\"pc\":\"0x%08lx\",\"reason\":\"%s\",\"bt\":[%s]}",
+    sum.exc_bt_info.corrupted ? "true" : "false",
+    task_esc, (unsigned long)sum.exc_pc, reason_esc, bt);
+
+  return httpd_resp_send(r, buf, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t h_coredump_delete(httpd_req_t *r) {
+  if (!admin_key_ok(r)) {
+    httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "falscher Schluessel");
+    return ESP_FAIL;
+  }
+  esp_core_dump_image_erase();
+  httpd_resp_set_type(r, "application/json");
+  return httpd_resp_send(r, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+#endif /* CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH && CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF */
+
+/* ===========================================================================
  * Start
  * ========================================================================= */
 
@@ -994,6 +1114,10 @@ bool web_start(bool provisioning) {
     { "/api/autotune",HTTP_POST, h_autotune,    NULL },
     { "/api/scan",    HTTP_GET,  h_scan,        NULL },
     { "/api/update",  HTTP_POST, h_update,      NULL },
+#if CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH && CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF
+    { "/api/coredump",HTTP_GET,    h_coredump_get,    NULL },
+    { "/api/coredump",HTTP_DELETE, h_coredump_delete, NULL },
+#endif
   };
   for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
     httpd_register_uri_handler(s_httpd, &uris[i]);
