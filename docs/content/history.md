@@ -170,3 +170,67 @@ Dabei fiel ein Fehler auf: `tx_power = 0` hiess "nicht anfassen" und stellte den
 ### Kein PSRAM
 
 Bestaetigt: keine SPIRAM-Option aktiv, und GPIO16 ist bei diesem Board die PHY-Stromversorgung — genau der Pin, den PSRAM belegen wuerde. Waere ohnehin nutzlos, WLAN-DMA-Puffer muessen in internem RAM liegen.
+
+## 2026-08-16 — Ins Git ueberfuehrt, WiFi-Watchdog nach Jammer-Test
+
+Das Projekt existierte bis hierhin nur als lokaler Verzeichnisstand; die obigen Eintraege (08-11 bis 08-15) sind rekonstruiert, nicht aus Commits. `b846bea`/`9870e7a` sind der erste Git-Stand ueberhaupt und buendeln alles bisher Beschriebene.
+
+### Kamera im Dauerbetrieb, dann ein 1-Minuten-Jammertest
+
+Zum ersten Mal beobachtet: ein 2,4-GHz-Stoersender, absichtlich nur 1 Minute aktiv, legte den Stream fuer **ueber 5 Stunden** lahm. `/api/status` zeigte die ganze Zeit `wifi_up=true` und einen unauffaelligen RSSI — die Bruecke hielt sich fuer verbunden, stellte aber praktisch keine Pakete mehr zu. Ein manueller `/api/reboot` behob es sofort. Ein zweites, komplett unabhaengiges Kamerasystem an einem anderen Router im selben Gebaeude zeigte im selben Zeitraum dasselbe Symptom — das schliesst die Firmware als alleinige Ursache aus, ohne sie freizusprechen: der Treiber haengt offenbar in einem degradierten Zustand fest, aus dem er sich ohne Neustart nicht selbst loest, und das ist unabhaengig von der konkreten Hardware reproduzierbar.
+
+### Watchdog: explizit portal-schaltbar, nicht als Kompilierschalter
+
+Anforderung von Christian: die Reaktion muss sich **im Portal aktivieren lassen**, nicht als Config-Datei- oder Compiler-Flag — ein Geraet ohne seriellen Zugang darf nicht von einer Einstellung abhaengen, die nur beim naechsten Flash aenderbar ist.
+
+Umgesetzt als neues `wd_enable`-Feld in `BridgeConfig` (angehaengt, per Konvention default 0/aus), ein Portal-Dropdown dafuer, und `watchdog_tick()` in `bridge.cpp` (`b2a0f47`): ein 10-Sekunden-Fenster beobachtet Paketverlust (`LAN->WLAN`-Drop-Quote) und WLAN-Reconnects; drei schlechte Fenster in Folge -> `esp_restart()`. Live umschaltbar, kein Neustart noetig (`h_config_post` ruft `g_cfg.wd_enable` direkt ab).
+
+**Bekannte Luecke beim ersten Entwurf:** das Fenster braucht Mindestverkehr (`WD_MIN_PAKETE`), um eine Verlustquote ueberhaupt berechnen zu koennen — bei nahezu keinem Verkehr (der Jammer-Fall, wenn die Kamera selbst kaum sendet) bleibt der Watchdog blind. Bewusst nicht "geloest" durch einen naiven Timeout auf Nullverkehr, weil das bei einer wirklich ruhigen Szene faelschlich ausloesen wuerde.
+
+### Aktive Gateway-Sonde schliesst die Luecke (`adf396a`)
+
+Wiederverwendet: `gateway_erreichbar()`, bereits vorhanden fuer den einmaligen Standort-Ping beim Boot (`standort_bestimmen()`). Springt ein, wenn im Fenster zu wenig Verkehr floss, um die Verlustquote zu bewerten: pingt das Gateway der Management-IP (`esp_netif_get_ip_info()` -> `gw`), Budget 1200 ms. Erfolglos -> zaehlt als schlechtes Fenster. Ergebnis als `wd_probe` in `BridgeStats` und `/api/status` (`0`=nicht noetig/aus, `1`=ok, `2`=fehlgeschlagen), im Portal als Text neben den Reconnects sichtbar.
+
+Damit deckt der Watchdog beide Faelle ab: hohe Last mit hohem Verlust (passiv erkannt) und nahezu keine Last bei haengendem Treiber (aktiv erfragt).
+
+PR `#1` (dieser Zweig) erst am **2026-08-20** gemerged — vier Tage Verzoegerung zwischen Implementierung und Merge, ohne dass hier festgehalten ist warum.
+
+## 2026-08-31 — Kompletter Ausfall trotz Watchdog, Ursache gefunden, Coredump-Forensik gebaut
+
+### Symptom: Watchdog "greift nicht"
+
+Christian meldete Faelle, in denen die Bruecke komplett unerreichbar wurde — sowohl die Management-IP (`.11`) als auch die gebrueckte Kamera (`.88`) gleichzeitig weg — und **nicht von selbst zurueckkam**, obwohl der Watchdog aus dem 08-16-Eintrag aktiviert war. Einziges verfuegbares Beweismittel: ein Home-Assistant-Graph des freien Heaps und des Durchsatzes, mit mehreren "Nicht verfuegbar"-Luecken ueber zwei Tage.
+
+### Ursache: ein laengst vorhandener, aber unbeachteter Absturzschleifen-Schutz
+
+In `main.cpp` (aus der 08-15-Zeit, nie in `history.md` als eigener Mechanismus vermerkt): nach **drei Boots ohne 60 s stabilen Betrieb** (`BOOT_MAX_FEHLSTARTS=3`, Zaehler im RTC-Speicher) gibt die Firmware bewusst auf und geht in den Provisionierungs-/AP-Modus (`192.168.4.1`) statt weiter Bruecke zu spielen.
+
+Das erklaert das Symptom vollstaendig:
+- Der AP-Modus liegt auf einem komplett anderen Subnetz — deshalb verschwinden `.11` und `.88` gleichzeitig, und Home Assistant (das `/api/status` auf `.11` abfragt) sieht ab da nur noch Luecken.
+- Es gibt **keinen automatischen Weg zurueck** aus dem Portal-Modus — nur manuelles Eingreifen oder ein echter Kaltstart (Stromunterbrechung, der den RTC-Zaehler loescht) helfen.
+- Der WiFi-Watchdog aus dem 08-16-Eintrag kann hier grundsaetzlich nicht greifen: `watchdog_tick()` ist bewusst an `s_active` (aktiver Bruecken-Modus) gebunden, und genau der wird in diesem Fehlerfall nie erreicht bzw. nie 60 s gehalten.
+
+Die eigentliche Ursache — *warum* die Bruecke ueberhaupt dreimal hintereinander innerhalb von 60 s abstuerzt — blieb an diesem Tag ungeklaert. Alle Hardware-Sicherheitsnetze (Task-Watchdog 5 s, Interrupt-Watchdog 300 ms, Brownout-Detector, Panic-Handler mit Reboot) sind korrekt scharf; das Problem ist nicht, dass die Bruecke nicht neu startet, sondern dass niemand sieht, *woran* sie abstuerzt.
+
+### `/api/coredump`: Absturzforensik ohne Kabel
+
+Die Coredump-Partition existierte bereits seit dem 08-13-Eintrag (`CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH`), wurde aber nie ausgelesen. Neuer Endpoint (GET/DELETE `/api/coredump`, admin-key-geschuetzt wie das Firmware-Update) liest `esp_core_dump_get_summary()` und `esp_core_dump_get_panic_reason()` aus: abstuerzender Task, PC, Backtrace, Panic-Grund als JSON. Portal zeigt automatisch eine Warnbox, wenn ein Abbild vorliegt.
+
+Direkt beim ersten Test auf echter Hardware lag tatsaechlich ein altes Abbild im Flash (Task `main`, `assert failed`) — aber die Backtrace-Adressen loesten sich gegen das aktuelle `firmware.elf` zu voellig unzusammenhaengenden Funktionen auf (`rtc_clk_bbpll_configure`, `ieee80211_is_tx_allowed`, `sha_hal_read_digest`, ...). Klassisches Zeichen fuer ein Adress/Build-Mismatch: das Abbild stammte von einer aelteren Firmware-Version, deren `.elf` laengst durch neuere Builds ueberschrieben war. Abbild geloescht, um kuenftige echte Abstuerze nicht mit diesem Altfund zu vermischen.
+
+**Zwei ESP-IDF-Ueberraschungen beim Bau der "leer"-Erkennung**, beide auf echter Hardware verifiziert und nicht aus der Doku ersichtlich:
+- `esp_core_dump_image_check()` liefert nach einem Loeschen NICHT `ESP_ERR_NOT_FOUND`.
+- `esp_core_dump_image_get()` liefert nach einem Loeschen `ESP_ERR_INVALID_SIZE`, nicht das im Header dokumentierte `ESP_ERR_NOT_FOUND` — der geloeschte Header liest als `0xFFFFFFFF` ("blank"), und `esp_core_dump_partition_and_size_get()` (siehe `core_dump_flash.c`) behandelt das als ungueltige Groesse, nicht als "keine Partition". Erst als beide Fehlercodes als "kein Abbild da" behandelt wurden, meldete der Endpoint nach dem Loeschen korrekt `present:false`.
+
+### Build-Archivierung, damit ein kuenftiger Coredump ueberhaupt aufloesbar bleibt
+
+Der Blindflug beim alten Abbild war strukturell: PlatformIO ueberschreibt `firmware.elf` bei jedem Build, und der Worktree des Watchdog-Builds war laengst geloescht. Behoben mit zwei kleinen Ergaenzungen statt einem Kompilierschalter-Trick in `platformio.ini` (dessen Shell-Escaping als zu fehleranfaellig verworfen wurde):
+
+- `scripts/gen_build_info.py`, als PlatformIO-`extra_scripts`-Pre-Build-Hook: schreibt `src/build_info.h` mit dem aktuellen Git-Kurz-Hash (plus `-dirty`-Suffix bei unversionierten Aenderungen). Der Wert landet als `"build"` in `/api/status`.
+- `scripts/ota_flash.sh`: baut, kopiert `firmware.elf` nach `elf_archive/<git-rev>_<utc-timestamp>.elf`, laedt dann per OTA hoch.
+
+Die Zuordnung eines kuenftigen Coredumps zum richtigen archivierten `.elf` stuetzt sich darauf, dass ein Laufzeitabsturz dieselbe OTA-Partition erneut bootet (kein Image-Wechsel) — der `build`-Wert aus `/api/status` zur Abfragezeit stimmt also nur mit dem abgestuerzten Build ueberein, solange dazwischen kein neues OTA-Update kam. Fuer den ueblichen Fall (Absturz, Watchdog/Hardware-Reboot, jemand schaut kurz danach nach) reicht das; nicht abgedeckt ist der seltenere Fall "Coredump liegt schon laenger, inzwischen wurde erneut geflasht" — dafuer muesste zusaetzlich `app_elf_sha256` aus der Coredump-Summary ausgewertet werden (aktuell nicht in der API exponiert, siehe `backlog.md`).
+
+Auf Hardware verifiziert: `build:"3765974-dirty"` in `/api/status` passte exakt zum Dateinamen `elf_archive/3765974-dirty_20260831T205316Z.elf`. Drei OTA-Zyklen insgesamt (Endpoint, Erase-Fix, Build-Archivierung), Bridge und Kamera nach jedem Zyklus gesund verifiziert. PR `#2` selbstaendig gepusht (kein `gh` auf dieser Maschine, kein Merge auf `main` durch die Session selbst — Merge von Christian ueber die GitHub-UI).
+
+**Offen geblieben:** die eigentliche Ursache des Dreifach-Absturzes. Naechstes Vorkommnis sollte ueber `/api/coredump` ausgewertet werden, BEVOR irgendjemand erneut flasht oder das Abbild loescht — sonst wiederholt sich genau der Blindflug von diesem Tag.
