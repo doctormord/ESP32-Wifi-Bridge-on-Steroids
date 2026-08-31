@@ -16,6 +16,7 @@
 #include "esp_wifi.h"
 #include "esp_heap_caps.h"
 #include "esp_core_dump.h"
+#include "build_info.h"
 
 #define AP_PASSWORD   "bridgesetup"   /* mind. 8 Zeichen, sonst offen */
 
@@ -428,7 +429,8 @@ async function tick(){
         ? ' (Tiefststand '+Math.round(s.heap_min/1024)+' kB, DMA '+
           Math.round(s.heap_dma/1024)+' kB, groesster Block '+
           Math.round(s.heap_blk/1024)+' kB)'
-        : '');
+        : '')+
+      (s.build ? ' &middot; Build: <b>'+s.build+'</b>' : '');
   }catch(e){}
 }
 /* Ein Feldname pro Eintrag, genau in dieser Reihenfolge auch beim Speichern.
@@ -554,7 +556,7 @@ static esp_err_t h_status(httpd_req_t *r) {
   BridgeStats st;
   bridge_get_stats(&st);
 
-  char buf[576];
+  char buf[608];
   snprintf(buf, sizeof(buf),
     "{\"prov\":%d,\"wifi\":%d,\"eth\":%d,\"rssi\":%d,\"ch\":%u,"
     "\"kbps_up\":%lu,\"kbps_down\":%lu,\"pkt_up\":%lu,\"pkt_down\":%lu,"
@@ -563,7 +565,7 @@ static esp_err_t h_status(httpd_req_t *r) {
     "\"ssid\":\"%s\",\"bssid\":\"%s\","
     "\"at\":%d,\"at_s\":%u,\"at_n\":%u,\"at_r\":%u,"
     "\"heap\":%lu,\"heap_min\":%lu,\"heap_dma\":%lu,\"heap_blk\":%lu,"
-    "\"txp\":%d,\"bw\":%u}",
+    "\"txp\":%d,\"bw\":%u,\"build\":\"" GIT_REV "\"}",
     s_provisioning ? 1 : 0, st.wifi_up ? 1 : 0, st.eth_link ? 1 : 0,
     (int)st.rssi, (unsigned)st.channel,
     (unsigned long)st.kbps_eth2wifi, (unsigned long)st.kbps_wifi2eth,

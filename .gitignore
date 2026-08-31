@@ -15,6 +15,13 @@ vergleich/
 *.bin
 *.elf
 
+# Von scripts/gen_build_info.py vor jedem Build neu geschrieben.
+src/build_info.h
+
+# Von scripts/ota_flash.sh archivierte firmware.elf-Dateien (siehe *.elf
+# oben - hier nur der Ordner, aus Dokumentationsgruenden explizit).
+elf_archive/
+
 # Aus der Arduino-Zeit uebrig, wird nicht mehr gelesen
 dependencies.lock
 
