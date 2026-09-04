@@ -84,6 +84,11 @@ static void announce_all(void) {
    * das oft die einzige Moeglichkeit herauszufinden, unter welcher Adresse
    * sie zu erreichen ist - die Bridge sieht sie im Datenpfad ohnehin. */
   announce_one("client_ip","IP des Clients",      NULL,  NULL, NULL, "mdi:ip-network");
+  /* Steigt bei jedem Watchdog-Reconnect (Eskalationsstufe 1) - allein die
+   * Tendenz ist das Signal, nicht der Absolutwert. Ein Neustart (Stufe 2)
+   * zaehlt bewusst NICHT als Fehlstart und ist hier NICHT gesondert
+   * sichtbar; der Coredump/das Boot-Log ist dafuer die Quelle. */
+  announce_one("wd_reconnects","Watchdog-Reconnects",NULL, NULL, "total_increasing", "mdi:wifi-refresh");
 
   char topic[160], payload[512];
   snprintf(topic, sizeof(topic),
@@ -152,16 +157,18 @@ void telemetry_tick(void) {
   BridgeStats st;
   bridge_get_stats(&st);
 
-  char payload[420];
+  char payload[460];
   snprintf(payload, sizeof(payload),
     "{\"rssi\":%d,\"ch\":%u,\"kbps_up\":%lu,\"kbps_down\":%lu,"
     "\"pkt_up\":%lu,\"pkt_down\":%lu,\"drop_up\":%lu,\"drop_down\":%lu,"
+    "\"wd_reconnects\":%lu,"
     "\"eth\":%d,\"uptime\":%lu,\"heap\":%lu,\"bssid\":\"%s\","
     "\"client_ip\":\"%s\"}",
     (int)st.rssi, (unsigned)st.channel,
     (unsigned long)st.kbps_eth2wifi, (unsigned long)st.kbps_wifi2eth,
     (unsigned long)st.pkt_eth2wifi,  (unsigned long)st.pkt_wifi2eth,
     (unsigned long)st.drop_eth2wifi, (unsigned long)st.drop_wifi2eth,
+    (unsigned long)st.wd_reconnects,
     st.eth_link ? 1 : 0, (unsigned long)(millis() / 1000),
     (unsigned long)esp_get_free_heap_size(), st.bssid, st.client_ip);
 

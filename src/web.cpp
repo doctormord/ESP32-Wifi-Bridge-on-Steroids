@@ -313,14 +313,16 @@ button.sec{background:#2f3542;color:var(--fg)}
     <b style="font-size:13px">Watchdog</b>
     <div class="sub" style="margin:4px 0 8px">
       Erkennt, wenn die Bruecke trotz "verbunden" kaum noch Pakete zustellt
-      (hohe Verlustrate LAN&rarr;WLAN unter Last, oder gehaeufte
-      Reassoziierungen - so wie nach einem 2,4-GHz-Stoertest beobachtet) und
-      startet dann selbststaendig neu. Reagiert bewusst NICHT auf einen
-      Stillstand ganz ohne Verkehr, dafuer fehlt die Datengrundlage.
+      (hohe Verlustrate LAN&rarr;WLAN unter Last, gehaeufte Reassoziierungen,
+      oder bei wenig Verkehr eine erfolglose Gateway-Sonde) und reagiert
+      zweistufig: <b>erst</b> nur WLAN trennen/neu verbinden (Ethernet und
+      Kamera bleiben unberuehrt), <b>erst wenn das nicht hilft</b> ein voller
+      Neustart mit provoziertem Coredump, damit danach nachvollziehbar ist
+      warum. Beides zaehlt nicht als Fehlstart fuer den Absturzschleifen-Schutz.
     </div>
     <select id="wd_enable">
       <option value="0">Aus (Standard)</option>
-      <option value="1">An - bei anhaltendem Paketverlust automatisch neu starten</option>
+      <option value="1">An - bei anhaltenden Problemen erst WLAN neu verbinden, notfalls neu starten</option>
     </select>
   </div>
 
@@ -424,6 +426,9 @@ async function tick(){
       '</span> &middot; Reconnects: <b>'+s.wifi_disc+'</b>'+
       (s.wd_probe ? ' &middot; Watchdog-Sonde: <span class="'+(s.wd_probe===1?'ok':'bad')+'">'+
         (s.wd_probe===1?'Gateway erreicht':'Gateway nicht erreicht')+'</span>' : '')+
+      (s.wd_reconnects ? ' &middot; Watchdog-Reconnects: <b>'+s.wd_reconnects+'</b>' : '')+
+      (s.wd_last_reason ? ' &middot; letzter Watchdog-Neustart: <span class="bad">'+
+        (['','Verlustquote','Reconnects','Gateway-Sonde'][s.wd_last_reason]||'?')+'</span>' : '')+
       ' &middot; Heap: <b>'+Math.round(s.heap/1024)+' kB</b>'+
       (s.heap_min!==undefined
         ? ' (Tiefststand '+Math.round(s.heap_min/1024)+' kB, DMA '+
@@ -556,11 +561,12 @@ static esp_err_t h_status(httpd_req_t *r) {
   BridgeStats st;
   bridge_get_stats(&st);
 
-  char buf[608];
+  char buf[672];
   snprintf(buf, sizeof(buf),
     "{\"prov\":%d,\"wifi\":%d,\"eth\":%d,\"rssi\":%d,\"ch\":%u,"
     "\"kbps_up\":%lu,\"kbps_down\":%lu,\"pkt_up\":%lu,\"pkt_down\":%lu,"
-    "\"drop_up\":%lu,\"drop_down\":%lu,\"wifi_disc\":%lu,\"wd_probe\":%u,\"uptime\":%lu,"
+    "\"drop_up\":%lu,\"drop_down\":%lu,\"wifi_disc\":%lu,\"wd_probe\":%u,"
+    "\"wd_reconnects\":%lu,\"wd_last_reason\":%u,\"uptime\":%lu,"
     "\"client_mac\":\"%s\",\"client_ip\":\"%s\",\"client_name\":\"%s\","
     "\"ssid\":\"%s\",\"bssid\":\"%s\","
     "\"at\":%d,\"at_s\":%u,\"at_n\":%u,\"at_r\":%u,"
@@ -572,6 +578,7 @@ static esp_err_t h_status(httpd_req_t *r) {
     (unsigned long)st.pkt_eth2wifi,  (unsigned long)st.pkt_wifi2eth,
     (unsigned long)st.drop_eth2wifi, (unsigned long)st.drop_wifi2eth,
     (unsigned long)st.wifi_disc_count, (unsigned)st.wd_probe,
+    (unsigned long)st.wd_reconnects, (unsigned)st.wd_last_reason,
     (unsigned long)(millis() / 1000), st.client_mac, st.client_ip, st.client_name, st.ssid, st.bssid,
     (int)bridge_autotune_state(), bridge_autotune_schritt(),
     bridge_autotune_anzahl(), bridge_autotune_ergebnis(),

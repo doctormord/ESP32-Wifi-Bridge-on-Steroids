@@ -15,6 +15,7 @@
 #include "config.h"
 
 #include <string.h>
+#include <stdlib.h>
 
 #include "esp_attr.h"
 #include "esp_err.h"
@@ -1093,19 +1094,83 @@ static void autotune_tick(void) {
  * ohne den fragilen Rohframe-Pfad in eth_rx_cb/wifi_rx_cb anzufassen.
  * ========================================================================= */
 
-#define WD_WINDOW_MS           10000u  /* Messfenster                        */
+#define WD_WINDOW_MS           20000u  /* Messfenster. War anfangs 10s - zu
+                                        * hektisch fuer eine kurze Schwankung,
+                                        * siehe 2026-09-04 in history.md.     */
 #define WD_MIN_PAKETE             200u  /* darunter keine Aussage aus Zaehlern moeglich */
 #define WD_VERLUST_PROMILLE      150u  /* 15% Verlust im Fenster = "schlecht" */
 #define WD_DISC_JE_FENSTER          4  /* so viele Reconnects im Fenster = "schlecht" */
-#define WD_SCHLECHTE_FENSTER        3  /* so oft hintereinander -> Neustart  */
+#define WD_SCHLECHTE_FENSTER        3  /* so oft hintereinander -> naechste
+                                        * Eskalationsstufe (gilt fuer beide) */
 #define WD_PROBE_BUDGET_MS      1200u  /* Obergrenze fuer die Gateway-Sonde -
                                         * blockiert bridge_tick() kurzzeitig,
                                         * siehe Kommentar dort                */
+
+/*
+ * Zweistufige Eskalation statt direktem esp_restart().
+ *
+ * Ein voller Neustart reisst den Ethernet-MAC/PHY kurz runter - das bringt
+ * die angeschlossene Kamera fuer die Dauer des Boots vom Netz, und je nach
+ * Kamera-Firmware braucht sie danach spuerbar Zeit, um sich zu erholen (am
+ * 2026-09-04 nach einem Portal-Neustart ca. 3 Minuten). Und wichtiger: ein
+ * Neustart repariert keine schlechte Funkumgebung - wenn die Stoerung noch
+ * da ist, scheitert der neue Verbindungsversuch nach dem Reboot genauso wie
+ * ein einfacher Reconnect. Ein Reboot ist also nur dann die richtige
+ * Reaktion, wenn der WLAN-Treiber selbst haengt (wie nach dem Jammer-Test:
+ * die Umgebung war zu dem Zeitpunkt schon wieder gut, nur der Treiber nicht) -
+ * und genau DAS laesst sich mit einem reinen esp_wifi_disconnect() pruefen,
+ * ohne Ethernet/Kamera ueberhaupt anzufassen.
+ *
+ * Stufe 1 (WD_STUFE_RECONNECT): nur trennen. wifi_evt() verbindet bei
+ * WIFI_EVENT_STA_DISCONNECTED automatisch neu, solange s_active gilt - kein
+ * zusaetzlicher esp_wifi_connect() noetig, das uebernimmt bereits bestehende
+ * Logik. Zaehlt NICHT als Fehlstart (siehe bridge_consume_planned_restart()),
+ * weil dabei gar kein Neustart passiert.
+ *
+ * Stufe 2 (Ultima Ratio): erst wenn Stufe 1 nicht half. Dann voller Neustart -
+ * aber ueber abort() statt esp_restart(), damit ein Coredump entsteht: der
+ * naechste Boot soll nachvollziehbar sein (Backtrace zeigt exakt diese
+ * Codestelle, Grund steht zusaetzlich in bridge_get_stats()->wd_last_reason,
+ * ueberlebt den Neustart im RTC-Speicher). Zaehlt bewusst trotzdem NICHT als
+ * Fehlstart - das Geraet ist ja sauber gebootet und gelaufen.
+ */
+typedef enum {
+  WD_REASON_NONE        = 0,
+  WD_REASON_VERLUST     = 1,   /* Verlustquote ueber der Schwelle */
+  WD_REASON_DISCONNECTS = 2,   /* zu viele Reconnects im Fenster */
+  WD_REASON_SONDE       = 3,   /* Gateway-Sonde fehlgeschlagen */
+} wd_reason_t;
+
+/* Fehlstart-Ausnahme: einmalig auswertbar, wird beim Lesen geloescht - siehe
+ * bridge_consume_planned_restart(). Analog zu main.cpp's PORTAL_MAGIC. */
+#define WD_RESTART_MAGIC 0x57445254u  /* "WDRT" */
+RTC_NOINIT_ATTR static uint32_t s_wd_restart_magic;
+
+/* Anzeige-Grund: NICHT einmalig, bleibt fuer /api/status bzw. MQTT stehen,
+ * bis der naechste Watchdog-Neustart ihn ueberschreibt. Eigenes Magic-Wort,
+ * weil RTC-Speicher nach einem echten Kaltstart undefiniert ist. */
+#define WD_REASON_MAGIC  0x57445253u  /* "WDRS" */
+RTC_NOINIT_ATTR static uint32_t s_wd_reason_magic;
+RTC_NOINIT_ATTR static uint8_t  s_wd_reason;
+
+void bridge_mark_planned_restart(uint8_t reason) {
+  s_wd_restart_magic = WD_RESTART_MAGIC;
+  s_wd_reason_magic  = WD_REASON_MAGIC;
+  s_wd_reason        = reason;
+}
+
+bool bridge_consume_planned_restart(void) {
+  const bool planned = (s_wd_restart_magic == WD_RESTART_MAGIC);
+  s_wd_restart_magic = 0;
+  return planned;
+}
 
 static uint32_t s_wd_t0 = 0, s_wd_pkt0 = 0, s_wd_drop0 = 0, s_wd_disc0 = 0;
 static uint8_t  s_wd_bad = 0;
 static uint8_t  s_wd_probe = 0;   /* 0=nicht noetig/aus, 1=ok, 2=fehlgeschlagen -
                                    * fuer /api/status, siehe BridgeStats.wd_probe */
+static uint8_t  s_wd_stage = 0;   /* 0=normal, 1=nach Reconnect-Versuch (Stufe 1) */
+static uint32_t s_wd_reconnects = 0;  /* seit Boot, fuer /api/status/MQTT */
 
 /* Aktuell auf dem Management-Netif eingetragenes Gateway auslesen - nicht
  * erneut aus g_cfg/Profilwahl ableiten (drei moegliche Profile), sondern
@@ -1124,7 +1189,7 @@ static void watchdog_tick(void) {
    * Bewertung - ein Neustart mitten im Firmware-Flash waere fatal, und ohne
    * aktiven Datenpfad sind die Zaehler ohnehin bedeutungslos. */
   if (!g_cfg.wd_enable || !s_active || s_paused) {
-    s_wd_bad = 0; s_wd_t0 = 0; s_wd_probe = 0;
+    s_wd_bad = 0; s_wd_t0 = 0; s_wd_probe = 0; s_wd_stage = 0;
     return;
   }
 
@@ -1143,12 +1208,14 @@ static void watchdog_tick(void) {
   s_wd_disc0 = s_wifi_disc_count;
 
   bool schlecht = false;
+  uint8_t grund = WD_REASON_NONE;
+
   if (dp + dd >= WD_MIN_PAKETE) {
     /* Genug echter Verkehr - die Verlustquote entscheidet, keine Sonde
      * noetig (spart Luftzeit waehrend eines laufenden Streams). */
     s_wd_probe = 0;
     const uint32_t promille = (1000ULL * dd) / (dp + dd);
-    if (promille >= WD_VERLUST_PROMILLE) schlecht = true;
+    if (promille >= WD_VERLUST_PROMILLE) { schlecht = true; grund = WD_REASON_VERLUST; }
   } else {
     uint8_t gw[4];
     if (!wd_gateway_holen(gw)) {
@@ -1157,20 +1224,51 @@ static void watchdog_tick(void) {
       s_wd_probe = 1;
     } else {
       s_wd_probe = 2;
-      schlecht = true;
+      schlecht = true; grund = WD_REASON_SONDE;
     }
   }
-  if (ddisc >= WD_DISC_JE_FENSTER) schlecht = true;
+  /* Reconnects gehen vor - wenn beides zutrifft, ist das haeufigere
+   * Neuassoziieren das aussagekraeftigere Symptom. */
+  if (ddisc >= WD_DISC_JE_FENSTER) { schlecht = true; grund = WD_REASON_DISCONNECTS; }
 
   s_wd_bad = schlecht ? (uint8_t)(s_wd_bad + 1) : 0;
-  printf("[WD  ] Fenster: %u Pakete, %u Verlust, %u Reconnects, Sonde=%u -> %s (%u/%u)\n",
-         (unsigned)(dp + dd), (unsigned)dd, (unsigned)ddisc, (unsigned)s_wd_probe,
-         schlecht ? "schlecht" : "ok", (unsigned)s_wd_bad, (unsigned)WD_SCHLECHTE_FENSTER);
+  printf("[WD  ] Stufe %u, Fenster: %u Pakete, %u Verlust, %u Reconnects, Sonde=%u -> %s (%u/%u)\n",
+         (unsigned)s_wd_stage, (unsigned)(dp + dd), (unsigned)dd, (unsigned)ddisc,
+         (unsigned)s_wd_probe, schlecht ? "schlecht" : "ok",
+         (unsigned)s_wd_bad, (unsigned)WD_SCHLECHTE_FENSTER);
 
-  if (s_wd_bad >= WD_SCHLECHTE_FENSTER) {
-    printf("[WD  ] %u schlechte Fenster in Folge - Neustart\n", (unsigned)s_wd_bad);
-    esp_restart();
+  if (!schlecht) {
+    /* Erholt - eine eventuell laufende Eskalation ist erledigt. */
+    s_wd_stage = 0;
+    return;
   }
+  if (s_wd_bad < WD_SCHLECHTE_FENSTER) return;
+
+  if (s_wd_stage == 0) {
+    /* Eskalationsstufe 1: nur WLAN trennen. wifi_evt() verbindet bei
+     * WIFI_EVENT_STA_DISCONNECTED automatisch neu (s_active gilt hier immer),
+     * ein zusaetzlicher esp_wifi_connect() waere doppelt gemoppelt. Ethernet
+     * bleibt komplett unberuehrt - die Kamera merkt architektonisch nichts. */
+    printf("[WD  ] %u schlechte Fenster - trenne WLAN fuer Neuverbindung (Stufe 1)\n",
+           (unsigned)s_wd_bad);
+    esp_wifi_disconnect();
+    s_wd_reconnects++;
+    s_wd_stage = 1;
+    s_wd_bad = 0;
+    s_wd_t0  = 0;   /* naechstes Fenster startet frisch - der Reconnect
+                     * selbst braucht ein paar Sekunden, die sollen dem
+                     * aktuell laufenden Fenster nicht angelastet werden. */
+    return;
+  }
+
+  /* Stufe 1 hat nicht geholfen - letzte Eskalationsstufe. abort() statt
+   * esp_restart(), damit ein Coredump entsteht: der naechste Boot soll
+   * nachvollziehbar sein, nicht nur "es startete neu". */
+  printf("[WD  ] Reconnect brachte keine Besserung - erzwinge Neustart mit Coredump (Grund %u)\n",
+         (unsigned)grund);
+  bridge_mark_planned_restart(grund);
+  delay(200);   /* Log-Zeile noch rausschreiben lassen */
+  abort();
 }
 
 /* ===========================================================================
@@ -1205,6 +1303,8 @@ void bridge_get_stats(BridgeStats *o) {
   o->kbps_wifi2eth = s_kbps_w2e;
   o->wifi_disc_count = s_wifi_disc_count;
   o->wd_probe      = s_wd_probe;
+  o->wd_reconnects = s_wd_reconnects;
+  o->wd_last_reason = (s_wd_reason_magic == WD_REASON_MAGIC) ? s_wd_reason : 0;
   o->eth_link      = s_eth_link;
   o->wifi_up       = s_wifi_up;
   strcpy(o->bssid, s_bssid_str);
