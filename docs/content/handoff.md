@@ -2,20 +2,26 @@
 
 Technical state for whoever (human or Claude) picks up the next coding session. This file reflects the *current* state only — overwrite it each time; it is not a log (that's `history.md`) and not project-level context (that's `handover.md`).
 
-## State as of 2026-08-31
+## State as of 2026-09-04
 
-The firmware is **verified on real hardware and in continuous use** bridging a live IP camera. Bridge data path, management IP, config portal, MQTT, OTA, two network profiles with automatic location detection, an optional WiFi watchdog, and a crash-forensics endpoint — all exercised on the deployed board, not just compile-tested.
+The firmware is **verified on real hardware and in continuous use** bridging a live IP camera. Bridge data path, management IP, config portal, MQTT, OTA, two network profiles with automatic location detection, a three-stage self-healing watchdog, and a crash-forensics endpoint — all exercised on the deployed board, not just compile-tested.
 
 Updates go over the network (`POST /api/update`, or `scripts/ota_flash.sh <ip> [admin-key]` which also archives the matching `.elf` — see below); the serial cable is only needed if the board becomes unreachable. Build with `~/.pio-py313/bin/pio` — see `CLAUDE.md` for why plain `pio` fails.
 
 **Throughput is settled — don't reopen it without new information.** See `backlog.md` for what was tried; `history.md` (2026-08-14/15) has the full comparison against the Rust original and the methodological lesson.
 
-## Two resilience mechanisms exist, and they don't overlap
+## Two resilience mechanisms exist, and they're now coordinated
 
-- **`wd_enable`** (`bridge.cpp`, portal-toggleable, default **off**): passive drop-ratio/reconnect-churn detection over 10 s windows, plus an active gateway ping when traffic is too low to judge a ratio. Restarts after three bad windows in a row. Only runs once the bridge is fully active (`s_active`).
-- **The pre-existing boot-loop guard** (`main.cpp`, always on, not configurable): after 3 boots that never reach 60 s of stable operation, the firmware gives up and drops into the provisioning AP (`192.168.4.1`) instead of retrying bridge mode. There is no automatic way back from there — see `backlog.md`.
+- **`wd_enable`** (`bridge.cpp`, portal-toggleable, default **off**): a three-stage escalation, branching by symptom. "Ethernet link up but the camera's gone silent" (checked only once a gateway probe confirms WiFi itself is fine, to avoid double-counting a WiFi problem as a camera one) → `bridge_reset_eth()` first (driver stop/start, no chip reboot, WLAN untouched). Any WiFi-side symptom (drop ratio, reconnect churn, failed gateway probe) → `esp_wifi_disconnect()` directly (the existing `WIFI_EVENT_STA_DISCONNECTED` handler reconnects on its own). Whichever ran first, if the symptom persists the other lightweight remedy is tried next; only if *that* doesn't help does it reboot — via `abort()`, not `esp_restart()`, so a coredump is produced. 20 s windows (was 10 s), 3 bad windows before the first escalation.
+- **The pre-existing boot-loop guard** (`main.cpp`, always on, not configurable): after 3 boots that never reach 60 s of stable operation, the firmware gives up and drops into the provisioning AP (`192.168.4.1`) instead of retrying bridge mode. There is still no automatic way back from there once it's tripped — see `backlog.md`.
 
-**These two do not compose.** The watchdog can only act while the bridge is actually running; a boot-time crash loop is exactly the case where it never gets the chance to. A 2026-08-31 total outage (both `.11` and `.88` gone, watchdog enabled) turned out to be the second mechanism, not a watchdog failure — see `history.md` for the full diagnosis. If a future outage looks like this again, check `/api/status`'s `prov` field and whether the board is reachable on `192.168.4.1` before assuming the watchdog should have caught it.
+**They used to not compose, and that caused a real incident.** A 2026-08-31 total outage (both `.11` and `.88` gone, watchdog enabled) was the boot-loop guard, not a watchdog failure — the watchdog can only act while the bridge is running, and that outage was a boot-time problem. A second, 2026-09-04 incident (1d8h unnoticed in the provisioning AP, *no* coredump this time) turned out to be the watchdog *causing* the boot-loop guard to trip: each `esp_restart()` it issued during a prolonged WiFi problem counted as a failed boot attempt toward the same 3-strikes counter, which has nothing to do with the watchdog. Fixed by exempting watchdog-triggered restarts from that counter (`bridge_mark_planned_restart()`/`bridge_consume_planned_restart()`, RTC-persisted one-shot flag, same pattern as the existing `PORTAL_MAGIC`). If a future outage looks like the 08-31 kind again, check `/api/status`'s `prov` field and whether the board is reachable on `192.168.4.1` before assuming the watchdog should have caught it.
+
+## Watchdog visibility
+
+- `/api/status` and the periodic MQTT state payload carry `wd_reconnects`, `wd_eth_resets` (both plain runtime counters, reset on boot) and `wd_last_reason` (1=drop ratio, 2=reconnects, 3=gateway probe, 4=camera silent; RTC-persisted, so it survives the eventual reboot and stays visible until the next watchdog event overwrites it).
+- `telemetry_note_watchdog_event()` additionally publishes a discrete MQTT message to `bridge/<node>/watchdog` (action + reason + uptime) at the moment each escalation step fires, rather than only being discoverable as a counter at the next periodic refresh — Home Assistant's own message-received timestamp is the "when", since the board has no real-time clock.
+- `bridge_reset_eth()` is also reachable manually via `POST /api/eth_reset` + a portal button, independent of watchdog state.
 
 ## Crash forensics: what exists, what's still missing
 
