@@ -18,11 +18,13 @@ struct BridgeStats {
                                * den Watchdog und zur Diagnose im Portal    */
   uint8_t  wd_probe;          /* Ergebnis der letzten Watchdog-Gateway-Sonde:
                                * 0=nicht noetig/aus, 1=ok, 2=fehlgeschlagen  */
-  uint32_t wd_reconnects;     /* Watchdog-ausgeloeste WLAN-Reconnects seit Boot
-                               * (Eskalationsstufe 1, siehe watchdog_tick())  */
+  uint32_t wd_eth_resets;     /* Watchdog-ausgeloeste Ethernet-Resets seit Boot
+                               * (Eskalationsstufe "kein Kamera-Verkehr")     */
+  uint32_t wd_reconnects;     /* Watchdog-ausgeloeste WLAN-Reconnects seit Boot */
   uint8_t  wd_last_reason;    /* Grund des letzten erzwungenen Watchdog-Neustarts
-                               * (Eskalationsstufe 2): 0=keiner seit Kaltstart,
-                               * 1=Verlustquote, 2=Reconnects, 3=Gateway-Sonde.
+                               * (letzte Eskalationsstufe): 0=keiner seit
+                               * Kaltstart, 1=Verlustquote, 2=Reconnects,
+                               * 3=Gateway-Sonde, 4=kein Kamera-Verkehr.
                                * Bleibt nach dem Neustart stehen (RTC-Speicher),
                                * damit Portal/MQTT zeigen koennen WARUM.       */
   int8_t   rssi;
@@ -65,6 +67,15 @@ void bridge_get_stats(BridgeStats *out);
  * mehrere Watchdog-Neustarts waehrend einer laengeren WLAN-Stoerung den
  * Absturzschleifen-Schutz ausloesen, den sie gar nicht betreffen. */
 bool bridge_consume_planned_restart(void);
+
+/* Ethernet-Treiber neu starten (Stop/Start), OHNE den Chip neu zu booten -
+ * erzeugt fuer die angeschlossene Kamera einen echten kurzen Link-Down/Up,
+ * das WLAN bleibt komplett unberuehrt. Manuell aus dem Portal aufrufbar
+ * (/api/eth_reset) und intern vom Watchdog bei Verdacht auf haengende
+ * Kamera. Liefert false und tut nichts, wenn der Ethernet-Treiber noch
+ * nicht initialisiert ist (z.B. im Provisionierungsmodus ohne je erkannten
+ * Client). */
+bool bridge_reset_eth(void);
 
 esp_netif_t *bridge_mgmt_netif(void);
 bool         bridge_is_active(void);

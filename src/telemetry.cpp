@@ -84,11 +84,12 @@ static void announce_all(void) {
    * das oft die einzige Moeglichkeit herauszufinden, unter welcher Adresse
    * sie zu erreichen ist - die Bridge sieht sie im Datenpfad ohnehin. */
   announce_one("client_ip","IP des Clients",      NULL,  NULL, NULL, "mdi:ip-network");
-  /* Steigt bei jedem Watchdog-Reconnect (Eskalationsstufe 1) - allein die
-   * Tendenz ist das Signal, nicht der Absolutwert. Ein Neustart (Stufe 2)
-   * zaehlt bewusst NICHT als Fehlstart und ist hier NICHT gesondert
-   * sichtbar; der Coredump/das Boot-Log ist dafuer die Quelle. */
-  announce_one("wd_reconnects","Watchdog-Reconnects",NULL, NULL, "total_increasing", "mdi:wifi-refresh");
+  /* Steigen bei jeder Watchdog-Eskalation (Ethernet- bzw. WLAN-Stufe) - allein
+   * die Tendenz ist das Signal, nicht der Absolutwert. Der erzwungene
+   * Neustart (letzte Stufe) ist hier NICHT gesondert sichtbar - dafuer gibt
+   * es telemetry_note_watchdog_event() und den Coredump. */
+  announce_one("wd_reconnects","Watchdog-WLAN-Reconnects",NULL, NULL, "total_increasing", "mdi:wifi-refresh");
+  announce_one("wd_eth_resets","Watchdog-Ethernet-Resets",NULL, NULL, "total_increasing", "mdi:lan-connect");
 
   char topic[160], payload[512];
   snprintf(topic, sizeof(topic),
@@ -157,20 +158,38 @@ void telemetry_tick(void) {
   BridgeStats st;
   bridge_get_stats(&st);
 
-  char payload[460];
+  char payload[500];
   snprintf(payload, sizeof(payload),
     "{\"rssi\":%d,\"ch\":%u,\"kbps_up\":%lu,\"kbps_down\":%lu,"
     "\"pkt_up\":%lu,\"pkt_down\":%lu,\"drop_up\":%lu,\"drop_down\":%lu,"
-    "\"wd_reconnects\":%lu,"
+    "\"wd_reconnects\":%lu,\"wd_eth_resets\":%lu,"
     "\"eth\":%d,\"uptime\":%lu,\"heap\":%lu,\"bssid\":\"%s\","
     "\"client_ip\":\"%s\"}",
     (int)st.rssi, (unsigned)st.channel,
     (unsigned long)st.kbps_eth2wifi, (unsigned long)st.kbps_wifi2eth,
     (unsigned long)st.pkt_eth2wifi,  (unsigned long)st.pkt_wifi2eth,
     (unsigned long)st.drop_eth2wifi, (unsigned long)st.drop_wifi2eth,
-    (unsigned long)st.wd_reconnects,
+    (unsigned long)st.wd_reconnects, (unsigned long)st.wd_eth_resets,
     st.eth_link ? 1 : 0, (unsigned long)(millis() / 1000),
     (unsigned long)esp_get_free_heap_size(), st.bssid, st.client_ip);
 
   esp_mqtt_client_publish(s_mqtt, s_state, payload, 0, 0, 0);
+}
+
+void telemetry_note_watchdog_event(const char *action, const char *reason) {
+  if (!s_mqtt || !s_connected) return;
+
+  char topic[64];
+  snprintf(topic, sizeof(topic), "%s/watchdog", s_base);
+
+  char payload[128];
+  snprintf(payload, sizeof(payload), "{\"action\":\"%s\",\"reason\":\"%s\",\"uptime\":%lu}",
+           action, reason ? reason : "", (unsigned long)(millis() / 1000));
+
+  /* qos 1, nicht retained - ein Ereignis, kein Dauerzustand. Wird bewusst
+   * synchron/blockierend aus der Watchdog-Eskalation heraus aufgerufen (auch
+   * kurz vor einem erzwungenen Neustart) - esp_mqtt_client_publish() selbst
+   * kehrt sofort zurueck, den Versand muss der Aufrufer mit einer kurzen
+   * Pause abwarten, siehe watchdog_tick() in bridge.cpp. */
+  esp_mqtt_client_publish(s_mqtt, topic, payload, 0, 1, 0);
 }
