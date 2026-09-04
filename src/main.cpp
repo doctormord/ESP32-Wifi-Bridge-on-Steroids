@@ -176,9 +176,24 @@ static void bridge_setup(void) {
   /* Fehlstarts zaehlen. Beim ersten Kaltstart ist der RTC-Speicher
    * undefiniert - daran erkennen wir ihn am Magic-Wort. */
   bool zu_viele_fehlstarts = false;
+
+  /* Ausnahme: kam dieser Boot von einem erzwungenen Watchdog-Neustart
+   * (bridge.cpp, Eskalationsstufe 2), zaehlt er NICHT als Fehlstart - das
+   * Geraet ist sauber gebootet und gelaufen, hat sich nur selbst aus
+   * WLAN-Gesundheitsgruenden neu gestartet. Ohne diese Ausnahme koennten
+   * mehrere Watchdog-Neustarts waehrend einer laengeren WLAN-Stoerung genau
+   * diesen Absturzschleifen-Schutz ausloesen, den sie gar nicht betreffen -
+   * am 2026-09-04 vermutlich genau so passiert (kein Coredump vorgefunden,
+   * also kein Absturz, aber die Bruecke landete trotzdem unerreichbar im
+   * Portal). Muss VOR dem Kaltstart-Zweig ausgewertet werden, sonst wird das
+   * einmalige Magic-Wort verschluckt, ohne je konsumiert worden zu sein. */
+  const bool geplanter_neustart = bridge_consume_planned_restart();
+
   if (s_boot_magic != BOOT_MAGIC) {
     s_boot_magic = BOOT_MAGIC;
     s_boot_fehlstarts = 0;
+  } else if (geplanter_neustart) {
+    /* s_boot_fehlstarts bleibt unveraendert. */
   } else {
     s_boot_fehlstarts++;
     if (s_boot_fehlstarts >= BOOT_MAX_FEHLSTARTS) {

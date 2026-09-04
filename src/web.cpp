@@ -312,16 +312,28 @@ button.sec{background:#2f3542;color:var(--fg)}
   <div style="margin-top:14px;padding:12px;background:#232833;border-radius:8px">
     <b style="font-size:13px">Watchdog</b>
     <div class="sub" style="margin:4px 0 8px">
-      Erkennt, wenn die Bruecke trotz "verbunden" kaum noch Pakete zustellt
-      (hohe Verlustrate LAN&rarr;WLAN unter Last, oder gehaeufte
-      Reassoziierungen - so wie nach einem 2,4-GHz-Stoertest beobachtet) und
-      startet dann selbststaendig neu. Reagiert bewusst NICHT auf einen
-      Stillstand ganz ohne Verkehr, dafuer fehlt die Datengrundlage.
+      Erkennt, wenn die Bruecke trotz "verbunden" nicht mehr richtig
+      zustellt, und eskaliert je nach Symptom in bis zu drei Stufen:
+      <b>Ethernet-Link da, aber kein Verkehr von der Kamera</b> &rarr; nur
+      der Ethernet-Treiber wird neu gestartet (WLAN bleibt unberuehrt);
+      <b>WLAN-seitige Probleme</b> (hohe Verlustrate, gehaeufte
+      Reassoziierungen, erfolglose Gateway-Sonde) &rarr; WLAN trennen und neu
+      verbinden (Ethernet/Kamera bleiben unberuehrt); <b>hilft das alles
+      nicht</b> &rarr; voller Neustart mit provoziertem Coredump, damit
+      danach nachvollziehbar ist warum. Nichts davon zaehlt als Fehlstart
+      fuer den Absturzschleifen-Schutz.
     </div>
     <select id="wd_enable">
       <option value="0">Aus (Standard)</option>
-      <option value="1">An - bei anhaltendem Paketverlust automatisch neu starten</option>
+      <option value="1">An - eskaliert automatisch: Ethernet-Reset, WLAN-Reconnect, notfalls Neustart</option>
     </select>
+    <div class="sub" style="margin:10px 0 4px">
+      Manuell ausloesen, unabhaengig vom Watchdog-Zustand oben (z.B. wenn die
+      Kamera gerade haengt und nicht auf den naechsten automatischen Zyklus
+      gewartet werden soll):
+    </div>
+    <button class="sec" onclick="ethReset()" style="margin-top:0">Ethernet neu starten</button>
+    <div id="ethmsg" style="margin-top:8px;font-size:13px"></div>
   </div>
 
   <div class="tag reboot">&#9679; erst nach NEUSTART wirksam</div>
@@ -424,6 +436,10 @@ async function tick(){
       '</span> &middot; Reconnects: <b>'+s.wifi_disc+'</b>'+
       (s.wd_probe ? ' &middot; Watchdog-Sonde: <span class="'+(s.wd_probe===1?'ok':'bad')+'">'+
         (s.wd_probe===1?'Gateway erreicht':'Gateway nicht erreicht')+'</span>' : '')+
+      (s.wd_reconnects ? ' &middot; Watchdog-WLAN-Reconnects: <b>'+s.wd_reconnects+'</b>' : '')+
+      (s.wd_eth_resets ? ' &middot; Watchdog-Ethernet-Resets: <b>'+s.wd_eth_resets+'</b>' : '')+
+      (s.wd_last_reason ? ' &middot; letzter Watchdog-Neustart: <span class="bad">'+
+        (['','Verlustquote','Reconnects','Gateway-Sonde','kein Kamera-Verkehr'][s.wd_last_reason]||'?')+'</span>' : '')+
       ' &middot; Heap: <b>'+Math.round(s.heap/1024)+' kB</b>'+
       (s.heap_min!==undefined
         ? ' (Tiefststand '+Math.round(s.heap_min/1024)+' kB, DMA '+
@@ -493,6 +509,14 @@ async function autotune(){
   }catch(e){$('atmsg').textContent='Fehler beim Starten'}
 }
 async function reboot(){await fetch('/api/reboot',{method:'POST'});$('msg').textContent='Neustart...';}
+async function ethReset(){
+  $('ethmsg').textContent='Setze Ethernet zurueck...';
+  try{
+    const j=await(await fetch('/api/eth_reset',{method:'POST'})).json();
+    $('ethmsg').textContent=j.ok?'Erledigt - kurzer Link-Aussetzer fuer die Kamera war normal.'
+                               :'Nicht moeglich: Ethernet-Treiber noch nicht aktiv.';
+  }catch(e){$('ethmsg').textContent='Fehler beim Ausloesen'}
+}
 /* Einmalig beim Laden pruefen, nicht im 2s-Intervall - ein Coredump aendert
    sich nur nach einem Absturz, staendiges Nachfragen waere reine Last. */
 function cdHeaders(){const h={};if($('okey')&&$('okey').value)h['X-Admin-Key']=$('okey').value;return h}
@@ -556,11 +580,12 @@ static esp_err_t h_status(httpd_req_t *r) {
   BridgeStats st;
   bridge_get_stats(&st);
 
-  char buf[608];
+  char buf[700];
   snprintf(buf, sizeof(buf),
     "{\"prov\":%d,\"wifi\":%d,\"eth\":%d,\"rssi\":%d,\"ch\":%u,"
     "\"kbps_up\":%lu,\"kbps_down\":%lu,\"pkt_up\":%lu,\"pkt_down\":%lu,"
-    "\"drop_up\":%lu,\"drop_down\":%lu,\"wifi_disc\":%lu,\"wd_probe\":%u,\"uptime\":%lu,"
+    "\"drop_up\":%lu,\"drop_down\":%lu,\"wifi_disc\":%lu,\"wd_probe\":%u,"
+    "\"wd_reconnects\":%lu,\"wd_eth_resets\":%lu,\"wd_last_reason\":%u,\"uptime\":%lu,"
     "\"client_mac\":\"%s\",\"client_ip\":\"%s\",\"client_name\":\"%s\","
     "\"ssid\":\"%s\",\"bssid\":\"%s\","
     "\"at\":%d,\"at_s\":%u,\"at_n\":%u,\"at_r\":%u,"
@@ -572,6 +597,8 @@ static esp_err_t h_status(httpd_req_t *r) {
     (unsigned long)st.pkt_eth2wifi,  (unsigned long)st.pkt_wifi2eth,
     (unsigned long)st.drop_eth2wifi, (unsigned long)st.drop_wifi2eth,
     (unsigned long)st.wifi_disc_count, (unsigned)st.wd_probe,
+    (unsigned long)st.wd_reconnects, (unsigned long)st.wd_eth_resets,
+    (unsigned)st.wd_last_reason,
     (unsigned long)(millis() / 1000), st.client_mac, st.client_ip, st.client_name, st.ssid, st.bssid,
     (int)bridge_autotune_state(), bridge_autotune_schritt(),
     bridge_autotune_anzahl(), bridge_autotune_ergebnis(),
@@ -822,6 +849,12 @@ static esp_err_t h_reboot(httpd_req_t *r) {
   delay(400);
   esp_restart();
   return ESP_OK;
+}
+
+static esp_err_t h_eth_reset(httpd_req_t *r) {
+  const bool ok = bridge_reset_eth();
+  httpd_resp_set_type(r, "application/json");
+  return httpd_resp_send(r, ok ? "{\"ok\":true}" : "{\"ok\":false}", HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t h_scan(httpd_req_t *r) {
@@ -1111,6 +1144,7 @@ bool web_start(bool provisioning) {
     { "/api/config",  HTTP_GET,  h_config_get,  NULL },
     { "/api/config",  HTTP_POST, h_config_post, NULL },
     { "/api/reboot",  HTTP_POST, h_reboot,      NULL },
+    { "/api/eth_reset",HTTP_POST,h_eth_reset,   NULL },
     { "/api/autotune",HTTP_POST, h_autotune,    NULL },
     { "/api/scan",    HTTP_GET,  h_scan,        NULL },
     { "/api/update",  HTTP_POST, h_update,      NULL },

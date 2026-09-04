@@ -18,6 +18,15 @@ struct BridgeStats {
                                * den Watchdog und zur Diagnose im Portal    */
   uint8_t  wd_probe;          /* Ergebnis der letzten Watchdog-Gateway-Sonde:
                                * 0=nicht noetig/aus, 1=ok, 2=fehlgeschlagen  */
+  uint32_t wd_eth_resets;     /* Watchdog-ausgeloeste Ethernet-Resets seit Boot
+                               * (Eskalationsstufe "kein Kamera-Verkehr")     */
+  uint32_t wd_reconnects;     /* Watchdog-ausgeloeste WLAN-Reconnects seit Boot */
+  uint8_t  wd_last_reason;    /* Grund des letzten erzwungenen Watchdog-Neustarts
+                               * (letzte Eskalationsstufe): 0=keiner seit
+                               * Kaltstart, 1=Verlustquote, 2=Reconnects,
+                               * 3=Gateway-Sonde, 4=kein Kamera-Verkehr.
+                               * Bleibt nach dem Neustart stehen (RTC-Speicher),
+                               * damit Portal/MQTT zeigen koennen WARUM.       */
   int8_t   rssi;
   uint8_t  channel;
   bool     eth_link;
@@ -49,6 +58,24 @@ void bridge_activate(void);
 void bridge_tick(void);
 
 void bridge_get_stats(BridgeStats *out);
+
+/* Einmalig auswertbar (loescht sich beim Lesen, wie main.cpp's PORTAL_MAGIC):
+ * true, wenn der GERADE laufende Boot von einem erzwungenen Watchdog-Neustart
+ * kommt. main.cpp ruft das ganz am Anfang von bridge_setup() auf, um so einen
+ * Neustart NICHT als Fehlstart zu zaehlen - das Geraet ist ja sauber gebootet
+ * und gelaufen, hat sich nur selbst neu gestartet. Ohne diese Ausnahme koennten
+ * mehrere Watchdog-Neustarts waehrend einer laengeren WLAN-Stoerung den
+ * Absturzschleifen-Schutz ausloesen, den sie gar nicht betreffen. */
+bool bridge_consume_planned_restart(void);
+
+/* Ethernet-Treiber neu starten (Stop/Start), OHNE den Chip neu zu booten -
+ * erzeugt fuer die angeschlossene Kamera einen echten kurzen Link-Down/Up,
+ * das WLAN bleibt komplett unberuehrt. Manuell aus dem Portal aufrufbar
+ * (/api/eth_reset) und intern vom Watchdog bei Verdacht auf haengende
+ * Kamera. Liefert false und tut nichts, wenn der Ethernet-Treiber noch
+ * nicht initialisiert ist (z.B. im Provisionierungsmodus ohne je erkannten
+ * Client). */
+bool bridge_reset_eth(void);
 
 esp_netif_t *bridge_mgmt_netif(void);
 bool         bridge_is_active(void);

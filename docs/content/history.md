@@ -234,3 +234,45 @@ Die Zuordnung eines kuenftigen Coredumps zum richtigen archivierten `.elf` stuet
 Auf Hardware verifiziert: `build:"3765974-dirty"` in `/api/status` passte exakt zum Dateinamen `elf_archive/3765974-dirty_20260831T205316Z.elf`. Drei OTA-Zyklen insgesamt (Endpoint, Erase-Fix, Build-Archivierung), Bridge und Kamera nach jedem Zyklus gesund verifiziert. PR `#2` selbstaendig gepusht (kein `gh` auf dieser Maschine, kein Merge auf `main` durch die Session selbst — Merge von Christian ueber die GitHub-UI).
 
 **Offen geblieben:** die eigentliche Ursache des Dreifach-Absturzes. Naechstes Vorkommnis sollte ueber `/api/coredump` ausgewertet werden, BEVOR irgendjemand erneut flasht oder das Abbild loescht — sonst wiederholt sich genau der Blindflug von diesem Tag.
+
+## 2026-09-04 — Watchdog trat sich selbst ins Portal, dreistufige Eskalation gebaut
+
+### Symptom: wieder ein Totalausfall, diesmal ohne Absturz
+
+Christian fand die Bruecke erneut komplett unerreichbar — Portal zeigte "Erstinbetriebnahme", **Laufzeit 1 Tag 8 Stunden im Provisionierungsmodus**, niemandem war es aufgefallen. `/api/coredump` meldete `present:false` — **kein Absturz**, die vorigen Neustarts waren also sauber (`esp_restart()`), nicht durch einen Crash erzwungen.
+
+### Ursache: der Watchdog hat sich selbst ins Portal manoevriert
+
+Rekonstruiert im Gespraech: anhaltend schlechte WLAN-Bedingungen liessen den (seit dem 08-16-Eintrag aktivierten) Watchdog wiederholt `esp_restart()` ausloesen. Jeder dieser Neustarts zaehlte als Boot-Versuch fuer den Absturzschleifen-Schutz (`main.cpp`, `BOOT_MAX_FEHLSTARTS=3`, siehe 08-15) — der aber komplett unabhaengig vom Watchdog entstanden war und nie mit ihm abgestimmt wurde. Scheiterte der WLAN-Aufbau nach einem Watchdog-Neustart erneut, bevor die 60-Sekunden-Stabilitaetsschwelle erreicht war (rechnerisch moeglich: der Watchdog konnte schon nach ~30-40 s zuschlagen), zaehlte das als Fehlstart. Drei solcher Zyklen, und der komplett unabhaengige Absturzschleifen-Schutz warf die Bruecke ins isolierte Portal-WLAN — wo der Watchdog per Definition nicht mehr laufen kann (`s_active` ist dort nie wahr). Der Watchdog hat also getan, wofuer er da ist, wurde dafuer aber vom Nachbarmechanismus bestraft.
+
+### Warum ein Reboot keine schlechte Funkumgebung repariert
+
+Christian wies zurecht darauf hin: wenn ein reiner Reconnect nicht hilft, warum sollte ein voller Neustart helfen — der aendert an der Umgebung ja nichts. Richtig, und das war die entscheidende Praezisierung: der urspruengliche Jammer-Vorfall (08-16) wurde nicht durch einen Reboot "repariert", weil der Reboot die Umgebung verbesserte — die Umgebung war zum Zeitpunkt des (Stunden spaeteren, manuellen) Reboots laengst wieder gut, nur der WLAN-Treiber im ESP32 hing noch in einem degradierten Zustand fest. Ein Reboot hilft also nur gegen einen haengenden Treiber, nicht gegen anhaltend schlechten Empfang — und genau das laesst sich mit einem reinen `esp_wifi_disconnect()` pruefen, ohne das Ethernet ueberhaupt anzufassen.
+
+### Fix: zweistufige Eskalation, Watchdog-Neustarts zaehlen nicht mehr als Fehlstart
+
+- `watchdog_tick()` eskaliert jetzt in zwei Schritten statt direkt `esp_restart()` zu rufen: **Stufe 1** trennt nur das WLAN (`esp_wifi_disconnect()`) — der bereits vorhandene `WIFI_EVENT_STA_DISCONNECTED`-Handler verbindet automatisch neu, solange `s_active` gilt, ein zusaetzliches `esp_wifi_connect()` waere doppelt. Ethernet/Kamera bleiben unberuehrt. **Stufe 2** (nur wenn Stufe 1 nach einem weiteren Beobachtungsfenster nicht half): voller Neustart — aber ueber `abort()` statt `esp_restart()`, damit ein Coredump entsteht und der naechste Boot nachvollziehbar ist (Wunsch von Christian: "wenn das gemacht werden muss, waere es sinnvoll, einen Coredump zu provozieren").
+- Beide Stufen zaehlen jetzt **nicht** mehr als Fehlstart: `bridge_mark_planned_restart()`/`bridge_consume_planned_restart()`, ein RTC-persistiertes Einmal-Flag nach demselben Muster wie `main.cpp`s bestehendes `PORTAL_MAGIC`. Ein Watchdog-Neustart bedeutet ja "sauber gebootet und gelaufen, hat sich nur selbst neu gestartet" — fundamental etwas anderes als "kam nie hoch".
+- Neu in `BridgeStats`/`/api/status`/MQTT: `wd_reconnects` (Zaehler seit Boot) und `wd_last_reason` (1=Verlustquote, 2=Reconnects, 3=Gateway-Sonde; RTC-persistiert, ueberlebt also den Neustart und bleibt im Portal sichtbar, bis der naechste Watchdog-Vorfall ihn ueberschreibt).
+- Messfenster von 10 s auf 20 s entspannt (Christian: "10s ist zu kurz gegriffen").
+
+Auf Hardware verifiziert: OTA erfolgreich, `wd_reconnects`/`wd_last_reason` korrekt vorhanden und auf 0, Kamera weiter erreichbar.
+
+### Nachtrag: Kamera kam nach einem Bridge-Neustart nicht zurueck — Ursachensuche
+
+Waehrend der Diagnose des 1d8h-Vorfalls musste die Bruecke manuell neu gestartet werden; danach blieb die Kamera fuer ~3 Minuten unerreichbar (kam am Ende von selbst zurueck, ohne eigenen Stromreset). Frage von Christian: passiert das auch bei einem reinen WLAN-Ausfall ohne Bridge-Neustart, und liegt es an Kamera, Router oder Bridge-Mechanismus?
+
+Architektonische Antwort: **nein, ein reiner WLAN-Ausfall sollte die Kamera nicht betreffen** — der Ethernet-Treiber (`bridge_eth_init()`/`eth_rx_cb`) ist komplett unabhaengig vom WLAN-Zustand, ein `WIFI_EVENT_STA_DISCONNECTED` fasst ihn nie an. Ein **Bridge-Neustart** dagegen reisst den Ethernet-MAC/PHY tatsaechlich kurz runter — ein echter Link-Flap auf der Kamera-Seite, den ihre (vermutlich HiSilicon-basierte) Firmware offenbar nur traege wegsteckt.
+
+Folgefrage von Christian: laesst sich das nicht eleganter loesen, z.B. per DHCP-Neuverhandlung oder ARP? Antwort: **nein** — DHCP kennt keinen Mechanismus, mit dem ein Dritter (nicht der DHCP-Server) einen Client zur Neuverhandlung zwingen kann; `DHCPFORCERENEW` (RFC 3203) muesste vom Server kommen und wird von Consumer-Routern praktisch nie unterstuetzt. Gratuitous ARP aktualisiert nur fremde ARP-Caches, bringt aber einen haengenden Kamera-Netzwerkstack nicht zum Laufen. Was tatsaechlich geht: **nur den Ethernet-Treiber zuruecksetzen, ohne den Chip neu zu booten** (`esp_eth_stop()`/`esp_eth_start()`) — erzeugt fuer die Kamera einen echten, aber kurzen Link-Down/Up, ohne WLAN ueberhaupt anzufassen. Vermutlich genau das (als Nebeneffekt eines vollen Reboots), was der Kamera nach dem 08-16-Jammervorfall schon einmal geholfen hat.
+
+### Dritte Eskalationsstufe: Ethernet-Reset bei stiller Kamera
+
+- Neuer, eigenstaendiger Erkennungspfad in `watchdog_tick()`: Ethernet-Link vorhanden, aber praktisch kein Verkehr von der Kamera (`WD_ETH_STALL_PAKETE`, < 5 Pakete im Fenster) — geprueft NUR, nachdem die Gateway-Sonde WLAN bereits als funktionierend bestaetigt hat, damit ein WLAN-Problem nicht faelschlich als Kamera-Problem gezaehlt wird. Bei dieser Installation (Dauerstream, siehe 08-15) ist echte Stille abnormal, kein Fehlalarm-Risiko durch legitime Pausen.
+- Eskalation jetzt symptomabhaengig: `WD_REASON_ETH_STALL` -> zuerst `bridge_reset_eth()` (Stop/Start, kein Netif involviert, also keines der Risiken, die ein doppeltes WLAN-Netif-Anlegen hat). Jeder andere Grund -> direkt WLAN-Reconnect wie zuvor, ein Ethernet-Reset waere dort wirkungslos und wuerde die Kamera grundlos stoeren. Hilft die jeweils erste Massnahme nicht, folgt die andere leichte Massnahme, erst danach der volle Neustart.
+- `bridge_reset_eth()` zusaetzlich manuell ueber einen neuen Button "Ethernet neu starten" im Portal (`POST /api/eth_reset`) ausloesbar, unabhaengig vom Watchdog-Zustand — fuer den Fall, dass jemand nicht auf den naechsten automatischen Zyklus warten will (Wunsch von Christian: "1. beides" — automatisch UND manuell).
+- Neu: `telemetry_note_watchdog_event()` veroeffentlicht jede Eskalationsstufe SOFORT als MQTT-Nachricht auf `bridge/<node>/watchdog` (Aktion, Grund, Laufzeit) statt erst beim naechsten regulaeren `telemetry_tick()` als stiller Zaehlerstand sichtbar zu werden — Home Assistant timestempelt den Nachrichtenempfang selbst, ein eigener Zeitstempel im Geraet (das keine Echtzeituhr hat) war dafuer nicht noetig. `wd_eth_resets` zusaetzlich als laufender Zaehler in Status/MQTT/HA-Sensor.
+
+Auf Hardware verifiziert: OTA erfolgreich, `wd_eth_resets` vorhanden und 0 nach Boot. Manueller Ethernet-Reset live ausgeloest: Link erholte sich, Kamera-Traffic lief sofort weiter, kein Bridge-Neustart. Heap sackte kurzzeitig um ~40 kB ab (88,6 -> 41,6 kB) und erholte sich innerhalb von 10 s vollstaendig auf 95 kB — einmalig beobachtet, kein Leck.
+
+**Offen geblieben:** ob ein reiner WLAN-Reconnect (Stufe 1/2) den urspruenglichen Jammer-Zustand (haengender Treiber trotz wiederhergestellter Umgebung) tatsaechlich loest, wurde nie isoliert getestet — beim naechsten echten Vorfall dieser Art zeigt sich das live. Ebenso weiterhin offen: die tieferliegende Ursache dafuer, dass die WLAN-Bedingungen ueberhaupt so lange anhaltend schlecht waren, dass der Watchdog in eine Neustart-Spirale geriet.

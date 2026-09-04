@@ -13,8 +13,10 @@
 #include "bridge.h"
 #include "driver/gpio.h"
 #include "config.h"
+#include "telemetry.h"
 
 #include <string.h>
+#include <stdlib.h>
 
 #include "esp_attr.h"
 #include "esp_err.h"
@@ -1093,19 +1095,133 @@ static void autotune_tick(void) {
  * ohne den fragilen Rohframe-Pfad in eth_rx_cb/wifi_rx_cb anzufassen.
  * ========================================================================= */
 
-#define WD_WINDOW_MS           10000u  /* Messfenster                        */
+#define WD_WINDOW_MS           20000u  /* Messfenster. War anfangs 10s - zu
+                                        * hektisch fuer eine kurze Schwankung,
+                                        * siehe 2026-09-04 in history.md.     */
 #define WD_MIN_PAKETE             200u  /* darunter keine Aussage aus Zaehlern moeglich */
 #define WD_VERLUST_PROMILLE      150u  /* 15% Verlust im Fenster = "schlecht" */
 #define WD_DISC_JE_FENSTER          4  /* so viele Reconnects im Fenster = "schlecht" */
-#define WD_SCHLECHTE_FENSTER        3  /* so oft hintereinander -> Neustart  */
+#define WD_ETH_STALL_PAKETE         5  /* darunter (LAN->WLAN, roh, nicht nur
+                                        * verworfen) bei bestehendem Link gilt
+                                        * die Kamera als still - siehe unten. */
+#define WD_SCHLECHTE_FENSTER        3  /* so oft hintereinander -> naechste
+                                        * Eskalationsstufe (gilt fuer alle)  */
 #define WD_PROBE_BUDGET_MS      1200u  /* Obergrenze fuer die Gateway-Sonde -
                                         * blockiert bridge_tick() kurzzeitig,
                                         * siehe Kommentar dort                */
+
+/*
+ * Dreistufige Eskalation statt direktem esp_restart().
+ *
+ * Ein voller Neustart reisst den Ethernet-MAC/PHY kurz runter - das bringt
+ * die angeschlossene Kamera fuer die Dauer des Boots vom Netz, und je nach
+ * Kamera-Firmware braucht sie danach spuerbar Zeit, um sich zu erholen (am
+ * 2026-09-04 nach einem Portal-Neustart ca. 3 Minuten). Und wichtiger: ein
+ * Neustart repariert keine schlechte Funkumgebung - wenn die Stoerung noch
+ * da ist, scheitert der neue Verbindungsversuch nach dem Reboot genauso wie
+ * ein einfacher Reconnect. Ein Reboot ist also nur dann die richtige
+ * Reaktion, wenn der WLAN-Treiber selbst haengt (wie nach dem Jammer-Test:
+ * die Umgebung war zu dem Zeitpunkt schon wieder gut, nur der Treiber nicht).
+ *
+ * Welche Eskalation zuerst greift, haengt vom SYMPTOM ab:
+ *
+ * - WD_REASON_ETH_STALL (Link da, aber praktisch kein Verkehr von der
+ *   Kamera - siehe Erkennung unten): erst nur der Ethernet-Treiber neu
+ *   gestartet (bridge_reset_eth()), WLAN komplett unberuehrt. Ein reines
+ *   WLAN-Problem sollte diesen Weg NICHT nehmen - dafuer waere ein
+ *   Ethernet-Reset wirkungslos und stoert die Kamera ohne Grund.
+ * - Jeder andere Grund (Verlustquote, Reconnects, Gateway-Sonde - alles
+ *   WLAN-seitige Symptome): direkt WLAN trennen. wifi_evt() verbindet bei
+ *   WIFI_EVENT_STA_DISCONNECTED automatisch neu, solange s_active gilt -
+ *   kein zusaetzlicher esp_wifi_connect() noetig.
+ *
+ * Hilft der erste Schritt nicht (Symptom haelt an), kommt als naechstes
+ * IMMER der WLAN-Reconnect (falls nicht schon probiert). Hilft auch das
+ * nicht: Ultima Ratio, voller Neustart - aber ueber abort() statt
+ * esp_restart(), damit ein Coredump entsteht: der naechste Boot soll
+ * nachvollziehbar sein (Backtrace zeigt exakt diese Codestelle, Grund steht
+ * zusaetzlich in bridge_get_stats()->wd_last_reason, ueberlebt den Neustart
+ * im RTC-Speicher). Jede Stufe zaehlt bewusst NICHT als Fehlstart - beim
+ * Ethernet-Reset/Reconnect passiert ja gar kein Neustart, und selbst der
+ * finale Neustart ist ein sauberer Boot, kein gescheiterter.
+ */
+typedef enum {
+  WD_REASON_NONE        = 0,
+  WD_REASON_VERLUST     = 1,   /* Verlustquote ueber der Schwelle */
+  WD_REASON_DISCONNECTS = 2,   /* zu viele Reconnects im Fenster */
+  WD_REASON_SONDE       = 3,   /* Gateway-Sonde fehlgeschlagen */
+  WD_REASON_ETH_STALL   = 4,   /* Link da, aber kein Verkehr von der Kamera */
+} wd_reason_t;
+
+static const char *wd_reason_str(uint8_t r) {
+  switch (r) {
+    case WD_REASON_VERLUST:     return "verlust";
+    case WD_REASON_DISCONNECTS: return "disconnects";
+    case WD_REASON_SONDE:       return "sonde";
+    case WD_REASON_ETH_STALL:   return "eth_stall";
+    default:                    return "";
+  }
+}
+
+typedef enum {
+  WD_STAGE_NORMAL       = 0,
+  WD_STAGE_ETH_RESET    = 1,   /* Ethernet-Reset bereits versucht */
+  WD_STAGE_WIFI_RECONNECT = 2, /* WLAN-Reconnect bereits versucht (direkt
+                                 * oder nach einem erfolglosen ETH-Reset) */
+} wd_stage_t;
+
+/* Fehlstart-Ausnahme: einmalig auswertbar, wird beim Lesen geloescht - siehe
+ * bridge_consume_planned_restart(). Analog zu main.cpp's PORTAL_MAGIC. */
+#define WD_RESTART_MAGIC 0x57445254u  /* "WDRT" */
+RTC_NOINIT_ATTR static uint32_t s_wd_restart_magic;
+
+/* Anzeige-Grund: NICHT einmalig, bleibt fuer /api/status bzw. MQTT stehen,
+ * bis der naechste Watchdog-Neustart ihn ueberschreibt. Eigenes Magic-Wort,
+ * weil RTC-Speicher nach einem echten Kaltstart undefiniert ist. */
+#define WD_REASON_MAGIC  0x57445253u  /* "WDRS" */
+RTC_NOINIT_ATTR static uint32_t s_wd_reason_magic;
+RTC_NOINIT_ATTR static uint8_t  s_wd_reason;
+
+void bridge_mark_planned_restart(uint8_t reason) {
+  s_wd_restart_magic = WD_RESTART_MAGIC;
+  s_wd_reason_magic  = WD_REASON_MAGIC;
+  s_wd_reason        = reason;
+}
+
+bool bridge_consume_planned_restart(void) {
+  const bool planned = (s_wd_restart_magic == WD_RESTART_MAGIC);
+  s_wd_restart_magic = 0;
+  return planned;
+}
 
 static uint32_t s_wd_t0 = 0, s_wd_pkt0 = 0, s_wd_drop0 = 0, s_wd_disc0 = 0;
 static uint8_t  s_wd_bad = 0;
 static uint8_t  s_wd_probe = 0;   /* 0=nicht noetig/aus, 1=ok, 2=fehlgeschlagen -
                                    * fuer /api/status, siehe BridgeStats.wd_probe */
+static uint8_t  s_wd_stage = WD_STAGE_NORMAL;
+static uint32_t s_wd_reconnects = 0;   /* seit Boot, fuer /api/status/MQTT */
+static uint32_t s_wd_eth_resets = 0;   /* seit Boot, fuer /api/status/MQTT */
+
+/* Ethernet-Treiber neu starten, ohne den Chip neu zu booten. Kein Netif
+ * involviert (siehe Datei-Kommentar oben - der Datenpfad ist roh), also
+ * keine der Fallstricke, die bei einem doppelten Netif-Anlegen drohen
+ * (siehe portal_start_ap() in web.cpp). Callback und Promiscuous-Modus
+ * ueberleben einen Stop/Start moeglicherweise nicht zuverlaessig - werden
+ * daher sicherheitshalber neu gesetzt, identisch zu bridge_activate(). */
+bool bridge_reset_eth(void) {
+  if (!s_eth) return false;   /* noch nicht initialisiert - z.B. Provisionierung */
+
+  printf("[ETH ] Treiber-Reset angefordert\n");
+  esp_eth_stop(s_eth);
+  delay(500);   /* der Link-Partner (Kamera) soll den Down/Up wirklich sehen,
+                 * kein zu kurzer Blip, den ihr PHY wegfiltert */
+  esp_eth_start(s_eth);
+
+  esp_eth_update_input_path(s_eth, eth_rx_cb, NULL);
+  bool promisc = true;
+  esp_eth_ioctl(s_eth, ETH_CMD_S_PROMISCUOUS, &promisc);
+  return true;
+}
 
 /* Aktuell auf dem Management-Netif eingetragenes Gateway auslesen - nicht
  * erneut aus g_cfg/Profilwahl ableiten (drei moegliche Profile), sondern
@@ -1124,7 +1240,7 @@ static void watchdog_tick(void) {
    * Bewertung - ein Neustart mitten im Firmware-Flash waere fatal, und ohne
    * aktiven Datenpfad sind die Zaehler ohnehin bedeutungslos. */
   if (!g_cfg.wd_enable || !s_active || s_paused) {
-    s_wd_bad = 0; s_wd_t0 = 0; s_wd_probe = 0;
+    s_wd_bad = 0; s_wd_t0 = 0; s_wd_probe = 0; s_wd_stage = 0;
     return;
   }
 
@@ -1143,34 +1259,91 @@ static void watchdog_tick(void) {
   s_wd_disc0 = s_wifi_disc_count;
 
   bool schlecht = false;
+  uint8_t grund = WD_REASON_NONE;
+
   if (dp + dd >= WD_MIN_PAKETE) {
     /* Genug echter Verkehr - die Verlustquote entscheidet, keine Sonde
      * noetig (spart Luftzeit waehrend eines laufenden Streams). */
     s_wd_probe = 0;
     const uint32_t promille = (1000ULL * dd) / (dp + dd);
-    if (promille >= WD_VERLUST_PROMILLE) schlecht = true;
+    if (promille >= WD_VERLUST_PROMILLE) { schlecht = true; grund = WD_REASON_VERLUST; }
   } else {
     uint8_t gw[4];
     if (!wd_gateway_holen(gw)) {
       s_wd_probe = 0;   /* kein Gateway bekannt - keine Aussage moeglich */
     } else if (gateway_erreichbar(gw, WD_PROBE_BUDGET_MS)) {
       s_wd_probe = 1;
+      /* WLAN nachweislich in Ordnung - das beantwortet aber nicht, ob die
+       * Kamera selbst noch etwas liefert. Bei dieser Installation laeuft ein
+       * Dauerstream (siehe history.md); echte Stille trotz bestehendem Link
+       * ist hier abnormal und ein eigenstaendiges Symptom, kein WLAN-Problem -
+       * deshalb eigener Grund statt einfach "schlecht" von oben. */
+      if (s_eth_link && (dp + dd) < WD_ETH_STALL_PAKETE) {
+        schlecht = true; grund = WD_REASON_ETH_STALL;
+      }
     } else {
       s_wd_probe = 2;
-      schlecht = true;
+      schlecht = true; grund = WD_REASON_SONDE;
     }
   }
-  if (ddisc >= WD_DISC_JE_FENSTER) schlecht = true;
+  /* Reconnects gehen vor - wenn mehreres zutrifft, ist das haeufigere
+   * Neuassoziieren das aussagekraeftigere Symptom. */
+  if (ddisc >= WD_DISC_JE_FENSTER) { schlecht = true; grund = WD_REASON_DISCONNECTS; }
 
   s_wd_bad = schlecht ? (uint8_t)(s_wd_bad + 1) : 0;
-  printf("[WD  ] Fenster: %u Pakete, %u Verlust, %u Reconnects, Sonde=%u -> %s (%u/%u)\n",
-         (unsigned)(dp + dd), (unsigned)dd, (unsigned)ddisc, (unsigned)s_wd_probe,
-         schlecht ? "schlecht" : "ok", (unsigned)s_wd_bad, (unsigned)WD_SCHLECHTE_FENSTER);
+  printf("[WD  ] Stufe %u, Fenster: %u Pakete, %u Verlust, %u Reconnects, Sonde=%u, Grund=%s -> %s (%u/%u)\n",
+         (unsigned)s_wd_stage, (unsigned)(dp + dd), (unsigned)dd, (unsigned)ddisc,
+         (unsigned)s_wd_probe, wd_reason_str(grund), schlecht ? "schlecht" : "ok",
+         (unsigned)s_wd_bad, (unsigned)WD_SCHLECHTE_FENSTER);
 
-  if (s_wd_bad >= WD_SCHLECHTE_FENSTER) {
-    printf("[WD  ] %u schlechte Fenster in Folge - Neustart\n", (unsigned)s_wd_bad);
-    esp_restart();
+  if (!schlecht) {
+    /* Erholt - eine eventuell laufende Eskalation ist erledigt. */
+    s_wd_stage = WD_STAGE_NORMAL;
+    return;
   }
+  if (s_wd_bad < WD_SCHLECHTE_FENSTER) return;
+
+  /* Naechstes Fenster startet in jedem Eskalationsschritt frisch - die
+   * Massnahme selbst braucht ein paar Sekunden, die sollen dem aktuell
+   * laufenden Fenster nicht angelastet werden. */
+  s_wd_bad = 0;
+  s_wd_t0  = 0;
+
+  if (s_wd_stage == WD_STAGE_NORMAL && grund == WD_REASON_ETH_STALL) {
+    /* Kamera-seitiges Symptom -> zuerst nur Ethernet zuruecksetzen, WLAN
+     * bleibt unberuehrt. */
+    printf("[WD  ] Kein Verkehr von der Kamera trotz Link - setze Ethernet zurueck\n");
+    bridge_reset_eth();
+    s_wd_eth_resets++;
+    telemetry_note_watchdog_event("eth_reset", wd_reason_str(grund));
+    s_wd_stage = WD_STAGE_ETH_RESET;
+    return;
+  }
+
+  if (s_wd_stage != WD_STAGE_WIFI_RECONNECT) {
+    /* Entweder ein WLAN-seitiges Symptom (direkt hier rein), oder ein
+     * Ethernet-Reset in der vorigen Runde hat nicht geholfen - in beiden
+     * Faellen jetzt WLAN trennen. wifi_evt() verbindet bei
+     * WIFI_EVENT_STA_DISCONNECTED automatisch neu (s_active gilt hier immer),
+     * ein zusaetzlicher esp_wifi_connect() waere doppelt gemoppelt. */
+    printf("[WD  ] Trenne WLAN fuer Neuverbindung\n");
+    esp_wifi_disconnect();
+    s_wd_reconnects++;
+    telemetry_note_watchdog_event("wifi_reconnect", wd_reason_str(grund));
+    s_wd_stage = WD_STAGE_WIFI_RECONNECT;
+    return;
+  }
+
+  /* Weder Ethernet-Reset (falls versucht) noch WLAN-Reconnect halfen -
+   * letzte Eskalationsstufe. abort() statt esp_restart(), damit ein
+   * Coredump entsteht: der naechste Boot soll nachvollziehbar sein, nicht
+   * nur "es startete neu". */
+  printf("[WD  ] Keine Besserung - erzwinge Neustart mit Coredump (Grund %s)\n",
+         wd_reason_str(grund));
+  telemetry_note_watchdog_event("reboot", wd_reason_str(grund));
+  bridge_mark_planned_restart(grund);
+  delay(400);   /* Log-Zeile und MQTT-Publish noch rausgehen lassen */
+  abort();
 }
 
 /* ===========================================================================
@@ -1205,6 +1378,9 @@ void bridge_get_stats(BridgeStats *o) {
   o->kbps_wifi2eth = s_kbps_w2e;
   o->wifi_disc_count = s_wifi_disc_count;
   o->wd_probe      = s_wd_probe;
+  o->wd_reconnects = s_wd_reconnects;
+  o->wd_eth_resets = s_wd_eth_resets;
+  o->wd_last_reason = (s_wd_reason_magic == WD_REASON_MAGIC) ? s_wd_reason : 0;
   o->eth_link      = s_eth_link;
   o->wifi_up       = s_wifi_up;
   strcpy(o->bssid, s_bssid_str);
