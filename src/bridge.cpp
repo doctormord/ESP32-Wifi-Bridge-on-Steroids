@@ -100,6 +100,30 @@ void      esp_wifi_internal_free_rx_buffer(void *buffer);
  * Messungen 0 geblieben. Hier gibt es nichts zu gewinnen. */
 #define WIFI_TX_RETRIES_DEF 1
 #define WIFI_CONNECT_TIMEOUT_MS 12000
+/* Mehrere Versuche pro SSID statt nur einem, bevor bridge_wifi_start()
+ * aufgibt und main.cpp direkt ins Portal umleitet (main.cpp: "WLAN
+ * fehlgeschlagen - Neustart direkt ins Portal").
+ *
+ * Grund: ein einzelner 12s-Versuch reicht nicht fuer zwei ganz normale,
+ * voruebergehende Faelle. Erstens eine noch nicht abgelaufene alte
+ * Assoziation der GEKLONTEN MAC beim AP - am 2026-08-14 in diesem Projekt
+ * schon einmal als 802.11-Reason-204 dokumentiert (der AP haelt die alte
+ * Session noch, waehrend sich dieselbe MAC schon wieder anmeldet). Ein
+ * schneller abort()-Neustart (Watchdog-Eskalation, siehe watchdog_tick())
+ * ist genau der Fall, der diese Situation am ehesten erzeugt. Zweitens
+ * schlicht eine kurze Funkstoerung, die noch nicht abgeklungen ist -
+ * insbesondere direkt nach einem Watchdog-Neustart, dessen Ursache ja per
+ * Definition eine WLAN-Stoerung war und die sich nicht zwingend in der
+ * einen Sekunde bis zum naechsten Boot aufgeloest hat.
+ *
+ * Ohne Wiederholung wirft ein einziger schlechter Moment die Bruecke sofort
+ * ins Portal (192.168.4.1, fuer alle anderen Geraete unsichtbar) - erlebt
+ * am 2026-09-05, direkt nach einem Watchdog-Neustart mit Grund "Gateway-
+ * Sonde fehlgeschlagen". Bewusst als Wiederholung DERSELBEN SSID, nicht als
+ * laengerer Timeout: das eigentliche Problem ist "kurz warten und nochmal
+ * versuchen", nicht "laenger auf denselben einen Versuch warten". */
+#define WIFI_CONNECT_RETRIES        3
+#define WIFI_CONNECT_RETRY_DELAY_MS 2000
 
 /* Die Retry-Zaehler liegen als eigene Variablen und nicht als g_cfg-Zugriff
  * im Datenpfad: eth_rx_cb/wifi_rx_cb laufen im IRAM und werden pro Paket
@@ -834,10 +858,19 @@ bool bridge_wifi_start(void) {
      * nicht weiter oben bei den uebrigen Einstellungen. */
     bridge_apply_live_tuning();
 
-    esp_wifi_connect();
+    for (int versuch = 0; versuch < WIFI_CONNECT_RETRIES; versuch++) {
+      if (versuch > 0) {
+        printf("[WIFI] '%s' Versuch %d/%d...\n", nets[i].ssid,
+               versuch + 1, WIFI_CONNECT_RETRIES);
+        delay(WIFI_CONNECT_RETRY_DELAY_MS);
+      }
+      esp_wifi_connect();
 
-    uint32_t t0 = millis();
-    while (!s_wifi_up && (millis() - t0) < WIFI_CONNECT_TIMEOUT_MS) delay(100);
+      uint32_t t0 = millis();
+      while (!s_wifi_up && (millis() - t0) < WIFI_CONNECT_TIMEOUT_MS) delay(100);
+      if (s_wifi_up) break;
+      esp_wifi_disconnect();
+    }
     if (s_wifi_up) {
       /* Verbunden - aber an WELCHEM Standort? Der SSID-Slot verraet es nicht,
        * wenn mehrere Orte dasselbe WLAN heissen. Also die belegten Profile
@@ -850,7 +883,8 @@ bool bridge_wifi_start(void) {
       return true;
     }
 
-    printf("[WIFI] '%s' fehlgeschlagen\n", nets[i].ssid);
+    printf("[WIFI] '%s' fehlgeschlagen nach %d Versuchen\n",
+           nets[i].ssid, WIFI_CONNECT_RETRIES);
     esp_wifi_disconnect();
     esp_wifi_stop();
   }
