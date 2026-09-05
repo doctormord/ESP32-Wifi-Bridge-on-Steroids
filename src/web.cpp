@@ -385,10 +385,9 @@ button.sec{background:#2f3542;color:var(--fg)}
   <div class="sub" style="margin:6px 0 0">
     Wie lange und wie oft eine SSID beim Start probiert wird, bevor die
     naechste konfigurierte SSID dran ist bzw. ganz aufgegeben und ins Portal
-    gewechselt wird. War frueher ein einzelner 12-Sekunden-Versuch ohne
-    Wiederholung - reichte nicht immer: der Router haelt eine alte
-    WLAN-Sitzung der (geklonten) MAC manchmal noch kurz, waehrend sich die
-    Bruecke nach einem schnellen Neustart schon wieder anmeldet.
+    gewechselt wird. Mehrere Versuche fangen ab, dass der Router eine alte
+    WLAN-Sitzung der (geklonten) MAC nach einem schnellen Neustart manchmal
+    noch kurz haelt und der erste Versuch deshalb scheitert.
   </div>
 
   <label>Kanalbreite</label>
