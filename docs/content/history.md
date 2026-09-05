@@ -276,3 +276,32 @@ Folgefrage von Christian: laesst sich das nicht eleganter loesen, z.B. per DHCP-
 Auf Hardware verifiziert: OTA erfolgreich, `wd_eth_resets` vorhanden und 0 nach Boot. Manueller Ethernet-Reset live ausgeloest: Link erholte sich, Kamera-Traffic lief sofort weiter, kein Bridge-Neustart. Heap sackte kurzzeitig um ~40 kB ab (88,6 -> 41,6 kB) und erholte sich innerhalb von 10 s vollstaendig auf 95 kB — einmalig beobachtet, kein Leck.
 
 **Offen geblieben:** ob ein reiner WLAN-Reconnect (Stufe 1/2) den urspruenglichen Jammer-Zustand (haengender Treiber trotz wiederhergestellter Umgebung) tatsaechlich loest, wurde nie isoliert getestet — beim naechsten echten Vorfall dieser Art zeigt sich das live. Ebenso weiterhin offen: die tieferliegende Ursache dafuer, dass die WLAN-Bedingungen ueberhaupt so lange anhaltend schlecht waren, dass der Watchdog in eine Neustart-Spirale geriet.
+
+## 2026-09-05 — Zweite Luecke im Absturzschleifen-Schutz gefunden und geschlossen
+
+### Wieder unerreichbar, diesmal per Coredump aufgeklaert
+
+Trotz des 09-04-Fixes fand Christian die Bruecke erneut im Portal-Modus (`prov:1`, `192.168.4.1`), diesmal mit einem tatsaechlich vorhandenen Coredump. Entschluesselt (Quellcode zum exakt laufenden Commit neu gebaut, `addr2line` gegen das frische `firmware.elf` - kein archiviertes `.elf` noetig, da main-Checkout und Build identisch waren): der Stacktrace fuehrte glasklar durch `panic_abort -> esp_system_abort -> abort -> bridge_tick() (bridge.cpp:1346, watchdog_tick() inline) -> app_main -> main_task`. Kein mysterioeser Absturz - exakt der eigene, absichtliche `abort()` aus der letzten Watchdog-Eskalationsstufe, wie vorgesehen ausgeloest. `wd_last_reason:3` (Gateway-Sonde fehlgeschlagen) bestaetigte: WLAN war zum Eskalationszeitpunkt wirklich unerreichbar, kein reines Verlustproblem.
+
+### Die Luecke: ein einziger fehlgeschlagener Reconnect-Versuch reicht
+
+Der 09-04-Fix hatte Watchdog-Neustarts korrekt vom 3-Fehlstart-Zaehler ausgenommen. Trotzdem landete die Bruecke wieder im Portal - ueber einen KOMPLETT ANDEREN, bis dahin unbeachteten Pfad: `bridge_wifi_start()` gab jeder konfigurierten SSID nur EINEN Verbindungsversuch (12 s Timeout, keine Wiederholung). Scheiterte der, setzte `main.cpp` sofort `s_portal_request = PORTAL_MAGIC` und startete direkt ins Portal um - unabhaengig vom Fehlstart-Zaehler, der ueberhaupt nicht befragt wird. Mit nur einem konfigurierten Netzwerkprofil (`BMI_2G`) reichte also ein einziger schlechter Moment fuer den Rueckfall ins unerreichbare Portal.
+
+Christian fragte zurecht nach, warum ein Reboot ueberhaupt einen neuen WLAN-Verbindungsversuch retten sollte, wenn ein reiner Reconnect es nicht tut - berechtigter Einwand, siehe dazu den 09-04-Eintrag oben (ein Reboot repariert keine schlechte Funkumgebung). Die eigentliche Erklaerung liegt woanders: zwei ganz gewoehnliche, voruebergehende Ursachen fuer einen einzelnen fehlgeschlagenen Versuch direkt nach einem (schnellen `abort()`-)Neustart:
+
+1. **Alte Assoziation der GEKLONTEN MAC beim Router** - bereits am 2026-08-14 in diesem Projekt als 802.11-Reason-204 dokumentiert: der AP haelt die alte Sitzung noch, waehrend sich dieselbe MAC schon wieder anmeldet.
+2. **Die Funkstoerung, die den Watchdog erst zum Eskalieren brachte, war eine Sekunde spaeter noch nicht zwingend weg.**
+
+### Fix: Wiederholung statt laengerem Timeout, jetzt Portal-einstellbar
+
+`bridge_wifi_start()` probiert dieselbe SSID jetzt mehrfach (Standard 3×, 2 s Pause dazwischen) mit je 20 s Timeout (Standard vorher 12 s/1 Versuch, nie gemessen, nur geraten), bevor das naechste Profil bzw. das Portal drankommt. Auf Nachfrage von Christian, warum ausgerechnet 12s/1 Versuch "empirisch" sein sollten (waren sie nie) - beide Werte sind jetzt zusaetzlich per Portal ueberschreibbar (`wifi_connect_timeout_s`, `wifi_connect_retries`, 0 = Firmware-Standard, gleiche Konvention wie die uebrige Feinabstimmung), damit sich ein falscher Standardwert ohne Neuflashen korrigieren laesst.
+
+### Portal-Idle-Neustart: die Grundsatzluecke aus dem Backlog geschlossen
+
+Zusaetzlich, auf Vorschlag von Christian: `ap_idle_reboot_s` (Standard 900 s = 15 min, ebenfalls Portal-einstellbar). Solange die Bruecke im Portal-Modus ohne ECHTE Portal-Nutzung haengt (Seite geladen, Konfiguration gespeichert oder gescannt - der automatische 2-Sekunden-Status-Poll zaehlt bewusst NICHT, sonst wuerde ein offen gelassener Browser-Tab den Neustart fuer immer verhindern, siehe `web_last_activity_ms()` in `web.cpp`), versucht sie nach dieser Zeit von selbst einen normalen Neustart mit den vorhandenen Zugangsdaten. Gate auf `g_cfg.configured`, damit sich ein frisches oder werksrueckgesetztes Geraet nicht sinnlos im Kreis neu startet, wo es nichts zu wiederholen gibt. Das schliesst die seit 2026-08-31 im Backlog stehende Luecke ("boot-loop guard has no automatic way back").
+
+### Portal-Texte bereinigt
+
+Auf Hinweis von Christian: die neue WLAN-Verbindungsversuch-Beschreibung im Portal erzaehlte die Debug-Geschichte nach ("War frueher ein einzelner 12-Sekunden-Versuch... reichte nicht immer"), statt schlicht das aktuelle Verhalten zu beschreiben. Portal-Text ist fuer Endnutzer, nicht fuer die Entwicklungshistorie - die gehoert in Code-Kommentare und hierher, nicht in die Oberflaeche. Korrigiert, ohne die Historie in den Code-Kommentaren oder hier anzufassen.
+
+Auf Hardware verifiziert ueber vier OTA-Zyklen (Retry-Fix, Portal-Parameter + AP-Idle-Reboot, Text-Cleanup): Bridge und Kamera nach jedem Zyklus gesund, neue Felder (`wifi_connect_timeout_s`, `wifi_connect_retries`, `ap_idle_reboot_s`) korrekt in `/api/config` sichtbar (effektiv und im `def`-Block).
