@@ -22,6 +22,9 @@
 
 static httpd_handle_t s_httpd = NULL;
 static bool           s_provisioning = false;
+static uint32_t       s_last_activity_ms = 0;
+
+uint32_t web_last_activity_ms(void) { return s_last_activity_ms; }
 
 /* ===========================================================================
  * Access Point
@@ -336,6 +339,22 @@ button.sec{background:#2f3542;color:var(--fg)}
     <div id="ethmsg" style="margin-top:8px;font-size:13px"></div>
   </div>
 
+  <div style="margin-top:14px;padding:12px;background:#232833;border-radius:8px">
+    <b style="font-size:13px">Portal-Idle-Neustart</b>
+    <div class="sub" style="margin:4px 0 8px">
+      Solange die Bruecke im Portal-Modus (Setup-WLAN, 192.168.4.1) haengt,
+      ist sie im normalen Netz unsichtbar. Ohne aktive Portal-Nutzung
+      (Seite geladen, gespeichert oder gescannt - der automatische
+      2&#8209;Sekunden-Status-Poll zaehlt bewusst NICHT mit) versucht sie
+      nach dieser Zeit von selbst wieder einen normalen Start mit den
+      vorhandenen Zugangsdaten. Greift nur, wenn ueberhaupt ein WLAN
+      konfiguriert ist - sonst wuerde ein frisches oder werksrueckgesetztes
+      Geraet sich sinnlos im Kreis neu starten.
+    </div>
+    <label>Zeit bis zum Neustart-Versuch (s)</label>
+    <input id="ap_idle_reboot_s">
+  </div>
+
   <div class="tag reboot">&#9679; erst nach NEUSTART wirksam</div>
   <div class="row">
     <div><label>Statische RX-Puffer</label>
@@ -355,6 +374,20 @@ button.sec{background:#2f3542;color:var(--fg)}
     Heap von 111 auf 9&nbsp;kB fallen und halbierte den Durchsatz.
     Der Heap steht oben im Status &ndash; faellt er unter etwa 30&nbsp;kB, ist es
     zu viel.
+  </div>
+
+  <div class="row">
+    <div><label>WLAN-Verbindungsversuch: Timeout (s)</label>
+      <input id="wifi_connect_timeout_s"></div>
+    <div><label>WLAN-Verbindungsversuch: Wiederholungen</label>
+      <input id="wifi_connect_retries"></div>
+  </div>
+  <div class="sub" style="margin:6px 0 0">
+    Wie lange und wie oft eine SSID beim Start probiert wird, bevor die
+    naechste konfigurierte SSID dran ist bzw. ganz aufgegeben und ins Portal
+    gewechselt wird. Mehrere Versuche fangen ab, dass der Router eine alte
+    WLAN-Sitzung der (geklonten) MAC nach einem schnellen Neustart manchmal
+    noch kurz haelt und der erste Versuch deshalb scheitert.
   </div>
 
   <label>Kanalbreite</label>
@@ -456,7 +489,8 @@ const CFG=['name','ssid1','ssid2','ssid3','ip','mask','gw','ip2','mask2','gw2','
            'mqtt_host','mqtt_port','mqtt_user','telemetry_s',
            'tx_power','eth_tx_retries','wifi_tx_retries',
            'static_rx_buf','dynamic_rx_buf','dynamic_tx_buf','rx_ba_win',
-           'ht40','no_11b','wd_enable'];
+           'ht40','no_11b','wd_enable',
+           'wifi_connect_timeout_s','wifi_connect_retries','ap_idle_reboot_s'];
 async function load(){
   const c=await(await fetch('/api/config')).json();
   DEF=c.def||null;
@@ -566,6 +600,7 @@ load();tick();checkCoredump();setInterval(tick,2000);
  * ========================================================================= */
 
 static esp_err_t h_root(httpd_req_t *r) {
+  s_last_activity_ms = millis();
   httpd_resp_set_type(r, "text/html; charset=utf-8");
   /* Ohne Cache-Steuerung speichern Browser HTML heuristisch zwischen - nach
    * einem Firmware-Update sieht man dann die alte Seite, samt fehlender oder
@@ -625,6 +660,7 @@ static esp_err_t h_status(httpd_req_t *r) {
 }
 
 static esp_err_t h_config_get(httpd_req_t *r) {
+  s_last_activity_ms = millis();
   char ip[16], mask[16], gw[16];
   format_ipv4(g_cfg.mgmt_ip,   ip,   sizeof(ip));
   format_ipv4(g_cfg.mgmt_mask, mask, sizeof(mask));
@@ -682,9 +718,12 @@ static esp_err_t h_config_get(httpd_req_t *r) {
     "\"tx_power\":%d,\"eth_tx_retries\":%u,\"wifi_tx_retries\":%u,"
     "\"static_rx_buf\":%u,\"dynamic_rx_buf\":%u,\"dynamic_tx_buf\":%u,"
     "\"rx_ba_win\":%u,\"ht40\":%u,\"no_11b\":%u,\"wd_enable\":%u,"
+    "\"wifi_connect_timeout_s\":%u,\"wifi_connect_retries\":%u,"
+    "\"ap_idle_reboot_s\":%u,"
     "\"def\":{\"eth_tx_retries\":%u,\"wifi_tx_retries\":%u,"
     "\"static_rx_buf\":%u,\"dynamic_rx_buf\":%u,\"dynamic_tx_buf\":%u,"
-    "\"rx_ba_win\":%u}}",
+    "\"rx_ba_win\":%u,\"wifi_connect_timeout_s\":%u,"
+    "\"wifi_connect_retries\":%u,\"ap_idle_reboot_s\":%u}}",
     n, s1, s2, s3, ip, mask, gw, ip2, mask2, gw2, ip3, mask3, gw3,
     mh, g_cfg.mqtt_port, mu, g_cfg.telemetry_s,
     /* Die WIRKSAMEN Werte ausliefern, nicht die gespeicherte 0 - im Formular
@@ -693,8 +732,10 @@ static esp_err_t h_config_get(httpd_req_t *r) {
     (int)g_cfg.tx_power, eff.eth_retries, eff.wifi_retries,
     eff.static_rx, eff.dyn_rx, eff.dyn_tx,
     eff.ba_win, g_cfg.ht40, g_cfg.no_11b, g_cfg.wd_enable,
+    eff.wifi_connect_timeout_s, eff.wifi_connect_retries, eff.ap_idle_reboot_s,
     def.eth_retries, def.wifi_retries,
-    def.static_rx, def.dyn_rx, def.dyn_tx, def.ba_win);
+    def.static_rx, def.dyn_rx, def.dyn_tx, def.ba_win,
+    def.wifi_connect_timeout_s, def.wifi_connect_retries, def.ap_idle_reboot_s);
 
   httpd_resp_set_type(r, "application/json");
   httpd_resp_set_hdr(r, "Cache-Control", "no-store");
@@ -702,6 +743,7 @@ static esp_err_t h_config_get(httpd_req_t *r) {
 }
 
 static esp_err_t h_config_post(httpd_req_t *r) {
+  s_last_activity_ms = millis();
   /* Grosszuegiger als noetig, aber nicht beliebig: das Formular schickt immer
    * ALLE Felder mit, und im unguenstigsten Fall sind Passwoerter und SSIDs
    * komplett prozentkodiert (drei Zeichen pro Byte). Mit den neun Tuning-
@@ -815,9 +857,35 @@ static esp_err_t h_config_post(httpd_req_t *r) {
   if (form_get(body, "ht40",   v, sizeof(v))) g_cfg.ht40   = (uint8_t)(atoi(v) ? 1 : 0);
   if (form_get(body, "no_11b", v, sizeof(v))) g_cfg.no_11b = (uint8_t)(atoi(v) ? 1 : 0);
 
+  /* Wirken erst beim naechsten Verbindungsaufbau (bridge_wifi_start()), nicht
+   * sofort - anders als tx_power/Retries greifen sie nicht in eine bereits
+   * bestehende Verbindung ein. Obergrenzen bewusst grosszuegig, aber nicht
+   * beliebig: ein Vertipper soll das Board nicht auf Minuten pro Versuch
+   * hochtreiben. */
+  if (form_get(body, "wifi_connect_timeout_s", v, sizeof(v))) {
+    int t = atoi(v);
+    if (t != 0 && t < 3) t = 3;
+    if (t > 60)          t = 60;
+    g_cfg.wifi_connect_timeout_s = (uint16_t)t;
+  }
+  if (form_get(body, "wifi_connect_retries", v, sizeof(v))) {
+    int t = atoi(v);
+    if (t < 0)  t = 0;
+    if (t > 10) t = 10;
+    g_cfg.wifi_connect_retries = (uint8_t)t;
+  }
+
   /* Wirkt sofort - watchdog_tick() liest g_cfg.wd_enable direkt, kein
    * Neustart noetig, damit "ausschalten" auch sofort greift. */
   if (form_get(body, "wd_enable", v, sizeof(v))) g_cfg.wd_enable = (uint8_t)(atoi(v) ? 1 : 0);
+
+  /* Untergrenze 60s, damit ein Vertipper (z.B. "5" statt "500") das Geraet
+   * nicht in eine schnelle Neustart-Schleife im Portal-Modus schickt. */
+  if (form_get(body, "ap_idle_reboot_s", v, sizeof(v))) {
+    int t = atoi(v);
+    if (t != 0 && t < 60) t = 60;
+    g_cfg.ap_idle_reboot_s = (uint16_t)(t < 0 ? 0 : t);
+  }
 
   g_cfg.configured = (g_cfg.ssid1[0] != '\0');
 
@@ -858,6 +926,7 @@ static esp_err_t h_eth_reset(httpd_req_t *r) {
 }
 
 static esp_err_t h_scan(httpd_req_t *r) {
+  s_last_activity_ms = millis();
   wifi_scan_config_t sc = {};
   sc.show_hidden = false;
 

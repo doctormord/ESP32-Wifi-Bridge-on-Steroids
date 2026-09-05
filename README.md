@@ -65,7 +65,7 @@ These do essentially the same MAC-cloning trick, and they work. What you don't g
 - **Static management IP on the same interface**, selectively delivered to lwIP. The bridge is reachable while bridging.
 - **Self-contained web portal** — status, configuration, tuning, firmware upload. Single embedded page, no external assets, no internet required.
 - **Provisioning mode**: with no credentials stored, the board opens an access point and serves the same portal at `192.168.4.1`.
-- **JSON API** (`/api/status`, `/api/config`, `/api/scan`, `/api/reboot`, `/api/update`, `/api/autotune`) — everything the portal does is scriptable.
+- **JSON API** (`/api/status`, `/api/config`, `/api/scan`, `/api/reboot`, `/api/update`, `/api/autotune`, `/api/coredump`, `/api/eth_reset`) — everything the portal does is scriptable.
 - **NetBIOS name announcement**, so the bridge shows up by name instead of "unknown" in routers that read NBNS (FritzBox does; OpenWrt-based routers do not).
 
 ### Multi-site operation
@@ -74,12 +74,20 @@ These do essentially the same MAC-cloning trick, and they work. What you don't g
 - **Automatic location detection**: after associating, the bridge pings each configured profile's gateway and adopts the one that answers. This works even when both sites use the *same SSID* — a case where selecting by SSID alone cannot work.
 - **Strongest-AP selection** (`WIFI_ALL_CHANNEL_SCAN` + `WIFI_CONNECT_AP_BY_SIGNAL`). In a mesh with several nodes sharing an SSID, the ESP-IDF default (`WIFI_FAST_SCAN`) picks whichever it finds first and never re-evaluates. Getting this wrong cost 20 dB and two thirds of the throughput in testing.
 
+### Self-healing watchdog
+
+- **Optional, portal-toggleable** (`wd_enable`, default off) — never a compile-time-only switch, since a deployed board has no other way to reach it.
+- **Escalates by symptom, cheapest fix first.** Ethernet link up but the bridged device has gone silent (checked only once a gateway probe confirms Wi-Fi itself is fine) → reset just the Ethernet driver (`bridge_reset_eth()`, a driver stop/start — no chip reboot, Wi-Fi untouched). Any Wi-Fi-side symptom (drop ratio, reconnect churn, failed gateway probe) → disconnect/reconnect Wi-Fi directly (Ethernet untouched). If the symptom persists, the other lightweight remedy is tried next; only if *that* fails does it reboot.
+- **The final reboot provokes its own core dump** (`abort()`, not `esp_restart()`), so the next boot is diagnosable instead of just "it restarted". `wd_reconnects`, `wd_eth_resets` and `wd_last_reason` (which survives the reboot) are visible in `/api/status`, MQTT, and the portal; each escalation step also publishes an immediate MQTT event (`bridge/<node>/watchdog`) rather than waiting for the next periodic status refresh.
+- Manual "Ethernet neu starten" portal button (`POST /api/eth_reset`), independent of watchdog state.
+
 ### Updates and recovery
 
 - **OTA over HTTP** with automatic rollback. A firmware that does not confirm itself within 30 seconds of *network reachability* is undone by a single power cycle. This has been exercised repeatedly, including after real crashes.
-- **Crash-loop protection**: three starts without 60 seconds of stable operation, and the board falls back to the portal instead of rebooting forever.
+- **Crash-loop protection**: three starts without 60 seconds of stable operation, and the board falls back to the portal instead of rebooting forever. If it does land there, it now finds its own way back too — see "Portal idle auto-recovery" below.
+- **Portal idle auto-recovery**: while sitting in the provisioning AP with no active portal use (page load, config save, network scan — deliberately *not* the page's own status auto-poll, or a left-open browser tab would block this forever), the board retries a normal boot with whatever Wi-Fi credentials are already stored, once every `ap_idle_reboot_s` (default 15 minutes, portal-configurable). Only if credentials exist at all, so a factory-reset or never-configured board doesn't loop pointlessly.
 - **Factory reset** by holding GPIO14 low for two seconds at boot.
-- **Core dumps** to a dedicated flash partition, for a board with no serial access once installed.
+- **Core dumps** to a dedicated flash partition, retrievable over HTTP (`GET /api/coredump`: panic reason, crashing task, program counter, backtrace as JSON; `DELETE` to clear it) — for a board with no serial access once installed. `scripts/ota_flash.sh` archives the matching `firmware.elf` on every flash (`elf_archive/<git-rev>_<timestamp>.elf`) specifically so a later core dump's addresses can still be resolved with `addr2line` against the exact binary that produced it.
 
 ### Telemetry and diagnostics
 
@@ -91,7 +99,7 @@ These do essentially the same MAC-cloning trick, and they work. What you don't g
 ### Tuning
 
 - **Live** (no reboot): TX power, and TX retry counts for both directions.
-- **Reboot required**: Wi-Fi buffer counts, RX block-ack window, HT20/HT40, 802.11b rates.
+- **Reboot required**: Wi-Fi buffer counts, RX block-ack window, HT20/HT40, 802.11b rates, Wi-Fi connect timeout/retry count (how hard the board tries a configured SSID before moving to the next one or giving up), portal idle-reboot delay.
 - **Autotune**: sweeps the retry count, measures the loss rate under real traffic, and picks the *smallest* value that stays under 0.10 % — not the best one, because every retry blocks the Ethernet receive task a little longer. Aborts honestly if there is not enough traffic to measure.
 
 ---
@@ -206,7 +214,9 @@ Raising `dynamic_tx_buf` from 32 to 64 dropped free heap from 111 kB to 9 kB and
 
 ## MQTT
 
-Publishes to `bridge/<mac-suffix>/state` as JSON, with an availability topic and Home Assistant autodiscovery under `homeassistant/sensor/…`. Sensors: RSSI, channel, throughput up/down, packets up/down, drops up/down, uptime, free heap, client IP, and Ethernet link as a connectivity binary sensor.
+Publishes to `bridge/<mac-suffix>/state` as JSON, with an availability topic and Home Assistant autodiscovery under `homeassistant/sensor/…`. Sensors: RSSI, channel, throughput up/down, packets up/down, drops up/down, uptime, free heap, client IP, watchdog Wi-Fi-reconnect and Ethernet-reset counters, and Ethernet link as a connectivity binary sensor.
+
+Each watchdog escalation step additionally publishes an immediate, non-retained message to `bridge/<mac-suffix>/watchdog` (action, reason, uptime) — this shows up in Home Assistant history with its own receive timestamp, without the board needing to know wall-clock time.
 
 TLS is deliberately not supported — it would cost roughly 40 KB of flash for a device that only ever talks to a broker on the local network.
 
@@ -214,7 +224,7 @@ TLS is deliberately not supported — it would cost roughly 40 KB of flash for a
 
 ## Troubleshooting
 
-**Board unreachable after a config change.** Power-cycle. A firmware that failed to confirm itself is rolled back automatically; a bridge that could not associate restarts into the portal; three unstable starts in a row also land in the portal.
+**Board unreachable after a config change.** Power-cycle, or just wait: a firmware that failed to confirm itself is rolled back automatically; a bridge that could not associate restarts into the portal; three unstable starts in a row also land in the portal — and if it does land there with credentials already stored, it retries on its own after `ap_idle_reboot_s` (default 15 minutes) without a manual power cycle.
 
 **Bridge works, portal does not.** You are probably reaching it from the Ethernet side. Use the Wi-Fi side.
 
@@ -233,11 +243,19 @@ TLS is deliberately not supported — it would cost roughly 40 KB of flash for a
 ```
 src/
   main.cpp        entry point, boot modes, crash-loop protection, NetBIOS
-  bridge.cpp      the data path, Wi-Fi/Ethernet setup, autotune
+  bridge.cpp      the data path, Wi-Fi/Ethernet setup, autotune, watchdog
   web.cpp         portal page and JSON API
   config.cpp      NVS-backed configuration
   telemetry.cpp   MQTT and Home Assistant discovery
   compat.h        millis()/delay() over esp_timer/vTaskDelay
+scripts/
+  ota_flash.sh        build, archive firmware.elf, then OTA-upload — use this
+                      instead of a bare curl/pio upload so a later core dump
+                      stays decodable against the exact binary that produced it
+  gen_build_info.py   PlatformIO pre-build hook, writes the running git rev
+                      into src/build_info.h (exposed as "build" in /api/status)
+elf_archive/      per-build firmware.elf, named <git-rev>_<utc-timestamp>.elf
+                  (gitignored; written by scripts/ota_flash.sh)
 docs/content/     development log, backlog, handoff notes
 ```
 

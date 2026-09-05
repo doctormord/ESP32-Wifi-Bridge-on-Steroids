@@ -395,6 +395,23 @@ static void bridge_loop(void) {
 #ifndef BRIDGE_MINIMAL
     telemetry_tick();
 #endif
+  } else if (g_cfg.configured) {
+    /* Portal-Modus: nach einer Weile ohne aktive Portal-Nutzung selbst einen
+     * normalen Neustart versuchen - siehe config.h: ap_idle_reboot_s. Nur mit
+     * vorhandenen Zugangsdaten (g_cfg.configured), sonst wuerde sich ein
+     * frisches oder werksrueckgesetztes Geraet sinnlos im Kreis neu starten,
+     * ohne dass sich je etwas aendern koennte. web_last_activity_ms() zaehlt
+     * bewusst nur echte Konfigurationshandlungen, nicht den 2s-Status-Poll -
+     * sonst wuerde ein offen gelassener Browser-Tab den Neustart fuer immer
+     * verhindern. */
+    const uint32_t schwelle_ms =
+        (g_cfg.ap_idle_reboot_s ? g_cfg.ap_idle_reboot_s : AP_IDLE_REBOOT_S_DEF) * 1000UL;
+    if (millis() - web_last_activity_ms() >= schwelle_ms) {
+      printf("[BOOT] %lu s ohne Portal-Nutzung - Neustart-Versuch mit vorhandenen Zugangsdaten\n",
+             (unsigned long)(schwelle_ms / 1000));
+      delay(200);
+      esp_restart();
+    }
   }
   delay(50);
 }
