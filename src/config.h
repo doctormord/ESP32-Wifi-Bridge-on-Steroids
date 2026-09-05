@@ -117,6 +117,27 @@ struct BridgeConfig {
    * OTA-Uploads oder einer gezielten Diagnose unerwuenscht sein - deshalb
    * ausdruecklich ein Portal-Schalter statt fest einprogrammiert. */
   uint8_t  wd_enable;          /* 1 = Watchdog aktiv, 0 = aus (Default)      */
+
+  /* --- WLAN-Verbindungsaufbau und Portal-Idle-Neustart (angehaengt 2026-09-05)
+   * Ausgeloest durch einen echten Vorfall: nach einem erzwungenen
+   * Watchdog-Neustart scheiterte der einzige Verbindungsversuch (12 s, ohne
+   * Wiederholung) und die Bruecke landete unerreichbar im Portal - siehe
+   * history.md 2026-09-05. Beide Werte folgen der 0-Konvention von oben:
+   * 0 = Firmware-Standard, siehe bridge.cpp. */
+  uint16_t wifi_connect_timeout_s;  /* Timeout je Versuch, 0 = 20 s          */
+  uint8_t  wifi_connect_retries;    /* Versuche je SSID, 0 = 3               */
+
+  /* Wie lange die Bruecke im Portal-Modus auf eine aktive Konfigurations-
+   * Sitzung wartet, bevor sie von selbst einen normalen Neustart versucht
+   * (mit den vorhandenen Zugangsdaten - derselbe Weg wie jeder andere Boot).
+   * "Aktiv" heisst: Seite geladen, Konfiguration gespeichert oder gescannt -
+   * NICHT der automatische 2s-Status-Poll der Portal-Seite, sonst wuerde ein
+   * offen gelassener Browser-Tab den Neustart fuer immer verhindern.
+   * Greift nur, wenn g_cfg.configured gilt (siehe main.cpp) - sonst wuerde
+   * sich ein frisches oder werksrueckgesetztes Geraet alle paar Minuten
+   * sinnlos selbst neu starten, ohne dass sich etwas geaendert haette.
+   * 0 = Firmware-Standard (900 s = 15 min). */
+  uint16_t ap_idle_reboot_s;
 };
 
 extern BridgeConfig g_cfg;

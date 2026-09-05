@@ -98,8 +98,16 @@ void bridge_get_mgmt_ip(uint8_t out[4]);
  * die TATSAECHLICH wirksamen Werte, und daneben die Standardwerte fuer den
  * "Standardwerte"-Knopf. */
 typedef struct {
-  uint8_t static_rx, dyn_rx, dyn_tx, ba_win, eth_retries, wifi_retries;
+  uint8_t  static_rx, dyn_rx, dyn_tx, ba_win, eth_retries, wifi_retries;
+  uint16_t wifi_connect_timeout_s;
+  uint8_t  wifi_connect_retries;
+  uint16_t ap_idle_reboot_s;
 } bridge_tuning_t;
+
+/* Firmware-Vorgabe fuer ap_idle_reboot_s (config.h) - hier statt in
+ * main.cpp, weil sowohl main.cpp (Timer-Logik) als auch web.cpp (Anzeige
+ * ueber bridge_get_defaults()) sie brauchen. */
+#define AP_IDLE_REBOOT_S_DEF 900u   /* 15 Minuten */
 
 void bridge_get_defaults(bridge_tuning_t *out);    /* Firmware-Vorgaben     */
 void bridge_get_effective(bridge_tuning_t *out);   /* was gerade laeuft     */
