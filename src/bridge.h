@@ -27,6 +27,7 @@ struct BridgeStats {
                                * 3=Gateway-Sonde, 4=kein Kamera-Verkehr.
                                * Bleibt nach dem Neustart stehen (RTC-Speicher),
                                * damit Portal/MQTT zeigen koennen WARUM.       */
+  uint32_t roam_count;        /* Aktive AP-Wechsel seit Boot (roam_tick())    */
   int8_t   rssi;
   uint8_t  channel;
   bool     eth_link;
@@ -102,6 +103,9 @@ typedef struct {
   uint16_t wifi_connect_timeout_s;
   uint8_t  wifi_connect_retries;
   uint16_t ap_idle_reboot_s;
+  uint16_t roam_check_s;
+  int8_t   roam_rssi_threshold;
+  uint8_t  roam_margin_db;
 } bridge_tuning_t;
 
 /* Firmware-Vorgabe fuer ap_idle_reboot_s (config.h) - hier statt in
