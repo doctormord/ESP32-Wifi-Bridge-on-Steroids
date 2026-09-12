@@ -138,6 +138,31 @@ struct BridgeConfig {
    * sinnlos selbst neu starten, ohne dass sich etwas geaendert haette.
    * 0 = Firmware-Standard (900 s = 15 min). */
   uint16_t ap_idle_reboot_s;
+
+  /* --- Aktives Roaming (angehaengt 2026-09-13) ----------------------------
+   * WIFI_ALL_CHANNEL_SCAN + WIFI_CONNECT_AP_BY_SIGNAL (siehe bridge.cpp,
+   * 2026-08-15) waehlen den staerksten AP nur EINMAL beim Verbindungsaufbau.
+   * Einmal verbunden, bleibt die STA auf diesem AP, selbst wenn spaeter ein
+   * deutlich besserer auftaucht - ESP-IDF roamt nicht von sich aus. Der
+   * Watchdog hilft hier nicht zuverlaessig: ein schwacher Link kann noch
+   * unter dessen Verlustschwelle bleiben, obwohl ein objektiv viel besserer
+   * AP verfuegbar waere. Ausgeloest durch einen echten Fall: Bruecke haengt
+   * auf einem Mesh-Knoten auf Kanal 9, waehrend ein anderer Knoten auf Kanal
+   * 5 mehr als 15 dB besseres Signal liefert - erst ein manueller Neustart
+   * waehlte den besseren.
+   *
+   * Alle vier Werte folgen der bestehenden Konvention: roam_enable ist ein
+   * Schalter wie wd_enable (explizit Portal, kein Kompilierschalter), die
+   * drei Zahlenwerte darunter 0 = Firmware-Standard wie die uebrige
+   * Feinabstimmung, siehe bridge.cpp fuer die tatsaechlichen Vorgaben. */
+  uint8_t  roam_enable;          /* 1 = aktiv, 0 = aus (Default)              */
+  uint16_t roam_check_s;         /* Pruefintervall, 0 = Standard              */
+  int8_t   roam_rssi_threshold;  /* nur unterhalb dieses RSSI ueberhaupt
+                                   * pruefen (0 dBm kommt real nie vor, daher
+                                   * unproblematisch als "Standard"-Marker),
+                                   * 0 = Standard                             */
+  uint8_t  roam_margin_db;       /* Mindestvorsprung eines Kandidaten in dB,
+                                   * um den Wechsel zu rechtfertigen, 0 = Standard */
 };
 
 extern BridgeConfig g_cfg;

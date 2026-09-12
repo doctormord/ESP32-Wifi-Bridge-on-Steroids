@@ -355,6 +355,31 @@ button.sec{background:#2f3542;color:var(--fg)}
     <input id="ap_idle_reboot_s">
   </div>
 
+  <div style="margin-top:14px;padding:12px;background:#232833;border-radius:8px">
+    <b style="font-size:13px">Aktives Roaming</b>
+    <div class="sub" style="margin:4px 0 8px">
+      Der staerkste sichtbare Accesspoint wird nur EINMAL beim
+      Verbindungsaufbau gewaehlt - danach bleibt die Bruecke auf diesem AP,
+      auch wenn spaeter ein deutlich besserer auftaucht (z.B. ein anderer
+      Mesh-Knoten). Bei schwachem Signal wird deshalb regelmaessig geprueft,
+      ob ein AP derselben SSID mit ausreichend besserem Signal verfuegbar
+      ist, und bei Bedarf dorthin gewechselt. Bei gutem Signal wird gar
+      nicht erst gescannt, um keine Luftzeit zu verschwenden.
+    </div>
+    <select id="roam_enable">
+      <option value="0">Aus (Standard)</option>
+      <option value="1">An - bei schwachem Signal automatisch zum staerkeren AP wechseln</option>
+    </select>
+    <div class="row" style="margin-top:10px">
+      <div><label>Pruefintervall (s)</label>
+        <input id="roam_check_s"></div>
+      <div><label>Schwelle (dBm, negativ)</label>
+        <input id="roam_rssi_threshold"></div>
+      <div><label>Mindestvorsprung (dB)</label>
+        <input id="roam_margin_db"></div>
+    </div>
+  </div>
+
   <div class="tag reboot">&#9679; erst nach NEUSTART wirksam</div>
   <div class="row">
     <div><label>Statische RX-Puffer</label>
@@ -471,6 +496,7 @@ async function tick(){
         (s.wd_probe===1?'Gateway erreicht':'Gateway nicht erreicht')+'</span>' : '')+
       (s.wd_reconnects ? ' &middot; Watchdog-WLAN-Reconnects: <b>'+s.wd_reconnects+'</b>' : '')+
       (s.wd_eth_resets ? ' &middot; Watchdog-Ethernet-Resets: <b>'+s.wd_eth_resets+'</b>' : '')+
+      (s.roam_count ? ' &middot; AP-Wechsel (Roaming): <b>'+s.roam_count+'</b>' : '')+
       (s.wd_last_reason ? ' &middot; letzter Watchdog-Neustart: <span class="bad">'+
         (['','Verlustquote','Reconnects','Gateway-Sonde','kein Kamera-Verkehr'][s.wd_last_reason]||'?')+'</span>' : '')+
       ' &middot; Heap: <b>'+Math.round(s.heap/1024)+' kB</b>'+
@@ -490,7 +516,8 @@ const CFG=['name','ssid1','ssid2','ssid3','ip','mask','gw','ip2','mask2','gw2','
            'tx_power','eth_tx_retries','wifi_tx_retries',
            'static_rx_buf','dynamic_rx_buf','dynamic_tx_buf','rx_ba_win',
            'ht40','no_11b','wd_enable',
-           'wifi_connect_timeout_s','wifi_connect_retries','ap_idle_reboot_s'];
+           'wifi_connect_timeout_s','wifi_connect_retries','ap_idle_reboot_s',
+           'roam_enable','roam_check_s','roam_rssi_threshold','roam_margin_db'];
 async function load(){
   const c=await(await fetch('/api/config')).json();
   DEF=c.def||null;
@@ -615,12 +642,13 @@ static esp_err_t h_status(httpd_req_t *r) {
   BridgeStats st;
   bridge_get_stats(&st);
 
-  char buf[700];
+  char buf[730];
   snprintf(buf, sizeof(buf),
     "{\"prov\":%d,\"wifi\":%d,\"eth\":%d,\"rssi\":%d,\"ch\":%u,"
     "\"kbps_up\":%lu,\"kbps_down\":%lu,\"pkt_up\":%lu,\"pkt_down\":%lu,"
     "\"drop_up\":%lu,\"drop_down\":%lu,\"wifi_disc\":%lu,\"wd_probe\":%u,"
-    "\"wd_reconnects\":%lu,\"wd_eth_resets\":%lu,\"wd_last_reason\":%u,\"uptime\":%lu,"
+    "\"wd_reconnects\":%lu,\"wd_eth_resets\":%lu,\"wd_last_reason\":%u,"
+    "\"roam_count\":%lu,\"uptime\":%lu,"
     "\"client_mac\":\"%s\",\"client_ip\":\"%s\",\"client_name\":\"%s\","
     "\"ssid\":\"%s\",\"bssid\":\"%s\","
     "\"at\":%d,\"at_s\":%u,\"at_n\":%u,\"at_r\":%u,"
@@ -633,7 +661,7 @@ static esp_err_t h_status(httpd_req_t *r) {
     (unsigned long)st.drop_eth2wifi, (unsigned long)st.drop_wifi2eth,
     (unsigned long)st.wifi_disc_count, (unsigned)st.wd_probe,
     (unsigned long)st.wd_reconnects, (unsigned long)st.wd_eth_resets,
-    (unsigned)st.wd_last_reason,
+    (unsigned)st.wd_last_reason, (unsigned long)st.roam_count,
     (unsigned long)(millis() / 1000), st.client_mac, st.client_ip, st.client_name, st.ssid, st.bssid,
     (int)bridge_autotune_state(), bridge_autotune_schritt(),
     bridge_autotune_anzahl(), bridge_autotune_ergebnis(),
@@ -707,7 +735,7 @@ static esp_err_t h_config_get(httpd_req_t *r) {
    * zusammen auf gut 900 Byte im ungeguenstigsten Fall. snprintf schneidet
    * zwar sauber ab, aber ein abgeschnittenes JSON ist unparsbar - dann
    * bliebe das Formular schlicht leer. */
-  char buf[1800];
+  char buf[1900];
   snprintf(buf, sizeof(buf),
     "{\"name\":\"%s\",\"ssid1\":\"%s\",\"ssid2\":\"%s\",\"ssid3\":\"%s\","
     "\"ip\":\"%s\",\"mask\":\"%s\",\"gw\":\"%s\","
@@ -720,10 +748,13 @@ static esp_err_t h_config_get(httpd_req_t *r) {
     "\"rx_ba_win\":%u,\"ht40\":%u,\"no_11b\":%u,\"wd_enable\":%u,"
     "\"wifi_connect_timeout_s\":%u,\"wifi_connect_retries\":%u,"
     "\"ap_idle_reboot_s\":%u,"
+    "\"roam_enable\":%u,\"roam_check_s\":%u,\"roam_rssi_threshold\":%d,"
+    "\"roam_margin_db\":%u,"
     "\"def\":{\"eth_tx_retries\":%u,\"wifi_tx_retries\":%u,"
     "\"static_rx_buf\":%u,\"dynamic_rx_buf\":%u,\"dynamic_tx_buf\":%u,"
     "\"rx_ba_win\":%u,\"wifi_connect_timeout_s\":%u,"
-    "\"wifi_connect_retries\":%u,\"ap_idle_reboot_s\":%u}}",
+    "\"wifi_connect_retries\":%u,\"ap_idle_reboot_s\":%u,"
+    "\"roam_check_s\":%u,\"roam_rssi_threshold\":%d,\"roam_margin_db\":%u}}",
     n, s1, s2, s3, ip, mask, gw, ip2, mask2, gw2, ip3, mask3, gw3,
     mh, g_cfg.mqtt_port, mu, g_cfg.telemetry_s,
     /* Die WIRKSAMEN Werte ausliefern, nicht die gespeicherte 0 - im Formular
@@ -733,9 +764,11 @@ static esp_err_t h_config_get(httpd_req_t *r) {
     eff.static_rx, eff.dyn_rx, eff.dyn_tx,
     eff.ba_win, g_cfg.ht40, g_cfg.no_11b, g_cfg.wd_enable,
     eff.wifi_connect_timeout_s, eff.wifi_connect_retries, eff.ap_idle_reboot_s,
+    g_cfg.roam_enable, eff.roam_check_s, (int)eff.roam_rssi_threshold, eff.roam_margin_db,
     def.eth_retries, def.wifi_retries,
     def.static_rx, def.dyn_rx, def.dyn_tx, def.ba_win,
-    def.wifi_connect_timeout_s, def.wifi_connect_retries, def.ap_idle_reboot_s);
+    def.wifi_connect_timeout_s, def.wifi_connect_retries, def.ap_idle_reboot_s,
+    def.roam_check_s, (int)def.roam_rssi_threshold, def.roam_margin_db);
 
   httpd_resp_set_type(r, "application/json");
   httpd_resp_set_hdr(r, "Cache-Control", "no-store");
@@ -885,6 +918,34 @@ static esp_err_t h_config_post(httpd_req_t *r) {
     int t = atoi(v);
     if (t != 0 && t < 60) t = 60;
     g_cfg.ap_idle_reboot_s = (uint16_t)(t < 0 ? 0 : t);
+  }
+
+  /* Wirkt sofort - roam_tick() liest g_cfg.roam_enable direkt, kein Neustart
+   * noetig. Wie beim Watchdog: explizit ein Portal-Schalter statt fest
+   * einprogrammiert, siehe config.h. */
+  if (form_get(body, "roam_enable", v, sizeof(v))) g_cfg.roam_enable = (uint8_t)(atoi(v) ? 1 : 0);
+  if (form_get(body, "roam_check_s", v, sizeof(v))) {
+    int t = atoi(v);
+    /* Untergrenze 30s - haeufigeres Pruefen bringt kaum etwas (ein Scan
+     * dauert selbst schon eine spuerbare Zeit) und kostet nur Luftzeit. */
+    if (t != 0 && t < 30) t = 30;
+    g_cfg.roam_check_s = (uint16_t)(t < 0 ? 0 : t);
+  }
+  if (form_get(body, "roam_rssi_threshold", v, sizeof(v))) {
+    int t = atoi(v);
+    /* 0 bleibt unangetastet als Default-Marker (siehe config.h) - reale
+     * RSSI-Werte sind immer negativ, daher eindeutig unterscheidbar. */
+    if (t != 0) {
+      if (t > -1)   t = -1;
+      if (t < -100) t = -100;
+    }
+    g_cfg.roam_rssi_threshold = (int8_t)t;
+  }
+  if (form_get(body, "roam_margin_db", v, sizeof(v))) {
+    int t = atoi(v);
+    if (t < 0)  t = 0;
+    if (t > 40) t = 40;
+    g_cfg.roam_margin_db = (uint8_t)t;
   }
 
   g_cfg.configured = (g_cfg.ssid1[0] != '\0');

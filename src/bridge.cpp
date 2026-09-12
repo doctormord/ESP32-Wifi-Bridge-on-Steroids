@@ -133,6 +133,13 @@ void      esp_wifi_internal_free_rx_buffer(void *buffer);
 #define WIFI_CONNECT_RETRIES_DEF        3
 #define WIFI_CONNECT_RETRY_DELAY_MS  2000u
 
+/* Vorgaben fuer das aktive Roaming - vorgezogen, damit bridge_get_defaults()
+ * weiter unten sie schon kennt. Ausfuehrliche Begruendung beim eigentlichen
+ * roam_tick() weiter unten. */
+#define ROAM_CHECK_S_DEF            300u   /* 5 min */
+#define ROAM_RSSI_THRESHOLD_DEF     (-70)  /* nur darunter ueberhaupt pruefen */
+#define ROAM_MARGIN_DB_DEF            6u   /* so viel muss ein Kandidat besser sein */
+
 /* Die Retry-Zaehler liegen als eigene Variablen und nicht als g_cfg-Zugriff
  * im Datenpfad: eth_rx_cb/wifi_rx_cb laufen im IRAM und werden pro Paket
  * aufgerufen, da soll kein Umweg ueber die grosse Config-Struktur hinein.
@@ -930,6 +937,9 @@ void bridge_get_defaults(bridge_tuning_t *o) {
   o->wifi_connect_timeout_s = WIFI_CONNECT_TIMEOUT_MS_DEF / 1000;
   o->wifi_connect_retries   = WIFI_CONNECT_RETRIES_DEF;
   o->ap_idle_reboot_s       = AP_IDLE_REBOOT_S_DEF;
+  o->roam_check_s           = ROAM_CHECK_S_DEF;
+  o->roam_rssi_threshold    = ROAM_RSSI_THRESHOLD_DEF;
+  o->roam_margin_db         = ROAM_MARGIN_DB_DEF;
 }
 
 void bridge_get_effective(bridge_tuning_t *o) {
@@ -940,6 +950,9 @@ void bridge_get_effective(bridge_tuning_t *o) {
   o->eth_retries  = s_eth_tx_retries;
   o->wifi_retries = s_wifi_tx_retries;
   o->wifi_connect_timeout_s = s_eff_wifi_connect_timeout_s;
+  o->roam_check_s        = g_cfg.roam_check_s        ? g_cfg.roam_check_s        : ROAM_CHECK_S_DEF;
+  o->roam_rssi_threshold = g_cfg.roam_rssi_threshold  ? g_cfg.roam_rssi_threshold : ROAM_RSSI_THRESHOLD_DEF;
+  o->roam_margin_db      = g_cfg.roam_margin_db       ? g_cfg.roam_margin_db      : ROAM_MARGIN_DB_DEF;
   o->wifi_connect_retries   = s_eff_wifi_connect_retries;
   o->ap_idle_reboot_s       = g_cfg.ap_idle_reboot_s ? g_cfg.ap_idle_reboot_s : AP_IDLE_REBOOT_S_DEF;
 }
@@ -1406,12 +1419,93 @@ static void watchdog_tick(void) {
 }
 
 /* ===========================================================================
+ * Aktives Roaming
+ * ---------------------------------------------------------------------------
+ * WIFI_ALL_CHANNEL_SCAN + WIFI_CONNECT_AP_BY_SIGNAL (siehe bridge_wifi_start())
+ * waehlen den staerksten AP nur EINMAL beim Verbindungsaufbau. Einmal
+ * verbunden, bleibt die STA auf diesem AP, selbst wenn spaeter ein deutlich
+ * besserer auftaucht - ESP-IDF roamt nicht von sich aus, und der Watchdog
+ * hilft hier nicht zuverlaessig: ein schwacher, aber "stabiler" Link kann
+ * unter dessen Verlustschwelle bleiben, obwohl ein objektiv viel besserer AP
+ * verfuegbar waere. Ausgeloest durch einen echten Fall am 2026-09-13: Bruecke
+ * haengt auf einem Mesh-Knoten auf Kanal 9, ein anderer Knoten auf Kanal 5
+ * lieferte >15 dB besseres Signal - erst ein manueller Neustart wechselte.
+ *
+ * Bewusst zurueckhaltend: nur pruefen, wenn das AKTUELLE Signal schon
+ * schlecht ist (kein staendiges Scannen "auf Verdacht", das kostet Luftzeit
+ * und stoert den Datenpfad kurz), und nur wechseln, wenn ein Kandidat einen
+ * deutlichen Vorsprung hat (Marge gegen Pingpong zwischen zwei aehnlich
+ * guten APs). ========================================================== */
+
+static uint32_t s_roam_t0    = 0;
+static uint32_t s_roam_count = 0;
+
+/* Bester RSSI unter APs mit der uebergebenen SSID. false, wenn der Scan
+ * fehlschlug oder keine APs mit dieser SSID sichtbar waren. */
+static bool roam_scan_best(const uint8_t *ssid, int8_t *out_best) {
+  wifi_scan_config_t sc = {};
+  sc.ssid        = (uint8_t *)ssid;
+  sc.show_hidden = false;
+  if (esp_wifi_scan_start(&sc, true) != ESP_OK) return false;
+
+  uint16_t n = 0;
+  esp_wifi_scan_get_ap_num(&n);
+  if (n == 0) return false;
+  if (n > 20) n = 20;
+
+  wifi_ap_record_t *recs = (wifi_ap_record_t *)malloc(sizeof(wifi_ap_record_t) * n);
+  if (!recs) return false;
+  esp_wifi_scan_get_ap_records(&n, recs);
+
+  int8_t best = -127;
+  for (uint16_t i = 0; i < n; i++) if (recs[i].rssi > best) best = recs[i].rssi;
+  free(recs);
+
+  *out_best = best;
+  return true;
+}
+
+static void roam_tick(void) {
+  if (!g_cfg.roam_enable || !s_active || s_paused) { s_roam_t0 = 0; return; }
+
+  const uint32_t interval_ms =
+      (g_cfg.roam_check_s ? g_cfg.roam_check_s : ROAM_CHECK_S_DEF) * 1000UL;
+  const uint32_t now = millis();
+  if (s_roam_t0 == 0) { s_roam_t0 = now; return; }
+  if (now - s_roam_t0 < interval_ms) return;
+  s_roam_t0 = now;
+
+  wifi_ap_record_t ap;
+  if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return;   /* gerade nicht verbunden */
+
+  const int8_t schwelle = g_cfg.roam_rssi_threshold
+      ? g_cfg.roam_rssi_threshold : ROAM_RSSI_THRESHOLD_DEF;
+  if (ap.rssi >= schwelle) return;   /* schon gut genug - nicht mal scannen */
+
+  int8_t best;
+  if (!roam_scan_best(ap.ssid, &best)) return;
+
+  const uint8_t marge = g_cfg.roam_margin_db ? g_cfg.roam_margin_db : ROAM_MARGIN_DB_DEF;
+  if ((int)best - (int)ap.rssi < (int)marge) return;   /* kein ausreichender Kandidat */
+
+  printf("[ROAM] Aktuell %d dBm, Kandidat mit %d dBm gefunden - wechsle AP\n",
+         (int)ap.rssi, (int)best);
+  s_roam_count++;
+  /* wifi_evt()'s WIFI_EVENT_STA_DISCONNECTED-Handler verbindet automatisch
+   * neu (s_active gilt hier immer) und waehlt dabei per WIFI_ALL_CHANNEL_SCAN
+   * + WIFI_CONNECT_AP_BY_SIGNAL erneut den staerksten sichtbaren AP - kein
+   * zusaetzliches esp_wifi_connect() noetig. */
+  esp_wifi_disconnect();
+}
+
+/* ===========================================================================
  * Statistik
  * ========================================================================= */
 
 void bridge_tick(void) {
   autotune_tick();
   watchdog_tick();
+  roam_tick();
 
   static uint32_t last = 0;
   static uint64_t le = 0, lw = 0;
@@ -1440,6 +1534,7 @@ void bridge_get_stats(BridgeStats *o) {
   o->wd_reconnects = s_wd_reconnects;
   o->wd_eth_resets = s_wd_eth_resets;
   o->wd_last_reason = (s_wd_reason_magic == WD_REASON_MAGIC) ? s_wd_reason : 0;
+  o->roam_count     = s_roam_count;
   o->eth_link      = s_eth_link;
   o->wifi_up       = s_wifi_up;
   strcpy(o->bssid, s_bssid_str);
