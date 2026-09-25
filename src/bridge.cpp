@@ -221,18 +221,15 @@ IRAM_ATTR static inline bool is_for_mgmt(const uint8_t *f, uint16_t len);
 /*
  * Ethernet -> Wi-Fi. Laeuft im emac_rx-Task, 'buffer' gehoert uns.
  *
- * WICHTIG: Dieser Pfad darf NICHT blockieren. Standardmaessig gibt es genau
- * einen Sendeversuch; klappt der nicht, ist das Frame weg. Das wirkt falsch,
- * ist aber messbar richtig - die Begruendung steht bei ETH_TX_RETRIES_DEF.
- * Kurz: Warten haelt den Ethernet-Empfang an, und was in der Zeit hereinkommt,
- * verliert der DMA in Bursts. Das schadet TCP mehr, als der eingesparte
- * Einzelverlust nuetzt.
+ * WICHTIG: Dieser Pfad soll so kurz wie moeglich blockieren. Wie oft bei
+ * vollem Sendepuffer nachgefasst wird, bestimmt s_eth_tx_retries - die
+ * Abwaegung (UDP-Kamera vs. TCP) steht bei ETH_TX_RETRIES_DEF. Kurz: Warten
+ * haelt den Ethernet-Empfang an, und was in der Zeit hereinkommt, verliert
+ * der DMA in Bursts.
  */
 IRAM_ATTR static esp_err_t eth_rx_cb(esp_eth_handle_t h, uint8_t *buffer,
                                      uint32_t len, void *priv) {
   (void)h; (void)priv;
-
-  if (s_paused) { free(buffer); return ESP_OK; }   /* stillgelegt, kein Drop */
 
   /* Client-IP mitlesen. Hier ist der Absender immer der angeschlossene Client,
    * die Quelladresse also seine. Kostet zwei Vergleiche und vier Byte kopieren.
@@ -301,12 +298,23 @@ IRAM_ATTR static esp_err_t eth_rx_cb(esp_eth_handle_t h, uint8_t *buffer,
   }
 #endif
 
+  /* Pause erst NACH der Management-Abzweigung pruefen - genau wie in
+   * wifi_rx_cb(). Vorher stand sie ganz oben, dann wurden waehrend eines
+   * OTA-Uploads auch die Management-Frames von der Ethernet-Seite verworfen:
+   * ein Update vom angeschlossenen Laptop aus haette sich damit selbst die
+   * TCP-Verbindung abgeschnitten (bridge_set_paused() verspricht das
+   * Gegenteil). */
+  if (s_paused) { free(buffer); return ESP_OK; }   /* stillgelegt, kein Drop */
+
   esp_err_t err = ESP_FAIL;
   if (s_active && s_wifi_up) {
     const uint8_t retries = s_eth_tx_retries;
     for (int i = 0; i < retries; i++) {
       err = esp_wifi_internal_tx(WIFI_IF_STA, buffer, (uint16_t)len);
-      if (err == ESP_OK || err != ESP_ERR_NO_MEM) break;
+      /* Nach dem LETZTEN Versuch nicht mehr warten - das Frame ist dann
+       * ohnehin verloren, und jede weitere Pause haelt nur den emac_rx-Task
+       * auf (siehe unten). Bei 8 Retries kostete das pro Drop 1 ms extra. */
+      if (err != ESP_ERR_NO_MEM || i + 1 >= retries) break;
 
       /* Die ersten Versuche nur die CPU abgeben statt schlafen.
        *
@@ -388,7 +396,10 @@ IRAM_ATTR static esp_err_t wifi_rx_cb(void *buffer, uint16_t len, void *eb) {
     const uint8_t retries = s_wifi_tx_retries;
     for (int i = 0; i < retries; i++) {
       err = esp_eth_transmit(s_eth, buffer, len);
-      if (err == ESP_OK) break;
+      /* Nach dem letzten Versuch nicht mehr schlafen: das hier ist der
+       * WLAN-Task, und beim Standard von 1 Retry hat jeder Drop ihn bisher
+       * eine volle Millisekunde lang blockiert - ganz ohne Nutzen. */
+      if (err == ESP_OK || i + 1 >= retries) break;
       vTaskDelay(1);
     }
   }
@@ -1440,9 +1451,14 @@ static void watchdog_tick(void) {
 static uint32_t s_roam_t0    = 0;
 static uint32_t s_roam_count = 0;
 
-/* Bester RSSI unter APs mit der uebergebenen SSID. false, wenn der Scan
- * fehlschlug oder keine APs mit dieser SSID sichtbar waren. */
-static bool roam_scan_best(const uint8_t *ssid, int8_t *out_best) {
+/* Bester RSSI unter den ANDEREN APs mit der uebergebenen SSID - der aktuell
+ * verbundene (cur_bssid) zaehlt nicht als Kandidat. Sonst reicht schon eine
+ * Messschwankung zwischen dem gemittelten RSSI aus esp_wifi_sta_get_ap_info()
+ * und dem Einzelwert aus dem Scan, um die Marge zu "ueberbieten" - und die
+ * Bruecke trennt sich, nur um sich wieder mit demselben AP zu verbinden.
+ * false, wenn der Scan fehlschlug oder kein anderer AP sichtbar war. */
+static bool roam_scan_best(const uint8_t *ssid, const uint8_t *cur_bssid,
+                           int8_t *out_best) {
   wifi_scan_config_t sc = {};
   sc.ssid        = (uint8_t *)ssid;
   sc.show_hidden = false;
@@ -1457,12 +1473,17 @@ static bool roam_scan_best(const uint8_t *ssid, int8_t *out_best) {
   if (!recs) return false;
   esp_wifi_scan_get_ap_records(&n, recs);
 
+  bool gefunden = false;
   int8_t best = -127;
-  for (uint16_t i = 0; i < n; i++) if (recs[i].rssi > best) best = recs[i].rssi;
+  for (uint16_t i = 0; i < n; i++) {
+    if (memcmp(recs[i].bssid, cur_bssid, 6) == 0) continue;
+    if (recs[i].rssi > best) best = recs[i].rssi;
+    gefunden = true;
+  }
   free(recs);
 
   *out_best = best;
-  return true;
+  return gefunden;
 }
 
 static void roam_tick(void) {
@@ -1483,7 +1504,7 @@ static void roam_tick(void) {
   if (ap.rssi >= schwelle) return;   /* schon gut genug - nicht mal scannen */
 
   int8_t best;
-  if (!roam_scan_best(ap.ssid, &best)) return;
+  if (!roam_scan_best(ap.ssid, ap.bssid, &best)) return;
 
   const uint8_t marge = g_cfg.roam_margin_db ? g_cfg.roam_margin_db : ROAM_MARGIN_DB_DEF;
   if ((int)best - (int)ap.rssi < (int)marge) return;   /* kein ausreichender Kandidat */
