@@ -305,3 +305,28 @@ Zusaetzlich, auf Vorschlag von Christian: `ap_idle_reboot_s` (Standard 900 s = 1
 Auf Hinweis von Christian: die neue WLAN-Verbindungsversuch-Beschreibung im Portal erzaehlte die Debug-Geschichte nach ("War frueher ein einzelner 12-Sekunden-Versuch... reichte nicht immer"), statt schlicht das aktuelle Verhalten zu beschreiben. Portal-Text ist fuer Endnutzer, nicht fuer die Entwicklungshistorie - die gehoert in Code-Kommentare und hierher, nicht in die Oberflaeche. Korrigiert, ohne die Historie in den Code-Kommentaren oder hier anzufassen.
 
 Auf Hardware verifiziert ueber vier OTA-Zyklen (Retry-Fix, Portal-Parameter + AP-Idle-Reboot, Text-Cleanup): Bridge und Kamera nach jedem Zyklus gesund, neue Felder (`wifi_connect_timeout_s`, `wifi_connect_retries`, `ap_idle_reboot_s`) korrekt in `/api/config` sichtbar (effektiv und im `def`-Block).
+
+## 2026-10-02 — Fremde Session-Diffs geprueft: OTA-Selbstaussperrung, Roaming-Pendelei, Portal-XSS und Pufferueberlauf gefunden und behoben
+
+Eine andere Claude-Code-Session (Cloud-Umgebung, PlatformIO-Registry dort per Netzwerkrichtlinie gesperrt, also ungebaut und ungetestet) hatte acht Probleme identifiziert und auf `jolo/pensive-dirac-qlazwq` gepusht. Branch in einem eigenen Worktree geprueft: jeder Hunk gegen den tatsaechlichen Diff gelesen, lokal gebaut (28,5 % Flash, sauber), per `scripts/ota_flash.sh` auf die laufende Produktionsbruecke (Kamera aktiv gebrueckt) geflasht und auf dem echten Geraet verifiziert, bevor der PR (#7) eroeffnet wurde.
+
+### Datenpfad (`bridge.cpp`)
+
+- **OTA-Update vom Ethernet-Client aus war strukturell unmoeglich:** `eth_rx_cb` hat `s_paused` (waehrend eines laufenden OTA-Schreibvorgangs gesetzt) GANZ OBEN geprueft, noch vor der Abzweigung an den Management-Stack - damit haette ein Update, das von einem am Ethernet-Port angeschlossenen Geraet aus gestartet wird, seine eigene TCP-Verbindung gekappt, sobald der Schreibvorgang beginnt. `wifi_rx_cb` hatte diesen Fehler nie, weil die Reihenfolge dort schon immer umgekehrt war. Jetzt identisch: Management-Abzweigung zuerst, Pause-Pruefung danach.
+- **Unnoetiges Warten nach dem letzten Sendeversuch** in beiden Retry-Schleifen (Ethernet->WLAN und WLAN->Ethernet) entfernt - nach dem letzten Fehlschlag ist das Frame ohnehin verloren, das Warten hielt nur den jeweiligen Task unnoetig auf.
+- **Aktives Roaming (09-13 gebaut) konnte zum bereits verbundenen AP zurueckwechseln:** `roam_scan_best()` nahm den staerksten AP aus dem Scan, ohne den AKTUELL verbundenen auszuschliessen. Der RSSI aus `esp_wifi_sta_get_ap_info()` ist ein gemittelter Wert, der aus dem Einzel-Scan ein Einzelmesswert - reine Messschwankung konnte die Margen-Schwelle ueberschreiten und einen Trenn-/Wiederverbindungs-Zyklus mit demselben AP ausloesen. Jetzt wird der aktuelle BSSID explizit aus den Kandidaten ausgeschlossen.
+
+### Portal (`web.cpp`)
+
+- **Lange Passwoerter/MQTT-Token wurden still abgeschnitten:** `form_get()` kuerzt den noch prozentkodierten Rohwert, BEVOR er dekodiert wird. `encodeURIComponent()` macht aus jedem Sonderzeichen drei Zeichen, aus einem Umlaut sechs - bei einem 80-Byte-Puffer passte ein 64-Zeichen-Passwort mit ein paar Sonderzeichen nicht mehr hinein, ohne jede Fehlermeldung. Puffer auf 200 Byte vergroessert (3x64 + Nullbyte deckt den schlechtesten Fall).
+- **XSS-Luecke im WLAN-Scan:** gefundene SSIDs gingen ungeprueft per `innerHTML` in die Seite. Ein Nachbar-AP mit einem Namen wie `<img src=x onerror=...>` haette eigenes JavaScript im Portal ausfuehren koennen. Jetzt per sicherem DOM-Aufbau (`createElement`/`textContent`).
+- **`/api/scan` konnte ungueltiges JSON liefern** (`[,{...}]`), wenn der erste Treffer wegen leerer SSID uebersprungen wurde - das Komma haengte am Schleifenindex, nicht am tatsaechlich ausgegebenen Element. Jetzt an einem eigenen `erstes`-Flag festgemacht.
+- **Ganzzahlueberlauf bei `ap_idle_reboot_s`/`roam_check_s`:** Eingaben ueber 65535 liefen im `uint16_t` ueber. Jetzt oben begrenzt.
+
+### Dokumentation
+
+- `CLAUDE.md`, `platformio.ini` und `main.cpp` beschrieben stellenweise noch die laengst obsolete 2-MB-Partitionierung bzw. den Arduino-Build - widersprach sich im selben Dokument selbst mit der korrekten 8-MB-Beschreibung weiter oben. Korrigiert; `CLAUDE.md` nennt jetzt auch explizit, dass der Admin-Key nur `/api/update` und `/api/coredump` schuetzt, nicht `/api/config`/`/api/reboot` (bewusst offen gelassene Luecke, siehe PR #7).
+
+Auf Hardware verifiziert: Build sauber, OTA erfolgreich, Bridge nach Neustart gesund (`wifi:1 eth:1`), Kamera-Traffic lief sofort wieder (`client_ip` aufgeloest, `kbps_up` > 0, `drop_up:0`), `/api/scan` liefert gueltiges JSON (9 sichtbare APs, darunter drei `BMI_2G`-Mesh-Knoten - genau das Szenario, fuer das der Roaming-Fix gedacht ist), `/api/config` nach OTA unveraendert (NVS-Blob-Kompatibilitaet intakt).
+
+**Bewusst nicht behoben** (von der pruefenden Session als Entscheidung von Christian markiert): `POST /api/config` und `/api/reboot` bleiben ohne Admin-Key erreichbar. Jemand im Netz koennte zuerst `admin_pass` per `/api/config` neu setzen und danach damit eine Firmware einspielen. Fix waere, `admin_key_ok()` auch dort zu verlangen - aendert aber die Bedienung (Portal muesste den Key bei jedem Speichern mitschicken), daher als offene Entscheidung stehen gelassen.
