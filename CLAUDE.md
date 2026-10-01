@@ -39,7 +39,7 @@ Don't guess at what's consuming flash — measure it. `xtensa-esp-elf-gcc-nm --p
 
 ### Flash size is configured in two independent places
 
-`board_build.flash_size` sets `CONFIG_ESPTOOLPY_FLASHSIZE` (what ESP-IDF believes); `board_upload.flash_size` sets the size nibble in the image header that esptool writes (what the hardware acts on). Both must say `2MB`. If only the first is set, the header inherits 4 MB from the `esp32dev` board manifest, and `esp_flash_init_default_chip()` fails with `ESP_ERR_FLASH_SIZE_NOT_MATCH` ("Probe failed") because detected size < header size — that's a hard error, so the board never boots. Verify with the first 4 bytes of `firmware.bin`/`bootloader.bin` rather than trusting sdkconfig.
+`board_build.flash_size` sets `CONFIG_ESPTOOLPY_FLASHSIZE` (what ESP-IDF believes); `board_upload.flash_size` sets the size nibble in the image header that esptool writes (what the hardware acts on). Both must say `8MB`. If only the first is set, the header silently inherits 4 MB from the `esp32dev` board manifest and the board never sees half of its flash (header < chip only warns). The reverse — a header claiming *more* than the chip has — makes `esp_flash_init_default_chip()` fail with `ESP_ERR_FLASH_SIZE_NOT_MATCH` ("Probe failed"), a hard error, so the board never boots. Verify with the first 4 bytes of `firmware.bin`/`bootloader.bin` rather than trusting sdkconfig.
 
 The same split applies to flash *frequency*: `CONFIG_ESPTOOLPY_FLASHFREQ` may still read `40m` in the generated sdkconfig while the actual header says 80 MHz, because PlatformIO patches it in at esptool time. The header wins — check there.
 
@@ -86,7 +86,7 @@ TX power is quantized by the PHY to 11 discrete steps (2/5/7/8.5/11/13/14/15/16.
 
 ### Web portal (`web.cpp`)
 
-Single self-contained HTML/CSS/JS page (`PAGE[]`) served at `/`, plus a small JSON API (`/api/status`, `/api/config` GET/POST, `/api/scan`, `/api/reboot`, `/api/update`). Config POST uses hand-rolled form-urlencoded parsing (`form_get`) — empty password fields mean "leave unchanged", not "clear". `/api/update` streams a raw `.bin` directly into the inactive OTA partition (`esp_ota_*`), gated by an optional `X-Admin-Key` header checked against `admin_pass`; there's no TLS (would cost ~40 KB of flash budget the project doesn't have).
+Single self-contained HTML/CSS/JS page (`PAGE[]`) served at `/`, plus a small JSON API (`/api/status`, `/api/config` GET/POST, `/api/scan`, `/api/reboot`, `/api/update`). Config POST uses hand-rolled form-urlencoded parsing (`form_get`) — empty password fields mean "leave unchanged", not "clear". `/api/update` streams a raw `.bin` directly into the inactive OTA partition (`esp_ota_*`), gated by an optional `X-Admin-Key` header checked against `admin_pass`; there's no TLS (originally rejected for the ~40 KB of flash it costs on the believed-2 MB layout). Note that the admin key only guards `/api/update` and `/api/coredump` — `/api/config` POST (including changing `admin_pass` itself) and `/api/reboot` are unauthenticated.
 
 ### Telemetry (`telemetry.cpp`)
 
@@ -94,4 +94,4 @@ Optional MQTT client (only starts if `mqtt_host` is configured), publishes state
 
 ### Partition layout
 
-`partitions_2mb_ota.csv` is hand-cut for the WT32-ETH01's 2 MB flash (not the stock 4MB+ tables): 24 KB NVS, 8 KB otadata, two 960 KB OTA app slots. App partitions must start on 64 KB boundaries, hence the gap after otadata.
+`partitions_8mb_ota.csv` is the live table: 24 KB NVS, 8 KB otadata, two 3 MB OTA app slots, a 64 KB coredump partition, ~1.8 MB unallocated reserve. The partition table cannot be changed via OTA, hence the generous slots. App partitions must start on 64 KB boundaries, hence the gap after otadata. (`partitions_2mb_ota.csv` is the obsolete leftover from the mistaken 2 MB belief — not referenced by the build.)

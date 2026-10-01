@@ -526,7 +526,11 @@ async function load(){
 async function scan(){
   $('msg').textContent='Suche Netze...';
   const r=await(await fetch('/api/scan')).json();
-  $('nets').innerHTML=r.map(n=>'<option value="'+n.ssid+'">'+n.ssid+' ('+n.rssi+' dBm)</option>').join('');
+  /* Per DOM statt innerHTML: SSIDs sind Fremddaten, ein Nachbar-AP namens
+     "<img src=x onerror=...>" wuerde sonst Skript im Portal ausfuehren. */
+  const d=$('nets');d.textContent='';
+  r.forEach(n=>{const o=document.createElement('option');o.value=n.ssid;
+    o.textContent=n.ssid+' ('+n.rssi+' dBm)';d.appendChild(o)});
   $('msg').textContent=r.length+' Netze gefunden';
 }
 /* rb=true -> speichern und neu starten (WLAN-Zugangsdaten, IP, Puffer...).
@@ -795,7 +799,12 @@ static esp_err_t h_config_post(httpd_req_t *r) {
   }
   body[got] = '\0';
 
-  char v[80];
+  /* form_get() kuerzt den ROHEN, noch prozentkodierten Wert und dekodiert
+   * erst danach. encodeURIComponent() macht aus jedem Sonderzeichen drei
+   * Zeichen, aus einem Umlaut sechs - ein 64-Zeichen-Passwort mit ein paar
+   * Sonderzeichen passte in die frueheren 80 Byte nicht mehr und wurde STILL
+   * abgeschnitten gespeichert. 3 x 64 + Nullbyte deckt den schlimmsten Fall. */
+  char v[200];
   if (form_get(body, "name",  v, sizeof(v))) strncpy(g_cfg.name,  v, sizeof(g_cfg.name)  - 1);
   if (form_get(body, "ssid1", v, sizeof(v))) strncpy(g_cfg.ssid1, v, sizeof(g_cfg.ssid1) - 1);
   if (form_get(body, "ssid2", v, sizeof(v))) strncpy(g_cfg.ssid2, v, sizeof(g_cfg.ssid2) - 1);
@@ -917,6 +926,7 @@ static esp_err_t h_config_post(httpd_req_t *r) {
   if (form_get(body, "ap_idle_reboot_s", v, sizeof(v))) {
     int t = atoi(v);
     if (t != 0 && t < 60) t = 60;
+    if (t > 65535)        t = 65535;   /* uint16_t - sonst Ueberlauf */
     g_cfg.ap_idle_reboot_s = (uint16_t)(t < 0 ? 0 : t);
   }
 
@@ -929,6 +939,7 @@ static esp_err_t h_config_post(httpd_req_t *r) {
     /* Untergrenze 30s - haeufigeres Pruefen bringt kaum etwas (ein Scan
      * dauert selbst schon eine spuerbare Zeit) und kostet nur Luftzeit. */
     if (t != 0 && t < 30) t = 30;
+    if (t > 65535)        t = 65535;   /* uint16_t - sonst Ueberlauf */
     g_cfg.roam_check_s = (uint16_t)(t < 0 ? 0 : t);
   }
   if (form_get(body, "roam_rssi_threshold", v, sizeof(v))) {
@@ -1009,12 +1020,17 @@ static esp_err_t h_scan(httpd_req_t *r) {
 
   httpd_resp_set_type(r, "application/json");
   httpd_resp_sendstr_chunk(r, "[");
+  bool erstes = true;
   for (uint16_t i = 0; i < n; i++) {
     char esc[80], item[128];
     json_escape((const char *)recs[i].ssid, esc, sizeof(esc));
     if (!esc[0]) continue;
+    /* Komma am tatsaechlich ausgegebenen Eintrag festmachen, nicht an i -
+     * sonst entsteht "[,{...}]", sobald der erste Treffer uebersprungen
+     * wird, und das Portal kann die Liste nicht mehr parsen. */
     snprintf(item, sizeof(item), "%s{\"ssid\":\"%s\",\"rssi\":%d}",
-             i ? "," : "", esc, (int)recs[i].rssi);
+             erstes ? "" : ",", esc, (int)recs[i].rssi);
+    erstes = false;
     httpd_resp_sendstr_chunk(r, item);
   }
   httpd_resp_sendstr_chunk(r, "]");

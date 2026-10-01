@@ -5,7 +5,7 @@
  * ============================================================================
  *
  *  Zielhardware : WT32-ETH01 (ESP32-D0WD + LAN8720A)
- *  Toolchain    : PlatformIO, framework = arduino, espidf
+ *  Toolchain    : PlatformIO, framework = espidf
  *
  *  ---------------------------------------------------------------------------
  *  BETRIEBSMODI
