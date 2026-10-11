@@ -163,6 +163,18 @@ struct BridgeConfig {
                                    * 0 = Standard                             */
   uint8_t  roam_margin_db;       /* Mindestvorsprung eines Kandidaten in dB,
                                    * um den Wechsel zu rechtfertigen, 0 = Standard */
+
+  /* --- Watchdog-Eskalationsstufen (angehaengt 2026-10-11) -----------------
+   * Bisher eskalierte der Watchdog immer ueber alle Stufen bis zum Neustart.
+   * Gewuenscht war, die Eskalation zu begrenzen - z.B. bei haengender Kamera
+   * nur den Ethernet-Treiber neu starten, aber das WLAN nie anfassen.
+   * wd_actions ist eine Bitmaske der ERLAUBTEN Massnahmen (WD_ACT_* in
+   * bridge.h); nicht erlaubte Stufen werden uebersprungen. 0 = Standard
+   * (alle drei), passend zur 0-Konvention der uebrigen Feinabstimmung -
+   * damit verhalten sich bestehende Konfigurationen genau wie vorher. */
+  uint8_t  wd_actions;           /* Bitmaske WD_ACT_*, 0 = alle               */
+  uint8_t  wd_bad_windows;       /* schlechte Messfenster in Folge bis zur
+                                   * naechsten Massnahme, 0 = Standard (3)    */
 };
 
 extern BridgeConfig g_cfg;

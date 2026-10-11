@@ -328,8 +328,29 @@ button.sec{background:#2f3542;color:var(--fg)}
     </div>
     <select id="wd_enable">
       <option value="0">Aus (Standard)</option>
-      <option value="1">An - eskaliert automatisch: Ethernet-Reset, WLAN-Reconnect, notfalls Neustart</option>
+      <option value="1">An</option>
     </select>
+    <label>Erlaubte Massnahmen
+      <span class="hint">Reihenfolge immer Ethernet &rarr; WLAN &rarr; Neustart</span></label>
+    <select id="wd_actions">
+      <option value="7">Ethernet-Reset &rarr; WLAN-Reconnect &rarr; Neustart (Standard)</option>
+      <option value="3">Ethernet-Reset &rarr; WLAN-Reconnect, nie neu starten</option>
+      <option value="1">Nur Ethernet-Reset (WLAN wird nie angefasst)</option>
+      <option value="5">Ethernet-Reset &rarr; Neustart, kein WLAN-Reconnect</option>
+      <option value="2">Nur WLAN-Reconnect</option>
+      <option value="6">WLAN-Reconnect &rarr; Neustart, kein Ethernet-Reset</option>
+      <option value="4">Nur Neustart</option>
+    </select>
+    <div class="sub" style="margin:6px 0 0">
+      Abgewaehlte Stufen werden uebersprungen. Ist die hoechste erlaubte Stufe
+      erreicht und das Problem besteht weiter, wird sie wiederholt (z.B. bei
+      "Nur Ethernet-Reset" erneut der Ethernet-Reset). Ein Ethernet-Reset gibt
+      es nur bei "Link da, aber kein Verkehr von der Kamera" &ndash; bei
+      WLAN-Symptomen ohne erlaubten WLAN-Reconnect/Neustart wird nur
+      protokolliert.
+    </div>
+    <label>Schlechte Messfenster (je 20&nbsp;s) bis zur naechsten Stufe</label>
+    <input id="wd_bad_windows">
     <div class="sub" style="margin:10px 0 4px">
       Manuell ausloesen, unabhaengig vom Watchdog-Zustand oben (z.B. wenn die
       Kamera gerade haengt und nicht auf den naechsten automatischen Zyklus
@@ -393,6 +414,7 @@ button.sec{background:#2f3542;color:var(--fg)}
     <div><label>RX-Block-Ack-Fenster</label>
       <input id="rx_ba_win"></div>
   </div>
+  <div id="bufeff" class="sub" style="margin:6px 0 0;color:#e0b050"></div>
   <div class="sub" style="margin:6px 0 0">
     <b>Mehr ist hier schlechter.</b> Sende- und Empfangspuffer teilen sich
     denselben Speicher: eine Erhoehung der TX-Puffer auf 64 liess den freien
@@ -459,6 +481,11 @@ const $=i=>document.getElementById(i);
    auch die Sendeleistung nicht sofort - die Rueckmeldung nach dem Speichern
    muss das sagen, sonst wartet man auf eine Wirkung, die es nicht gibt. */
 let PROV=false;
+/* Letzter gesehener Einmess-Zustand: das Ergebnis wird nur beim UEBERGANG
+   auf "fertig" ins Feld eingetragen. Vorher passierte das bei jedem 2s-Poll,
+   solange das Board "fertig" meldete - ein haendisch geaenderter Wert
+   sprang dadurch vor dem Speichern immer wieder zurueck. */
+let ATPREV=-1;
 function fmt(k){return k>1000?(k/1000).toFixed(1)+' Mbit/s':k+' kbit/s'}
 function dur(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
   return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m')}
@@ -484,9 +511,10 @@ async function tick(){
     if(s.at===1) $('atmsg').textContent='Einmessung laeuft - Schritt '+(s.at_s+1)+' von '+s.at_n+
                  ' (etwa '+Math.max(0,Math.round((s.at_n-s.at_s)*19/60*10)/10)+' min uebrig)';
     else if(s.at===2){ $('atmsg').textContent='Fertig - gewaehlt: '+s.at_r+' Retries, gespeichert.';
-                       if($('eth_tx_retries').value!=s.at_r) $('eth_tx_retries').value=s.at_r; }
+                       if(ATPREV===1) $('eth_tx_retries').value=s.at_r; }
     else if(s.at===3) $('atmsg').textContent='Abgebrochen: zu wenig Verkehr waehrend der Messung. '+
                       'Kamera streamen lassen und erneut starten.';
+    ATPREV=s.at;
     $('detail').innerHTML='Client: <b>'+s.client_mac+'</b> &middot; IP: <b>'+(s.client_ip||'-')+'</b>'+
       ' &middot; Name: <b>'+(s.client_name||'-')+'</b><br>Verbunden mit: <b>'+
       (s.ssid||'-')+'</b> ('+s.bssid+')'+
@@ -515,13 +543,20 @@ const CFG=['name','ssid1','ssid2','ssid3','ip','mask','gw','ip2','mask2','gw2','
            'mqtt_host','mqtt_port','mqtt_user','telemetry_s',
            'tx_power','eth_tx_retries','wifi_tx_retries',
            'static_rx_buf','dynamic_rx_buf','dynamic_tx_buf','rx_ba_win',
-           'ht40','no_11b','wd_enable',
+           'ht40','no_11b','wd_enable','wd_actions','wd_bad_windows',
            'wifi_connect_timeout_s','wifi_connect_retries','ap_idle_reboot_s',
            'roam_enable','roam_check_s','roam_rssi_threshold','roam_margin_db'];
 async function load(){
   const c=await(await fetch('/api/config')).json();
   DEF=c.def||null;
   for(const k of CFG) if(c[k]!==undefined)$(k).value=c[k];
+  /* Puffer: im Formular steht der GESPEICHERTE Wert (sonst ging eine
+     Aenderung vor dem Neustart beim naechsten Speichern wieder verloren).
+     Weicht der laufende davon ab, steht er als Hinweis darunter. */
+  const e=c.eff||{},d=['static_rx_buf','dynamic_rx_buf','dynamic_tx_buf','rx_ba_win']
+    .filter(k=>e[k]!==undefined&&e[k]!=c[k]);
+  $('bufeff').textContent=d.length?'Aktuell noch wirksam: '+d.map(k=>$(k).previousElementSibling
+    .textContent+' '+e[k]).join(', ')+' - der gespeicherte Wert greift nach dem Neustart.':'';
 }
 async function scan(){
   $('msg').textContent='Suche Netze...';
@@ -736,10 +771,11 @@ static esp_err_t h_config_get(httpd_req_t *r) {
   /* Passwoerter werden bewusst nie zurueckgeliefert.
    * Puffergroesse mitgewachsen: Name, zwei SSIDs, sechs IP-Adressen aus zwei
    * Profilen, Host, eskapierter Benutzername und die Tuning-Zahlen kommen
-   * zusammen auf gut 900 Byte im ungeguenstigsten Fall. snprintf schneidet
+   * zusammen auf gut 1750 Byte im unguenstigsten Fall (Stand 2026-10-11, mit
+   * Watchdog-Stufen und den laufenden Pufferwerten unter "eff"). snprintf schneidet
    * zwar sauber ab, aber ein abgeschnittenes JSON ist unparsbar - dann
    * bliebe das Formular schlicht leer. */
-  char buf[1900];
+  char buf[2048];
   snprintf(buf, sizeof(buf),
     "{\"name\":\"%s\",\"ssid1\":\"%s\",\"ssid2\":\"%s\",\"ssid3\":\"%s\","
     "\"ip\":\"%s\",\"mask\":\"%s\",\"gw\":\"%s\","
@@ -750,6 +786,7 @@ static esp_err_t h_config_get(httpd_req_t *r) {
     "\"tx_power\":%d,\"eth_tx_retries\":%u,\"wifi_tx_retries\":%u,"
     "\"static_rx_buf\":%u,\"dynamic_rx_buf\":%u,\"dynamic_tx_buf\":%u,"
     "\"rx_ba_win\":%u,\"ht40\":%u,\"no_11b\":%u,\"wd_enable\":%u,"
+    "\"wd_actions\":%u,\"wd_bad_windows\":%u,"
     "\"wifi_connect_timeout_s\":%u,\"wifi_connect_retries\":%u,"
     "\"ap_idle_reboot_s\":%u,"
     "\"roam_enable\":%u,\"roam_check_s\":%u,\"roam_rssi_threshold\":%d,"
@@ -758,21 +795,36 @@ static esp_err_t h_config_get(httpd_req_t *r) {
     "\"static_rx_buf\":%u,\"dynamic_rx_buf\":%u,\"dynamic_tx_buf\":%u,"
     "\"rx_ba_win\":%u,\"wifi_connect_timeout_s\":%u,"
     "\"wifi_connect_retries\":%u,\"ap_idle_reboot_s\":%u,"
-    "\"roam_check_s\":%u,\"roam_rssi_threshold\":%d,\"roam_margin_db\":%u}}",
+    "\"roam_check_s\":%u,\"roam_rssi_threshold\":%d,\"roam_margin_db\":%u,"
+    "\"wd_actions\":%u,\"wd_bad_windows\":%u},"
+    "\"eff\":{\"static_rx_buf\":%u,\"dynamic_rx_buf\":%u,\"dynamic_tx_buf\":%u,"
+    "\"rx_ba_win\":%u}}",
     n, s1, s2, s3, ip, mask, gw, ip2, mask2, gw2, ip3, mask3, gw3,
     mh, g_cfg.mqtt_port, mu, g_cfg.telemetry_s,
     /* Die WIRKSAMEN Werte ausliefern, nicht die gespeicherte 0 - im Formular
      * soll stehen, was laeuft. Beim Speichern wird die Zahl dann explizit
-     * uebernommen; der "Standardwerte"-Knopf setzt sie zurueck. */
+     * uebernommen; der "Standardwerte"-Knopf setzt sie zurueck.
+     * Ausnahme Puffer/BA-Fenster: die greifen erst nach einem Neustart. Ist
+     * dort schon ein Wert gespeichert, muss DER ins Formular - mit dem noch
+     * laufenden Wert sprang das Feld nach dem Neuladen der Seite zurueck,
+     * und das naechste Speichern (egal welcher Einstellung) hat die
+     * Aenderung still wieder ueberschrieben. Die laufenden Werte stehen
+     * zusaetzlich unter "eff". */
     (int)g_cfg.tx_power, eff.eth_retries, eff.wifi_retries,
-    eff.static_rx, eff.dyn_rx, eff.dyn_tx,
-    eff.ba_win, g_cfg.ht40, g_cfg.no_11b, g_cfg.wd_enable,
+    g_cfg.static_rx_buf  ? g_cfg.static_rx_buf  : eff.static_rx,
+    g_cfg.dynamic_rx_buf ? g_cfg.dynamic_rx_buf : eff.dyn_rx,
+    g_cfg.dynamic_tx_buf ? g_cfg.dynamic_tx_buf : eff.dyn_tx,
+    g_cfg.rx_ba_win      ? g_cfg.rx_ba_win      : eff.ba_win,
+    g_cfg.ht40, g_cfg.no_11b, g_cfg.wd_enable,
+    eff.wd_actions, eff.wd_bad_windows,
     eff.wifi_connect_timeout_s, eff.wifi_connect_retries, eff.ap_idle_reboot_s,
     g_cfg.roam_enable, eff.roam_check_s, (int)eff.roam_rssi_threshold, eff.roam_margin_db,
     def.eth_retries, def.wifi_retries,
     def.static_rx, def.dyn_rx, def.dyn_tx, def.ba_win,
     def.wifi_connect_timeout_s, def.wifi_connect_retries, def.ap_idle_reboot_s,
-    def.roam_check_s, (int)def.roam_rssi_threshold, def.roam_margin_db);
+    def.roam_check_s, (int)def.roam_rssi_threshold, def.roam_margin_db,
+    def.wd_actions, def.wd_bad_windows,
+    eff.static_rx, eff.dyn_rx, eff.dyn_tx, eff.ba_win);
 
   httpd_resp_set_type(r, "application/json");
   httpd_resp_set_hdr(r, "Cache-Control", "no-store");
@@ -920,6 +972,16 @@ static esp_err_t h_config_post(httpd_req_t *r) {
   /* Wirkt sofort - watchdog_tick() liest g_cfg.wd_enable direkt, kein
    * Neustart noetig, damit "ausschalten" auch sofort greift. */
   if (form_get(body, "wd_enable", v, sizeof(v))) g_cfg.wd_enable = (uint8_t)(atoi(v) ? 1 : 0);
+  /* Ebenfalls sofort wirksam. Unbekannte Bits werden verworfen; 0 bleibt
+   * der Standard-Marker ("alle Stufen", siehe config.h). */
+  if (form_get(body, "wd_actions", v, sizeof(v)))
+    g_cfg.wd_actions = (uint8_t)(atoi(v) & WD_ACT_ALL);
+  if (form_get(body, "wd_bad_windows", v, sizeof(v))) {
+    int t = atoi(v);
+    if (t < 0)  t = 0;
+    if (t > 30) t = 30;   /* 30 x 20 s = 10 min - mehr ist kein Watchdog mehr */
+    g_cfg.wd_bad_windows = (uint8_t)t;
+  }
 
   /* Untergrenze 60s, damit ein Vertipper (z.B. "5" statt "500") das Geraet
    * nicht in eine schnelle Neustart-Schleife im Portal-Modus schickt. */
