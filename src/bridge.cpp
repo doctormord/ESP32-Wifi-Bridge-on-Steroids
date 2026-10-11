@@ -938,6 +938,17 @@ bool bridge_is_active(void) { return s_active; }
 esp_netif_t *bridge_mgmt_netif(void) { return s_mgmt_netif; }
 void bridge_get_mgmt_ip(uint8_t out[4]) { memcpy(out, s_mgmt_ip, 4); }
 
+/* Watchdog-Einstellungen mit aufgeloester 0-Konvention - hier oben, weil
+ * sowohl bridge_get_effective() als auch watchdog_tick() sie brauchen. */
+static uint8_t wd_actions_eff(void) {
+  const uint8_t m = g_cfg.wd_actions & WD_ACT_ALL;
+  return m ? m : WD_ACT_ALL;
+}
+
+static uint8_t wd_bad_windows_eff(void) {
+  return g_cfg.wd_bad_windows ? g_cfg.wd_bad_windows : WD_BAD_WINDOWS_DEF;
+}
+
 void bridge_get_defaults(bridge_tuning_t *o) {
   o->static_rx    = CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM;
   o->dyn_rx       = CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM;
@@ -951,6 +962,8 @@ void bridge_get_defaults(bridge_tuning_t *o) {
   o->roam_check_s           = ROAM_CHECK_S_DEF;
   o->roam_rssi_threshold    = ROAM_RSSI_THRESHOLD_DEF;
   o->roam_margin_db         = ROAM_MARGIN_DB_DEF;
+  o->wd_actions             = WD_ACT_ALL;
+  o->wd_bad_windows         = WD_BAD_WINDOWS_DEF;
 }
 
 void bridge_get_effective(bridge_tuning_t *o) {
@@ -966,6 +979,8 @@ void bridge_get_effective(bridge_tuning_t *o) {
   o->roam_margin_db      = g_cfg.roam_margin_db       ? g_cfg.roam_margin_db      : ROAM_MARGIN_DB_DEF;
   o->wifi_connect_retries   = s_eff_wifi_connect_retries;
   o->ap_idle_reboot_s       = g_cfg.ap_idle_reboot_s ? g_cfg.ap_idle_reboot_s : AP_IDLE_REBOOT_S_DEF;
+  o->wd_actions             = wd_actions_eff();
+  o->wd_bad_windows         = wd_bad_windows_eff();
 }
 
 void bridge_get_client_mac(uint8_t out[6]) { memcpy(out, s_client_mac, 6); }
@@ -998,6 +1013,12 @@ void bridge_apply_live_tuning(void) {
    * verlassen. */
   s_eth_tx_retries  = g_cfg.eth_tx_retries  ? g_cfg.eth_tx_retries  : ETH_TX_RETRIES_DEF;
   s_wifi_tx_retries = g_cfg.wifi_tx_retries ? g_cfg.wifi_tx_retries : WIFI_TX_RETRIES_DEF;
+
+  /* Haendisch gespeichert schlaegt Einmessung: eine noch laufende Messung
+   * wuerde den eben eingetragenen Wert sonst beim naechsten Kandidaten bzw.
+   * mit ihrem Ergebnis wieder ueberschreiben. Ein abgeschlossenes Ergebnis
+   * wird ebenfalls quittiert, damit das Portal es nicht erneut eintraegt. */
+  bridge_autotune_reset();
 
   /* Beim ersten Aufruf den Ausgangswert sichern. */
   if (!s_txp_default) {
@@ -1084,6 +1105,12 @@ bool bridge_autotune_start(void) {
   printf("[AUTO] Start - %u Kandidaten, je %u s\n",
          (unsigned)AT_N, (unsigned)((AT_EINSCHWINGEN + AT_MESSDAUER) / 1000));
   return true;
+}
+
+void bridge_autotune_reset(void) {
+  if (s_at_state == AT_LAEUFT)
+    printf("[AUTO] Abgebrochen - Wert wurde haendisch gespeichert\n");
+  s_at_state = AT_IDLE;
 }
 
 autotune_state_t bridge_autotune_state(void)  { return s_at_state; }
@@ -1187,8 +1214,8 @@ static void autotune_tick(void) {
 #define WD_ETH_STALL_PAKETE         5  /* darunter (LAN->WLAN, roh, nicht nur
                                         * verworfen) bei bestehendem Link gilt
                                         * die Kamera als still - siehe unten. */
-#define WD_SCHLECHTE_FENSTER        3  /* so oft hintereinander -> naechste
-                                        * Eskalationsstufe (gilt fuer alle)  */
+/* Wie viele schlechte Fenster hintereinander bis zur naechsten
+ * Eskalationsstufe: g_cfg.wd_bad_windows, 0 = WD_BAD_WINDOWS_DEF (bridge.h). */
 #define WD_PROBE_BUDGET_MS      1200u  /* Obergrenze fuer die Gateway-Sonde -
                                         * blockiert bridge_tick() kurzzeitig,
                                         * siehe Kommentar dort                */
@@ -1246,12 +1273,36 @@ static const char *wd_reason_str(uint8_t r) {
   }
 }
 
+/* Zuletzt ausgefuehrte Massnahme der laufenden Eskalation. Die Werte sind
+ * zugleich die Eskalationsreihenfolge - wd_naechste_massnahme() sucht die
+ * naechste ERLAUBTE Stufe oberhalb der aktuellen. */
 typedef enum {
-  WD_STAGE_NORMAL       = 0,
-  WD_STAGE_ETH_RESET    = 1,   /* Ethernet-Reset bereits versucht */
-  WD_STAGE_WIFI_RECONNECT = 2, /* WLAN-Reconnect bereits versucht (direkt
-                                 * oder nach einem erfolglosen ETH-Reset) */
+  WD_STAGE_NORMAL         = 0,
+  WD_STAGE_ETH_RESET      = 1,   /* Ethernet-Reset bereits versucht */
+  WD_STAGE_WIFI_RECONNECT = 2,   /* WLAN-Reconnect bereits versucht */
+  WD_STAGE_REBOOT         = 3,   /* nur als Ziel, wird nie "erreicht" */
 } wd_stage_t;
+
+/* Naechste Massnahme fuer dieses Symptom, ausgehend von der zuletzt
+ * ausgefuehrten. Der Ethernet-Reset kommt nur fuer WD_REASON_ETH_STALL in
+ * Frage (gegen ein WLAN-Symptom waere er wirkungslos, siehe oben). Sind
+ * oberhalb keine erlaubten Stufen mehr uebrig - weil die Eskalation bewusst
+ * begrenzt wurde, z.B. "nur Ethernet-Reset" -, beginnt sie wieder von vorn:
+ * die hoechste erlaubte Massnahme wird also wiederholt statt aufzugeben.
+ * WD_STAGE_NORMAL = fuer dieses Symptom ist gar nichts erlaubt. */
+static uint8_t wd_naechste_massnahme(uint8_t stage, uint8_t grund) {
+  const uint8_t m = wd_actions_eff();
+  for (int runde = 0; runde < 2; runde++) {
+    for (uint8_t s = stage + 1; s <= WD_STAGE_REBOOT; s++) {
+      if (s == WD_STAGE_ETH_RESET && (grund != WD_REASON_ETH_STALL || !(m & WD_ACT_ETH_RESET))) continue;
+      if (s == WD_STAGE_WIFI_RECONNECT && !(m & WD_ACT_WIFI_RECON)) continue;
+      if (s == WD_STAGE_REBOOT && !(m & WD_ACT_REBOOT)) continue;
+      return s;
+    }
+    stage = WD_STAGE_NORMAL;
+  }
+  return WD_STAGE_NORMAL;
+}
 
 /* Fehlstart-Ausnahme: einmalig auswertbar, wird beim Lesen geloescht - siehe
  * bridge_consume_planned_restart(). Analog zu main.cpp's PORTAL_MAGIC. */
@@ -1373,18 +1424,19 @@ static void watchdog_tick(void) {
    * Neuassoziieren das aussagekraeftigere Symptom. */
   if (ddisc >= WD_DISC_JE_FENSTER) { schlecht = true; grund = WD_REASON_DISCONNECTS; }
 
+  const uint8_t bad_max = wd_bad_windows_eff();
   s_wd_bad = schlecht ? (uint8_t)(s_wd_bad + 1) : 0;
   printf("[WD  ] Stufe %u, Fenster: %u Pakete, %u Verlust, %u Reconnects, Sonde=%u, Grund=%s -> %s (%u/%u)\n",
          (unsigned)s_wd_stage, (unsigned)(dp + dd), (unsigned)dd, (unsigned)ddisc,
          (unsigned)s_wd_probe, wd_reason_str(grund), schlecht ? "schlecht" : "ok",
-         (unsigned)s_wd_bad, (unsigned)WD_SCHLECHTE_FENSTER);
+         (unsigned)s_wd_bad, (unsigned)bad_max);
 
   if (!schlecht) {
     /* Erholt - eine eventuell laufende Eskalation ist erledigt. */
     s_wd_stage = WD_STAGE_NORMAL;
     return;
   }
-  if (s_wd_bad < WD_SCHLECHTE_FENSTER) return;
+  if (s_wd_bad < bad_max) return;
 
   /* Naechstes Fenster startet in jedem Eskalationsschritt frisch - die
    * Massnahme selbst braucht ein paar Sekunden, die sollen dem aktuell
@@ -1392,9 +1444,19 @@ static void watchdog_tick(void) {
   s_wd_bad = 0;
   s_wd_t0  = 0;
 
-  if (s_wd_stage == WD_STAGE_NORMAL && grund == WD_REASON_ETH_STALL) {
-    /* Kamera-seitiges Symptom -> zuerst nur Ethernet zuruecksetzen, WLAN
-     * bleibt unberuehrt. */
+  const uint8_t naechste = wd_naechste_massnahme(s_wd_stage, grund);
+
+  if (naechste == WD_STAGE_NORMAL) {
+    /* Fuer dieses Symptom ist per Portal keine Massnahme freigegeben (z.B.
+     * WLAN-Problem bei "nur Ethernet-Reset") - nur protokollieren. */
+    printf("[WD  ] Grund %s - keine Massnahme freigegeben (Maske 0x%02x), nur beobachten\n",
+           wd_reason_str(grund), (unsigned)wd_actions_eff());
+    return;
+  }
+
+  if (naechste == WD_STAGE_ETH_RESET) {
+    /* Kamera-seitiges Symptom -> nur Ethernet zuruecksetzen, WLAN bleibt
+     * unberuehrt. */
     printf("[WD  ] Kein Verkehr von der Kamera trotz Link - setze Ethernet zurueck\n");
     bridge_reset_eth();
     s_wd_eth_resets++;
@@ -1403,7 +1465,7 @@ static void watchdog_tick(void) {
     return;
   }
 
-  if (s_wd_stage != WD_STAGE_WIFI_RECONNECT) {
+  if (naechste == WD_STAGE_WIFI_RECONNECT) {
     /* Entweder ein WLAN-seitiges Symptom (direkt hier rein), oder ein
      * Ethernet-Reset in der vorigen Runde hat nicht geholfen - in beiden
      * Faellen jetzt WLAN trennen. wifi_evt() verbindet bei
@@ -1417,7 +1479,7 @@ static void watchdog_tick(void) {
     return;
   }
 
-  /* Weder Ethernet-Reset (falls versucht) noch WLAN-Reconnect halfen -
+  /* Die freigegebenen Vorstufen halfen nicht (oder sind abgewaehlt) -
    * letzte Eskalationsstufe. abort() statt esp_restart(), damit ein
    * Coredump entsteht: der naechste Boot soll nachvollziehbar sein, nicht
    * nur "es startete neu". */

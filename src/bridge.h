@@ -106,7 +106,18 @@ typedef struct {
   uint16_t roam_check_s;
   int8_t   roam_rssi_threshold;
   uint8_t  roam_margin_db;
+  uint8_t  wd_actions;
+  uint8_t  wd_bad_windows;
 } bridge_tuning_t;
+
+/* Erlaubte Watchdog-Massnahmen (BridgeConfig.wd_actions). Die Reihenfolge der
+ * Eskalation ist fest (Ethernet -> WLAN -> Neustart), die Maske waehlt nur
+ * aus, welche Stufen ueberhaupt genommen werden duerfen. */
+#define WD_ACT_ETH_RESET   0x01u
+#define WD_ACT_WIFI_RECON  0x02u
+#define WD_ACT_REBOOT      0x04u
+#define WD_ACT_ALL         (WD_ACT_ETH_RESET | WD_ACT_WIFI_RECON | WD_ACT_REBOOT)
+#define WD_BAD_WINDOWS_DEF 3u
 
 /* Firmware-Vorgabe fuer ap_idle_reboot_s (config.h) - hier statt in
  * main.cpp, weil sowohl main.cpp (Timer-Logik) als auch web.cpp (Anzeige
@@ -147,6 +158,9 @@ void bridge_apply_live_tuning(void);
 typedef enum { AT_IDLE = 0, AT_LAEUFT, AT_FERTIG, AT_ZU_WENIG_VERKEHR } autotune_state_t;
 
 bool             bridge_autotune_start(void);
+/* Laufende Einmessung abbrechen bzw. ein fertiges Ergebnis quittieren - wird
+ * beim haendischen Speichern gerufen, damit der eingetragene Wert gilt. */
+void             bridge_autotune_reset(void);
 autotune_state_t bridge_autotune_state(void);
 uint8_t          bridge_autotune_schritt(void);   /* aktueller Kandidat 0..n */
 uint8_t          bridge_autotune_anzahl(void);
