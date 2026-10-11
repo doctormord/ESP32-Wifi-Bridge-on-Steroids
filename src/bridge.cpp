@@ -23,6 +23,10 @@
 #include "esp_event.h"
 #include "esp_eth_mac.h"
 #include "esp_eth_phy.h"
+#if CONFIG_ETH_SPI_ETHERNET_W5500
+#include "esp_eth_mac_spi.h"
+#include "driver/spi_master.h"
+#endif
 #include "esp_mac.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
@@ -62,11 +66,38 @@ void      esp_wifi_internal_free_rx_buffer(void *buffer);
 #error "CONFIG_LWIP_L2_TO_L3_COPY muss gesetzt sein - siehe eth_rx_cb() in bridge.cpp"
 #endif
 
+#if CONFIG_ETH_USE_ESP32_EMAC
 /* --- WT32-ETH01 Pinbelegung ---------------------------------------------- */
 #define ETH_PHY_ADDR        1
 #define ETH_PHY_MDC_GPIO    23
 #define ETH_PHY_MDIO_GPIO   18
 #define ETH_PHY_PWR_GPIO    16
+#elif CONFIG_ETH_SPI_ETHERNET_W5500
+/* --- NiceMCU ESP32-C5_MINI_V1.0 + W5500-Lite ----------------------------- *
+ * SCLK/MOSI/MISO/CS liegen auf den IO_MUX-Pins von SPI2 (FSPICLK/FSPID/
+ * FSPIQ/FSPICS0). Nur wenn ALLE vier dort liegen, umgeht der SPI-Treiber
+ * die GPIO-Matrix - ein einziger anderer Pin, und alle laufen ueber sie.
+ * IO2 und IO7 sind Strapping-Pins; als MISO (vom W5500 nur bei CS low
+ * getrieben) und MOSI (Eingang am W5500) stoeren sie den Boot nicht.
+ * INT und RST bewusst auf Nicht-Strapping-Pins. */
+#define W5500_SPI_HOST      SPI2_HOST
+#define W5500_SCLK_GPIO     6
+#define W5500_MOSI_GPIO     7
+#define W5500_MISO_GPIO     2
+#define W5500_CS_GPIO       10
+#define W5500_INT_GPIO      9
+#define W5500_RST_GPIO      8
+/* 80 MHz ist der vom W5500-Datenblatt als "theoretisch" genannte Hoechstwert,
+ * GARANTIERT sind nur 33,3 MHz. Ob es haelt, entscheiden Leitungslaenge und
+ * das einzelne Modul. bridge_eth_init() faellt automatisch auf die naechste
+ * Stufe zurueck, wenn der W5500 sich beim Init nicht korrekt meldet - das
+ * faengt aber nur grobe Fehler ab, keine sporadisch kippenden Bits im
+ * Betrieb. Steigen dort die Fehler, hier auf 40 MHz festnageln. */
+static const int W5500_SPI_HZ[] = { 80 * 1000 * 1000, 40 * 1000 * 1000,
+                                    20 * 1000 * 1000 };
+#else
+#error "Kein unterstuetzter Ethernet-Treiber konfiguriert (EMAC oder W5500)"
+#endif
 
 /*
  * Sendewiederholungen, bevor ein Frame verworfen wird.
@@ -467,6 +498,22 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
  * Ethernet
  * ========================================================================= */
 
+/* Filter fuer den Bridge-Betrieb: alles annehmen, was auf dem Kabel
+ * ankommt. Promiscuous allein reicht beim W5500 nicht - dessen Treiber setzt
+ * im MACRAW-Modus zusaetzlich "Multicast blockieren", und ohne Multicast
+ * verliert der Client hinter der Bridge mDNS, SSDP, ONVIF-Discovery usw.
+ * Beim ESP32-EMAC laesst Promiscuous Multicast ohnehin durch; der zweite
+ * ioctl ist dort harmlos. */
+static void eth_set_bridge_filters(void) {
+  bool on = true;
+  esp_eth_ioctl(s_eth, ETH_CMD_S_PROMISCUOUS, &on);
+  esp_err_t e = esp_eth_ioctl(s_eth, ETH_CMD_S_ALL_MULTICAST, &on);
+  if (e != ESP_OK && e != ESP_ERR_NOT_SUPPORTED) {
+    printf("[ETH ] all_multicast: %s\n", esp_err_to_name(e));
+  }
+}
+
+#if CONFIG_ETH_USE_ESP32_EMAC
 bool bridge_eth_init(void) {
   gpio_config_t pwr = {};
   pwr.pin_bit_mask = 1ULL << ETH_PHY_PWR_GPIO;
@@ -510,6 +557,89 @@ bool bridge_eth_init(void) {
                                       &eth_evt, NULL, NULL);
   return true;
 }
+#elif CONFIG_ETH_SPI_ETHERNET_W5500
+bool bridge_eth_init(void) {
+  /* INT des W5500 laeuft ueber den gemeinsamen GPIO-ISR-Dienst. Ist er schon
+   * installiert, kommt ESP_ERR_INVALID_STATE - das ist kein Fehler. */
+  esp_err_t err = gpio_install_isr_service(0);
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    printf("[ETH ] gpio_install_isr_service: %s\n", esp_err_to_name(err));
+    return false;
+  }
+
+  spi_bus_config_t bus = {};
+  bus.sclk_io_num   = W5500_SCLK_GPIO;
+  bus.mosi_io_num   = W5500_MOSI_GPIO;
+  bus.miso_io_num   = W5500_MISO_GPIO;
+  bus.quadwp_io_num = -1;
+  bus.quadhd_io_num = -1;
+  err = spi_bus_initialize(W5500_SPI_HOST, &bus, SPI_DMA_CH_AUTO);
+  if (err != ESP_OK) {
+    printf("[ETH ] spi_bus_initialize: %s\n", esp_err_to_name(err));
+    return false;
+  }
+
+  eth_mac_config_t mac_cfg = ETH_MAC_DEFAULT_CONFIG();
+  mac_cfg.rx_task_stack_size = 4096;   /* unser Callback ruft in den WiFi-Stack */
+
+  eth_phy_config_t phy_cfg = ETH_PHY_DEFAULT_CONFIG();
+  phy_cfg.phy_addr       = -1;          /* interne PHY des W5500 */
+  phy_cfg.reset_gpio_num = W5500_RST_GPIO;
+
+  /* Absteigende Taktstufen. Der W5500-Treiber liest beim Init das
+   * VERSIONR-Register und bricht ab, wenn nicht 0x04 zurueckkommt - ein
+   * grob zu hoher Takt faellt also genau hier auf. */
+  int hz_used = 0;
+  for (size_t i = 0; i < sizeof(W5500_SPI_HZ) / sizeof(W5500_SPI_HZ[0]); i++) {
+    spi_device_interface_config_t dev = {};
+    dev.mode           = 0;
+    dev.clock_speed_hz = W5500_SPI_HZ[i];
+    dev.queue_size     = 20;
+    dev.spics_io_num   = W5500_CS_GPIO;
+
+    eth_w5500_config_t w5500 = ETH_W5500_DEFAULT_CONFIG(W5500_SPI_HOST, &dev);
+    w5500.int_gpio_num = W5500_INT_GPIO;
+
+    esp_eth_mac_t *mac = esp_eth_mac_new_w5500(&w5500, &mac_cfg);
+    esp_eth_phy_t *phy = esp_eth_phy_new_w5500(&phy_cfg);
+    if (!mac || !phy) {
+      printf("[ETH ] W5500 MAC/PHY-Objekt konnte nicht angelegt werden\n");
+      if (mac) mac->del(mac);
+      if (phy) phy->del(phy);
+      return false;
+    }
+
+    esp_eth_config_t cfg = ETH_DEFAULT_CONFIG(mac, phy);
+    err = esp_eth_driver_install(&cfg, &s_eth);
+    if (err == ESP_OK) { hz_used = W5500_SPI_HZ[i]; break; }
+
+    printf("[ETH ] W5500 bei %d MHz nicht ansprechbar (%s)\n",
+           W5500_SPI_HZ[i] / 1000000, esp_err_to_name(err));
+    /* deinit raeumt den INT-Handler ab, falls mac->init durchlief und erst
+     * die PHY scheiterte - sonst zeigte er nach del() auf freien Speicher. */
+    mac->deinit(mac);
+    mac->del(mac);
+    phy->del(phy);
+    s_eth = NULL;
+  }
+  if (!s_eth) return false;
+  printf("[ETH ] W5500 an SPI mit %d MHz\n", hz_used / 1000000);
+
+  /* Der W5500 hat keine MAC aus eFuse. Fuer den Datenpfad ist sie im
+   * Promiscuous-Betrieb bedeutungslos (gesendet wird mit der Quell-MAC des
+   * Clients), der Treiber will aber eine gueltige haben. */
+  uint8_t own[6];
+  if (esp_read_mac(own, ESP_MAC_ETH) != ESP_OK) {
+    esp_read_mac(own, ESP_MAC_WIFI_STA);
+    own[0] |= 0x02;   /* lokal verwaltet */
+  }
+  esp_eth_ioctl(s_eth, ETH_CMD_S_MAC_ADDR, own);
+
+  esp_event_handler_instance_register(ETH_EVENT, ESP_EVENT_ANY_ID,
+                                      &eth_evt, NULL, NULL);
+  return true;
+}
+#endif
 
 bool bridge_sniff_client_mac(uint32_t timeout_ms) {
   esp_eth_update_input_path(s_eth, eth_sniff_cb, NULL);
@@ -538,8 +668,7 @@ bool bridge_sniff_client_mac(uint32_t timeout_ms) {
   printf("[ETH ] Client-MAC: %s\n", s);
 
   esp_eth_update_input_path(s_eth, NULL, NULL);
-  bool promisc = true;
-  esp_eth_ioctl(s_eth, ETH_CMD_S_PROMISCUOUS, &promisc);
+  eth_set_bridge_filters();
   printf("[ETH ] Promiscuous aktiv\n");
   return true;
 }
@@ -821,16 +950,44 @@ bool bridge_wifi_start(void) {
   /* 802.11b abschaltbar: die b-Raten sind langsam und belegen als
    * Basic-Rate unnoetig Sendezeit. Nur sinnvoll, wenn im Netz kein reines
    * b-Geraet mehr haengt - sonst sieht der AP uns evtl. gar nicht mehr. */
+#if CONFIG_SOC_WIFI_SUPPORT_5G
+  /* Dual-Band (ESP32-C5): 2,4 und 5 GHz zulassen, der Scan nimmt dann den
+   * staerksten AP egal auf welchem Band. Im Auto-Band-Modus liefern die
+   * Einband-APIs esp_wifi_set_protocol/_bandwidth ESP_ERR_NOT_SUPPORTED,
+   * deshalb hier die Plural-Varianten. 11ax (Wi-Fi 6) auf beiden Baendern
+   * - das ist der eigentliche Grund fuer den C5. */
+  esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);
+  wifi_protocols_t protos = {};
+  protos.ghz_2g = g_cfg.no_11b
+      ? (WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AX)
+      : (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AX);
+  protos.ghz_5g = WIFI_PROTOCOL_11A | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AC |
+                  WIFI_PROTOCOL_11AX;
+  esp_err_t pr = esp_wifi_set_protocols(WIFI_IF_STA, &protos);
+  if (pr != ESP_OK) {
+    printf("[WIFI] set_protocols: %s\n", esp_err_to_name(pr));
+  }
+#else
   esp_wifi_set_protocol(WIFI_IF_STA,
       g_cfg.no_11b ? (WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N)
                    : (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
+#endif
 
   /* HT40 verdoppelt die Kanalbreite und damit die Brutto-Datenrate, greift
    * aber nur, wenn der AP auf 2,4 GHz tatsaechlich 40 MHz anbietet - viele
    * tun das aus Koexistenzgruenden nicht. Ohne AP-Unterstuetzung bleibt es
    * folgenlos bei HT20, das ist kein Fehlerfall. */
+#if CONFIG_SOC_WIFI_SUPPORT_5G
+  /* Der HT40-Schalter gilt fuer beide Baender. Auf 5 GHz ist 40 MHz der
+   * Normalfall (keine Koexistenzbremse), dort kostet er nichts. */
+  wifi_bandwidths_t bws = {};
+  bws.ghz_2g = g_cfg.ht40 ? WIFI_BW_HT40 : WIFI_BW_HT20;
+  bws.ghz_5g = g_cfg.ht40 ? WIFI_BW_HT40 : WIFI_BW_HT20;
+  esp_err_t bw = esp_wifi_set_bandwidths(WIFI_IF_STA, &bws);
+#else
   esp_err_t bw = esp_wifi_set_bandwidth(
       WIFI_IF_STA, g_cfg.ht40 ? WIFI_BW_HT40 : WIFI_BW_HT20);
+#endif
   if (bw != ESP_OK) {
     printf("[WIFI] set_bandwidth: %s\n", esp_err_to_name(bw));
   }
@@ -997,8 +1154,7 @@ void bridge_set_client_mac(const uint8_t mac[6]) {
    * Bridge mit installiertem Sniff-Callback und ohne Promiscuous, wuerde also
    * nur Broadcasts durchreichen und praktisch nichts transportieren. */
   esp_eth_update_input_path(s_eth, NULL, NULL);
-  bool promisc = true;
-  esp_eth_ioctl(s_eth, ETH_CMD_S_PROMISCUOUS, &promisc);
+  eth_set_bridge_filters();
   printf("[ETH ] Promiscuous aktiv\n");
 }
 
@@ -1063,7 +1219,17 @@ int16_t bridge_get_tx_power(void) {
 
 uint8_t bridge_get_bandwidth_mhz(void) {
   wifi_bandwidth_t bw;
+#if CONFIG_SOC_WIFI_SUPPORT_5G
+  /* Im Auto-Band-Modus gibt es nur die Plural-Abfrage - welcher der beiden
+   * Werte gilt, entscheidet der Kanal, auf dem wir gerade sitzen. */
+  wifi_bandwidths_t bws;
+  uint8_t ch = 0; wifi_second_chan_t sec;
+  if (esp_wifi_get_bandwidths(WIFI_IF_STA, &bws) != ESP_OK) return 0;
+  if (esp_wifi_get_channel(&ch, &sec) != ESP_OK) return 0;
+  bw = (ch > 14) ? bws.ghz_5g : bws.ghz_2g;
+#else
   if (esp_wifi_get_bandwidth(WIFI_IF_STA, &bw) != ESP_OK) return 0;
+#endif
   return (bw == WIFI_BW_HT40) ? 40 : 20;
 }
 
@@ -1352,8 +1518,7 @@ bool bridge_reset_eth(void) {
   esp_eth_start(s_eth);
 
   esp_eth_update_input_path(s_eth, eth_rx_cb, NULL);
-  bool promisc = true;
-  esp_eth_ioctl(s_eth, ETH_CMD_S_PROMISCUOUS, &promisc);
+  eth_set_bridge_filters();
   return true;
 }
 

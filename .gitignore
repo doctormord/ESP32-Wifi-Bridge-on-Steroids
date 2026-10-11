@@ -6,6 +6,7 @@
 # die in docs/content/history.md mehrfach Zeit gekostet hat.
 sdkconfig.wt32-eth01
 sdkconfig.wt32-eth01-minimal
+sdkconfig.nicemcu-c5-w5500
 sdkconfig.*.old
 
 # Build-Artefakte und Vergleichs-Images.

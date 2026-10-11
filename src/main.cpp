@@ -55,8 +55,15 @@
 #include "lwip/apps/netbiosns.h"
 
 /* Pin gegen GND beim Booten -> Werksreset. Auf dem WT32-ETH01 sind die
- * meisten GPIOs von RMII belegt; IO14 ist frei und keine Strapping-Leitung. */
+ * meisten GPIOs von RMII belegt; IO14 ist frei und keine Strapping-Leitung.
+ * Auf dem NiceMCU ESP32-C5 Mini ist IO4 der naechste freie Nicht-Strapping-
+ * Pin (rechte Leiste, drei Pins ueber GND). Die BOOT-Taste (IO28) taugt
+ * nicht: beim Reset gedrueckt startet der C5 in den Download-Modus. */
+#if CONFIG_IDF_TARGET_ESP32C5
+#define FACTORY_RESET_GPIO   4
+#else
 #define FACTORY_RESET_GPIO   14
+#endif
 
 /* Wie lange auf das erste Client-Frame gewartet wird, bevor wir aufgeben
  * und stattdessen das Portal anbieten. Ohne Client-MAC keine Bridge. */

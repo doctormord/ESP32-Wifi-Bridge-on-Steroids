@@ -1,0 +1,26 @@
+# ============================================================================
+#  Partitionstabelle fuer NiceMCU ESP32-C5 Mini (ESP32-C5HF4, 4 MB Flash), OTA
+# ============================================================================
+#  Gleiche Aufteilung wie partitions_8mb_ota.csv, nur mit kleineren Slots.
+#  Der Flash sitzt beim C5HF4 im Chipgehaeuse, 4 MB sind fest.
+#
+#    nvs        24 KB  - Konfiguration (BridgeConfig) + WiFi-Kalibrierung
+#    otadata     8 KB  - merkt sich, welcher App-Slot aktiv ist
+#    app0     1920 KB  - OTA-Slot 0
+#    app1     1920 KB  - OTA-Slot 1
+#    coredump   64 KB  - Absturzabbild (Begruendung in partitions_8mb_ota.csv)
+#    (ab 0x3F0000 bleiben 64 KB unbelegt)
+#
+#  1920 KB pro Slot sind gut das Doppelte des aktuellen Images. Die Tabelle
+#  ist nicht per OTA aenderbar - wer sie aendert, braucht das Board am Kabel.
+#
+#  Beim C5 liegt der Bootloader bei 0x2000 (nicht 0x1000 wie beim ESP32);
+#  die Partitionstabelle bleibt bei 0x8000, der Platz davor reicht.
+#  App-Partitionen muessen auf 64-KB-Grenzen beginnen.
+# ----------------------------------------------------------------------------
+# Name,     Type, SubType,   Offset,   Size,     Flags
+nvs,        data, nvs,       0x9000,   0x6000,
+otadata,    data, ota,       0xF000,   0x2000,
+app0,       app,  ota_0,     0x20000,  0x1E0000,
+app1,       app,  ota_1,     0x200000, 0x1E0000,
+coredump,   data, coredump,  0x3E0000, 0x10000,

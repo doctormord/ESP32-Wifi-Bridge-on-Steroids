@@ -1283,18 +1283,32 @@ static esp_err_t h_coredump_get(httpd_req_t *r) {
   /* Backtrace als Hex-Adressen - mit dem lokalen firmware.elf per
    * xtensa-esp32-elf-addr2line auf Datei+Zeile aufloesbar. */
   char bt[400] = "";
+  char extra[80] = "";
+#if CONFIG_IDF_TARGET_ARCH_XTENSA
   size_t o = 0;
   for (uint32_t i = 0; i < sum.exc_bt_info.depth && i < 16 && o + 13 < sizeof(bt); i++) {
     o += snprintf(bt + o, sizeof(bt) - o, "%s\"0x%08lx\"", i ? "," : "",
                   (unsigned long)sum.exc_bt_info.bt[i]);
   }
+  const bool corrupted = sum.exc_bt_info.corrupted;
+#else
+  /* RISC-V (ESP32-C5): die IDF erzeugt hier keinen Backtrace auf dem Geraet,
+   * nur Register und einen Stack-Abzug. Die Ruecksprungadresse ra ist der
+   * eine Eintrag, der sich ohne ELF sicher angeben laesst; der volle
+   * Backtrace kommt per espcoredump.py aus der Partition. mcause/mtval
+   * sagen, WAS passiert ist (z.B. 5 = Load access fault, mtval = Adresse). */
+  snprintf(bt, sizeof(bt), "\"0x%08lx\"", (unsigned long)sum.ex_info.ra);
+  snprintf(extra, sizeof(extra), ",\"mcause\":\"0x%08lx\",\"mtval\":\"0x%08lx\"",
+           (unsigned long)sum.ex_info.mcause, (unsigned long)sum.ex_info.mtval);
+  const bool corrupted = false;
+#endif
 
-  char buf[1200];
+  char buf[1280];
   snprintf(buf, sizeof(buf),
     "{\"present\":true,\"readable\":true,\"corrupted\":%s,"
-    "\"task\":\"%s\",\"pc\":\"0x%08lx\",\"reason\":\"%s\",\"bt\":[%s]}",
-    sum.exc_bt_info.corrupted ? "true" : "false",
-    task_esc, (unsigned long)sum.exc_pc, reason_esc, bt);
+    "\"task\":\"%s\",\"pc\":\"0x%08lx\",\"reason\":\"%s\",\"bt\":[%s]%s}",
+    corrupted ? "true" : "false",
+    task_esc, (unsigned long)sum.exc_pc, reason_esc, bt, extra);
 
   return httpd_resp_send(r, buf, HTTPD_RESP_USE_STRLEN);
 }
