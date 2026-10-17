@@ -47,6 +47,15 @@ The same split applies to flash *frequency*: `CONFIG_ESPTOOLPY_FLASHFREQ` may st
 
 `sdkconfig.wt32-eth01` is a generated, fully-resolved cache of `sdkconfig.defaults` + component Kconfig defaults. PlatformIO/ESP-IDF only fills in options *missing* from it — an explicit value already present (e.g. from a previous build with different settings) silently wins over a later change to `sdkconfig.defaults`. If build behavior doesn't match what `sdkconfig.defaults` says it should (wrong flash size, unexpectedly large binary, a Kconfig-gated header suddenly missing), suspect drift first: delete `sdkconfig.wt32-eth01` and let it regenerate from `sdkconfig.defaults` on the next `pio run`, rather than hand-editing the cached file.
 
+## Language and comment conventions
+
+These rules are binding for every change, in every file (C/C++, headers, CMake, `platformio.ini`, `sdkconfig.defaults`, partition tables, scripts):
+
+- **English only.** All code comments, identifiers, serial log messages, MQTT/Home Assistant names, API error strings and the entire web portal UI (`PAGE[]` in `web.cpp`: labels, hints, buttons, status texts, JS messages) are English. No German anywhere in the code base. Docs under `docs/content/` are English as well.
+- **Every function gets a comment** explaining what it does, how it works and why it exists — written so that someone new to the project can follow it without reading the git log. Non-obvious constraints (buffer ownership, IRAM, task context, ordering requirements) belong there.
+- **Comments describe the code as it is, not how it got there.** No dates, no incident narratives ("seen on 2026-08-14 in the lab"), no "previously this was X", no "I first tried …", no field-appended-on markers. Keep the *reason* a design decision was made (e.g. "retries default to 8 because dropped UDP frames are lost for good"), drop the story. History belongs in `docs/content/history.md`, open work in `docs/content/backlog.md`.
+- **Nothing personal in the code**: no personal names, home/lab locations, specific personal devices, private network details. Use neutral wording ("the bridged client", "an IP camera", "a second site").
+
 ## Architecture
 
 ### Entry point and lifecycle
