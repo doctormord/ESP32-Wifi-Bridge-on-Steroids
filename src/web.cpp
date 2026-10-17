@@ -173,6 +173,21 @@ button.sec{background:#2f3542;color:var(--fg)}
 .tag.live{background:rgba(62,207,142,.15);color:var(--ok)}
 .tag.reboot{background:rgba(255,183,77,.15);color:#ffb74d}
 .hint{text-transform:none;letter-spacing:0;color:#6b7383;font-size:11px;margin-left:6px}
+/* Neustart-Knoepfe: beim Druecken rot, ausgeloest erst beim Loslassen. */
+button.hold{transition:background .12s,color .12s,transform .12s;touch-action:manipulation;user-select:none}
+button.hold.armed{background:var(--bad);color:#fff;transform:scale(.97)}
+button:disabled{opacity:.6;cursor:default}
+/* Hinweis auf ungespeicherte Aenderungen, unten rechts. */
+#dirty{position:fixed;right:16px;bottom:16px;z-index:10;max-width:calc(100% - 32px);width:340px;
+  background:#2a1b1f;border:1px solid rgba(255,107,107,.55);border-radius:10px;padding:12px 14px;
+  box-shadow:0 8px 24px rgba(0,0,0,.45);font-size:13px}
+#dirty[hidden]{display:none}
+#dirty b{color:var(--bad)}
+#dirty .row button{margin-top:10px;padding:8px 12px}
+#dirtymsg{margin-top:6px;color:var(--mut);font-size:12px}
+/* Solange die Box steht, Platz am Seitenende - sonst verdeckt sie (vor allem
+   am Handy) die letzten Felder dauerhaft. */
+body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
 </style></head><body><div class="wrap">
 <h1 id="title">WiFi-Ethernet-Bridge</h1>
 <div class="sub" id="mode"></div>
@@ -249,8 +264,8 @@ button.sec{background:#2f3542;color:var(--fg)}
   <label>Admin-Schluessel (schuetzt Firmware-Update und Absturz-Abbild, leer = offen)</label>
   <input id="admin_pass" type="password" placeholder="unveraendert lassen = leer">
 
-  <button onclick="save(true)">Speichern &amp; neu starten</button>
-  <button class="sec" onclick="reboot()">Nur neu starten</button>
+  <button class="hold" data-act="saverb">Speichern &amp; neu starten</button>
+  <button class="sec hold" data-act="reboot">Nur neu starten</button>
   <div id="msg"></div>
 </div>
 
@@ -469,7 +484,7 @@ button.sec{background:#2f3542;color:var(--fg)}
 
   <button onclick="save(false)">Speichern</button>
   <button class="sec" onclick="defaults()">Standardwerte</button>
-  <button class="sec" onclick="reboot()">Neu starten</button>
+  <button class="sec hold" data-act="reboot">Neu starten</button>
   <div id="tmsg"></div>
 </div>
 
@@ -487,6 +502,14 @@ button.sec{background:#2f3542;color:var(--fg)}
   <button onclick="upload()">Hochladen &amp; flashen</button>
   <div id="omsg"></div>
 </div>
+</div>
+<div id="dirty" hidden role="status">
+  <b>Ungespeicherte Aenderungen</b> <span id="dirtyn" class="hint"></span>
+  <div class="row" id="dirtybtns">
+    <button onclick="dirtySave()">Speichern</button>
+    <button class="sec" onclick="dirtyCancel()">Verwerfen</button>
+  </div>
+  <div id="dirtymsg"></div>
 </div><script>
 const $=i=>document.getElementById(i);
 /* Im Provisionierungsmodus laeuft der STA-Datenpfad noch nicht, dort greift
@@ -584,7 +607,10 @@ async function tick(){
     if(s.at===1) $('atmsg').textContent='Einmessung laeuft - Messung '+(s.at_s+1)+
                  ', teste '+s.at_k+' Retries (je ca. 19 s, meist 3-6 Messungen)';
     else if(s.at===2){ $('atmsg').textContent='Fertig - gewaehlt: '+s.at_r+' Retries, gespeichert.';
-                       if(ATPREV===1) $('eth_tx_retries').value=s.at_r; }
+                       if(ATPREV===1){ $('eth_tx_retries').value=s.at_r;
+                         /* Hat das Board selbst gespeichert - ist also keine
+                            offene Aenderung. */
+                         if(SNAP){SNAP.eth_tx_retries=String(s.at_r);dirtyCheck()} } }
     else if(s.at===3) $('atmsg').textContent='Abgebrochen: zu wenig Verkehr waehrend der Messung. '+
                       'Kamera streamen lassen und erneut starten.';
     ATPREV=s.at;
@@ -626,6 +652,7 @@ async function load(){
   const c=await(await fetch('/api/config')).json();
   DEF=c.def||null;
   for(const k of CFG) if(c[k]!==undefined)$(k).value=c[k];
+  snapshot();
   /* Puffer: im Formular steht der GESPEICHERTE Wert (sonst ging eine
      Aenderung vor dem Neustart beim naechsten Speichern wieder verloren).
      Weicht der laufende davon ab, steht er als Hinweis darunter. */
@@ -648,17 +675,22 @@ async function scan(){
    rb=false -> nur speichern; TX-Power und Retries greifen dann sofort, das
    Board bleibt online und man kann direkt oben am Zaehler ablesen, ob die
    Aenderung etwas gebracht hat. Genau dafuer ist das Tuning-Panel da. */
-async function save(rb){
-  const f=CFG.concat(['pass1','pass2','pass3','mqtt_pass','admin_pass']);
-  const body=f.map(k=>k+'='+encodeURIComponent($(k).value)).join('&');
-  const tgt=rb?$('msg'):$('tmsg');
+async function save(rb,tgtOverride){
+  const body=CFG.concat(PW).map(k=>k+'='+encodeURIComponent($(k).value)).join('&');
+  const tgt=tgtOverride||(rb?$('msg'):$('tmsg'));
   tgt.textContent='Speichere...';
-  const r=await fetch('/api/config',{method:'POST',body:body,
-    headers:{'Content-Type':'application/x-www-form-urlencoded'}});
-  if(!r.ok){tgt.textContent='Fehler beim Speichern';return}
+  let r;
+  try{r=await fetch('/api/config',{method:'POST',body:body,
+    headers:{'Content-Type':'application/x-www-form-urlencoded'}});}catch(e){}
+  if(!r||!r.ok){tgt.textContent='Fehler beim Speichern';return false}
+  /* Gespeichert = neuer Ausgangsstand. Passwortfelder leeren: leer heisst
+     "unveraendert", ein stehengebliebenes Passwort wuerde sonst als
+     Aenderung gelten und bei jedem Speichern erneut geschickt. */
+  for(const k of PW)$(k).value='';
+  snapshot();
   if(rb){
-    tgt.textContent='Gespeichert. Neustart laeuft...';
-    setTimeout(()=>fetch('/api/reboot',{method:'POST'}),600);
+    tgt.textContent='Gespeichert.';
+    setTimeout(()=>reboot(tgt),600);
   }else if(PROV){
     tgt.textContent='Gespeichert. Im Provisionierungsmodus greift noch nichts davon - '
       +'die Werte werden beim ersten Bridge-Start uebernommen.';
@@ -666,6 +698,7 @@ async function save(rb){
     tgt.textContent='Gespeichert. Sendeleistung, Retries und Watchdog sind sofort aktiv - '
       +'Puffer, Kanalbreite und 802.11b erst nach einem Neustart.';
   }
+  return true;
 }
 let DEF=null;
 /* Fuellt die Zahlenfelder mit den Firmware-Vorgaben. Gespeichert wird erst
@@ -675,6 +708,7 @@ function defaults(){
   for(const k in DEF) if($(k)) $(k).value=DEF[k];
   $('tx_power').value='0';
   $('tmsg').textContent='Standardwerte eingetragen - zum Uebernehmen speichern.';
+  dirtyCheck();   /* per Skript gesetzt - loest kein input-Ereignis aus */
 }
 async function autotune(){
   $('atmsg').textContent='Starte...';
@@ -684,7 +718,125 @@ async function autotune(){
                                :('Nicht gestartet: '+(j.err||'unbekannt'));
   }catch(e){$('atmsg').textContent='Fehler beim Starten'}
 }
-async function reboot(){await fetch('/api/reboot',{method:'POST'});$('msg').textContent='Neustart...';}
+/* Neustart ausloesen und die Seite neu laden, sobald das Board wieder
+   antwortet - sonst steht man vor einer toten Seite und weiss nicht, wann es
+   weitergeht. Erst nach 8 s fragen: vorher antwortet womoeglich noch die
+   alte Instanz. */
+async function reboot(tgt){
+  tgt=tgt||$('msg');
+  document.querySelectorAll('button.hold').forEach(b=>b.disabled=true);
+  try{await fetch('/api/reboot',{method:'POST'})}catch(e){}
+  REBOOTING=true;
+  const t0=Date.now();
+  tgt.textContent='Neustart laeuft - die Seite laedt neu, sobald die Bridge wieder antwortet...';
+  const poll=async()=>{
+    const ctl=new AbortController();const to=setTimeout(()=>ctl.abort(),3000);
+    try{const r=await fetch('/api/status',{cache:'no-store',signal:ctl.signal});
+        if(r.ok){location.reload();return}}catch(e){}
+    clearTimeout(to);
+    tgt.textContent='Neustart laeuft... ('+Math.round((Date.now()-t0)/1000)+' s)';
+    setTimeout(poll,2000);
+  };
+  setTimeout(poll,8000);
+}
+let REBOOTING=false;
+/* Knopf, der erst beim LOSLASSEN ausloest: Druecken faerbt ihn rot
+   ("Loslassen = Neustart"), Loslassen ueber dem Knopf loest aus, Wegziehen
+   oder Scrollen bricht ab. Ein versehentlicher Tipp beim Scrollen startet so
+   nichts neu. Per Tastatur (kein Zeiger) stattdessen mit Rueckfrage. */
+function holdBtn(b,act){
+  const txt=b.textContent;let armed=false;
+  const reset=()=>{armed=false;b.classList.remove('armed');b.textContent=txt};
+  b.addEventListener('pointerdown',e=>{
+    if(e.button||b.disabled)return;
+    armed=true;b.classList.add('armed');b.textContent='Loslassen = Neustart';
+  });
+  b.addEventListener('pointerup',e=>{
+    if(!armed)return;
+    /* Bei Touch bleibt der Zeiger am Knopf "gefangen" - ob der Finger noch
+       darueber ist, sagt erst elementFromPoint. */
+    const over=b.contains(document.elementFromPoint(e.clientX,e.clientY));
+    reset();
+    if(over)act();
+  });
+  b.addEventListener('pointercancel',reset);
+  b.addEventListener('pointerleave',e=>{if(e.pointerType==='mouse')reset()});
+  b.addEventListener('click',e=>{
+    if(e.detail===0&&!b.disabled&&confirm(txt+' - wirklich?'))act();
+  });
+}
+/* ---------------------------------------------------------------------------
+   Ungespeicherte Aenderungen. Ausgangsstand = Formular nach load() bzw. nach
+   dem letzten erfolgreichen Speichern. Passwortfelder: leer = unveraendert.
+   ------------------------------------------------------------------------- */
+const PW=['pass1','pass2','pass3','mqtt_pass','admin_pass'];
+/* Diese Felder greifen ohne Neustart (im Code geprueft: werden bei jeder
+   Verwendung frisch aus g_cfg gelesen bzw. von bridge_apply_live_tuning()
+   uebernommen). Alles andere erst nach einem Neustart. */
+const LIVE=['tx_power','eth_tx_retries','wifi_tx_retries','wd_enable','wd_actions','wd_bad_windows',
+            'roam_enable','roam_check_s','roam_rssi_threshold','roam_margin_db',
+            'ap_idle_reboot_s','telemetry_s','admin_pass'];
+let SNAP=null;
+function snapshot(){SNAP={};for(const k of CFG)SNAP[k]=$(k).value;dirtyCheck()}
+function geaendert(){
+  if(!SNAP)return[];
+  return CFG.filter(k=>$(k).value!==SNAP[k]).concat(PW.filter(k=>$(k).value!==''));
+}
+function dirtyCheck(){
+  const g=geaendert();
+  if(!g.length){
+    /* Nach dem Speichern bleibt die Box stehen, solange sie noch etwas zu
+       sagen hat (Neustart noetig) - sonst verschwindet sie. */
+    if(!DIRTY_NEEDS_RB)$('dirty').hidden=true;
+    return;
+  }
+  DIRTY_NEEDS_RB=false;
+  const rb=g.filter(k=>!LIVE.includes(k)).length;
+  $('dirtyn').textContent=g.length+(g.length===1?' Feld':' Felder')+
+    (rb?', davon '+rb+' erst nach Neustart wirksam':'');
+  $('dirtymsg').textContent='';
+  $('dirtybtns').innerHTML='<button onclick="dirtySave()">Speichern</button>'+
+    '<button class="sec" onclick="dirtyCancel()">Verwerfen</button>';
+  $('dirty').querySelector('b').textContent='Ungespeicherte Aenderungen';
+  $('dirty').hidden=false;
+}
+let DIRTY_NEEDS_RB=false;
+async function dirtySave(){
+  const rb=geaendert().filter(k=>!LIVE.includes(k)).length;
+  if(!await save(false,$('dirtymsg')))return;
+  if(rb&&!PROV){
+    /* Gespeichert, aber ein Teil greift erst nach dem Neustart - den gleich
+       hier anbieten, wieder als Loslassen-Knopf. */
+    DIRTY_NEEDS_RB=true;
+    $('dirty').querySelector('b').textContent='Gespeichert - Neustart noetig';
+    $('dirtyn').textContent='';
+    $('dirtymsg').textContent=rb+(rb===1?' Aenderung greift':' Aenderungen greifen')+' erst nach einem Neustart.';
+    $('dirtybtns').innerHTML='<button class="hold" data-act="reboot">Jetzt neu starten</button>'+
+      '<button class="sec" onclick="DIRTY_NEEDS_RB=false;$(\'dirty\').hidden=true">Spaeter</button>';
+    holdBtn($('dirtybtns').firstChild,()=>reboot($('dirtymsg')));
+    /* save() hat beim neuen Ausgangsstand "keine Aenderung" gesehen und die
+       Box versteckt, bevor DIRTY_NEEDS_RB stand - wieder einblenden. */
+    $('dirty').hidden=false;
+  }else{
+    $('dirtymsg').textContent='Gespeichert.';
+    setTimeout(()=>{if(!geaendert().length)$('dirty').hidden=true},1500);
+  }
+}
+function dirtyCancel(){
+  if(!SNAP)return;
+  for(const k of CFG)$(k).value=SNAP[k];
+  for(const k of PW)$(k).value='';
+  dirtyCheck();
+}
+/* Eingaben ueberall auf der Seite pruefen (delegiert), plus Warnung beim
+   Verlassen der Seite mit offenen Aenderungen. */
+document.addEventListener('input',dirtyCheck);
+document.addEventListener('change',dirtyCheck);
+window.addEventListener('beforeunload',e=>{
+  if(!REBOOTING&&geaendert().length){e.preventDefault();e.returnValue=''}
+});
+document.querySelectorAll('button.hold').forEach(b=>
+  holdBtn(b,b.dataset.act==='saverb'?()=>save(true):()=>reboot()));
 async function ethReset(){
   $('ethmsg').textContent='Setze Ethernet zurueck...';
   try{
