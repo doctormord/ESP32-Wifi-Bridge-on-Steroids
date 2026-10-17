@@ -1,40 +1,40 @@
 /*
  * ============================================================================
  *  ESP32 Wi-Fi <-> Ethernet Transparent Bridge
- *  mit Management-IP, Konfigurationsportal und MQTT-Telemetrie
+ *  with management IP, configuration portal and MQTT telemetry
  * ============================================================================
  *
- *  Zielhardware : WT32-ETH01 (ESP32-D0WD + LAN8720A)
- *  Toolchain    : PlatformIO, framework = espidf
+ *  Target hardware : WT32-ETH01 (ESP32-D0WD + LAN8720A)
+ *  Toolchain       : PlatformIO, framework = espidf
  *
  *  ---------------------------------------------------------------------------
- *  BETRIEBSMODI
+ *  OPERATING MODES
  *  ---------------------------------------------------------------------------
  *
- *  PROVISIONIERUNG  (keine SSID gespeichert, Reset-Pin gezogen,
- *                    oder Verbindungsaufbau gescheitert)
- *      -> Access Point "<name>-setup-XXXX"
- *      -> http://192.168.4.1 : Name, WLANs, Management-IP, MQTT einstellen
- *      -> Speichern loest Neustart aus
+ *  PROVISIONING  (no SSID stored, reset pin pulled low,
+ *                 or bringing up the bridge failed)
+ *      -> access point "<name>-setup-XXXX"
+ *      -> http://192.168.4.1 : set name, Wi-Fi networks, management IP, MQTT
+ *      -> saving triggers a reboot
  *
  *  BRIDGE
- *      1. Ethernet starten, MAC des angeschlossenen Clients sniffen
- *      2. Promiscuous aktivieren
- *      3. WLAN-STA mit der GEKLONTEN MAC verbinden
- *      4. Management-Netif mit statischer IP anhaengen
- *      5. Datenpfad scharf schalten, Webserver + MQTT starten
+ *      1. start Ethernet, sniff the MAC of the attached client
+ *      2. enable promiscuous mode
+ *      3. connect the Wi-Fi STA using the CLONED MAC
+ *      4. attach the management netif with its static IP
+ *      5. arm the data path, start the web server + MQTT
  *
  *  ---------------------------------------------------------------------------
- *  WARUM ZWEI IPs AUF EINER MAC FUNKTIONIEREN
+ *  WHY TWO IPs ON ONE MAC WORK
  *  ---------------------------------------------------------------------------
- *  Der WLAN-STA traegt die MAC des Clients (noetig, weil ein 802.11-STA im
- *  3-Address-Mode arbeitet und der AP nur an diese MAC ausliefert). Der
- *  Management-Stack haengt am selben Interface und damit an derselben MAC,
- *  hat aber eine eigene IP. ARP loest beide IPs auf dieselbe MAC auf - fuer
- *  Switches und APs voellig unauffaellig.
+ *  The Wi-Fi STA carries the client's MAC (required, because an 802.11 STA
+ *  works in 3-address mode and the AP only delivers frames to that MAC). The
+ *  management stack sits on the same interface and therefore the same MAC,
+ *  but has its own IP. ARP resolves both IPs to the same MAC - completely
+ *  unremarkable for switches and APs.
  *
- *  Die Management-IP MUSS statisch sein: ein DHCP-Server wuerde derselben
- *  MAC zweimal dieselbe Adresse zuweisen.
+ *  The management IP MUST be static: a DHCP server would hand the same MAC
+ *  the same lease twice.
  * ============================================================================
  */
 
@@ -55,63 +55,62 @@
 #include "nvs_flash.h"
 #include "lwip/apps/netbiosns.h"
 
-/* Pin gegen GND beim Booten -> Werksreset. Auf dem WT32-ETH01 sind die
- * meisten GPIOs von RMII belegt; IO14 ist frei und keine Strapping-Leitung. */
+/* Pull this pin to GND at boot for a factory reset. On the WT32-ETH01 most
+ * GPIOs are taken by RMII; IO14 is free and not a strapping pin. */
 #define FACTORY_RESET_GPIO   14
 
-/* Wie lange auf das erste Client-Frame gewartet wird, bevor wir aufgeben
- * und stattdessen das Portal anbieten. Ohne Client-MAC keine Bridge. */
+/* How long to wait for the first client frame before giving up and offering
+ * the portal instead. Without a client MAC there is no bridge. */
 #define MAC_SNIFF_TIMEOUT_MS 60000
 
 static bool s_provisioning = false;
 static bool s_ota_confirmed = false;
 
 /*
- * Anforderung "starte ins Portal", die einen Software-Reset ueberlebt.
+ * "Boot into the portal" request that survives a software reset.
  *
- * RTC_NOINIT_ATTR heisst: bleibt bei esp_restart() erhalten, ist nach einem
- * echten Kaltstart aber undefiniert - deshalb das Magic-Wort. Genau dieses
- * Verhalten wollen wir: nach einem gescheiterten Bridge-Start soll der
- * naechste Start direkt ins Portal, ein Kaltstart es aber wieder regulaer
- * versuchen (z.B. weil der AP inzwischen wieder da ist).
+ * RTC_NOINIT_ATTR means: preserved across esp_restart(), but undefined after
+ * a real power-on - hence the magic word. That is exactly the behavior we
+ * want: after a failed bridge start the next boot goes straight to the
+ * portal, but a power cycle tries the bridge again normally (e.g. because the
+ * AP is back by then).
  */
 #define PORTAL_MAGIC 0x50525450u   /* "PRTP" */
 RTC_NOINIT_ATTR static uint32_t s_portal_request;
 
 /*
- * Schutz gegen Absturzschleifen.
+ * Boot-loop protection.
  *
- * Die Portal-Sicherung oben greift nur, wenn der WLAN-Aufbau ordentlich
- * scheitert. Ein Absturz IM BETRIEB - etwa weil jemand die Puffer so hoch
- * gestellt hat, dass der Heap ausgeht - fuehrt dagegen zu Neustart, Absturz,
- * Neustart: eine Endlosschleife, aus der man ohne serielles Kabel nicht
- * herauskommt.
+ * The portal request above only covers a Wi-Fi bring-up that fails cleanly.
+ * A crash DURING operation - e.g. because someone set the buffers so high
+ * that the heap runs out - instead causes reboot, crash, reboot: an endless
+ * loop that cannot be escaped without a serial cable.
  *
- * Deshalb zaehlen wir Starts, die nie "stabil" erreicht haben. Nach drei
- * solchen Starts geht das Board ins Portal, wo sich die verantwortliche
- * Einstellung korrigieren laesst. Der Zaehler liegt im RTC-Speicher: Er
- * ueberlebt einen Software-Reset, aber nicht das Ziehen des Steckers - ein
- * echter Kaltstart soll wieder unbefangen probieren.
+ * So we count boots that never reached "stable". After three such boots the
+ * board enters the portal, where the offending setting can be corrected. The
+ * counter lives in RTC memory: it survives a software reset but not pulling
+ * the plug - a real power-on should start over without prejudice.
  */
 #define BOOT_MAGIC   0x424f4f54u   /* "BOOT" */
-#define BOOT_MAX_FEHLSTARTS 3
-#define BOOT_STABIL_MS      60000  /* so lange muss es laufen, um zu zaehlen */
+#define BOOT_MAX_FAILED_BOOTS 3
+#define BOOT_STABLE_MS        60000  /* uptime needed for a boot to count as stable */
 RTC_NOINIT_ATTR static uint32_t s_boot_magic;
-RTC_NOINIT_ATTR static uint32_t s_boot_fehlstarts;
-static bool s_stabil_gemeldet = false;
+RTC_NOINIT_ATTR static uint32_t s_boot_failures;
+static bool s_stable_reported = false;
 
 /*
- * Rollback-Freigabe.
+ * Confirm a freshly flashed OTA image so it is not rolled back.
  *
- * Mit CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE startet eine frisch geflashte
- * Firmware im Zustand PENDING_VERIFY. Ruft sie nicht innerhalb ihrer ersten
- * Laufzeit esp_ota_mark_app_valid_cancel_rollback(), springt der Bootloader
- * beim naechsten Start zurueck auf die alte Version.
+ * With CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE a newly flashed firmware boots
+ * in state PENDING_VERIFY. If it never calls
+ * esp_ota_mark_app_valid_cancel_rollback(), the bootloader reverts to the
+ * previous version on the next boot.
  *
- * Als Kriterium nehmen wir bewusst NICHT "hat gebootet", sondern
- * "ist ueber das Netz erreichbar" - genau das ist die Eigenschaft, deren
- * Verlust bei einem eingebauten Board wehtut. Das gilt in beiden Modi:
- * auch ein Board, das nur das Portal anbietet, ist reparierbar.
+ * The criterion is deliberately NOT "has booted" but "is reachable over the
+ * network" (the caller only invokes this after 30 s of uptime) - losing
+ * network access is what hurts on a board installed without serial access.
+ * This applies in both modes: a board that only offers the portal is still
+ * repairable.
  */
 static void ota_confirm_if_pending(void) {
   if (s_ota_confirmed) return;
@@ -123,10 +122,15 @@ static void ota_confirm_if_pending(void) {
 
   if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
     s_ota_confirmed = true;
-    printf("[OTA ] Neue Firmware bestaetigt, kein Rollback\n");
+    printf("[OTA ] New firmware confirmed, no rollback\n");
   }
 }
 
+/* Check whether the factory-reset pin is held low at boot.
+ *
+ * Configures the pin as input with pull-up and requires it to stay low for
+ * two seconds, so a glitch or a briefly touching wire does not wipe the
+ * configuration. */
 static bool factory_reset_requested(void) {
   gpio_config_t io = {};
   io.pin_bit_mask = 1ULL << FACTORY_RESET_GPIO;
@@ -136,8 +140,7 @@ static bool factory_reset_requested(void) {
   delay(20);
   if (gpio_get_level((gpio_num_t)FACTORY_RESET_GPIO) != 0) return false;
 
-  /* Gegen Wackler: muss zwei Sekunden anliegen. */
-  printf("[BOOT] Reset-Pin erkannt, halte 2 s...\n");
+  printf("[BOOT] Reset pin detected, hold for 2 s...\n");
   for (int i = 0; i < 20; i++) {
     delay(100);
     if (gpio_get_level((gpio_num_t)FACTORY_RESET_GPIO) != 0) return false;
@@ -145,15 +148,22 @@ static bool factory_reset_requested(void) {
   return true;
 }
 
+/* Switch into provisioning mode: start the setup AP and the HTTP portal.
+ * `reason` is only logged. Ethernet bridging is not attempted in this mode. */
 static void enter_provisioning(const char *reason) {
-  printf("[BOOT] Provisionierungsmodus: %s\n", reason);
+  printf("[BOOT] Provisioning mode: %s\n", reason);
   s_provisioning = true;
   portal_start_ap();
   web_start(true);
 }
 
+/* One-time boot sequence (the ESP-IDF counterpart of Arduino's setup()).
+ *
+ * Initializes NVS, netif and the event loop, loads the configuration, then
+ * decides between provisioning and bridge mode (see the file header for the
+ * criteria) and brings the chosen mode up. */
 static void bridge_setup(void) {
-  /* Kein Serial.begin noetig - die IDF-Konsole steht beim Start bereits. */
+  /* No Serial.begin needed - the IDF console is already up at this point. */
   delay(300);
   printf("\n=== ESP32 Wi-Fi <-> Ethernet Bridge ===\n");
 
@@ -169,144 +179,141 @@ static void bridge_setup(void) {
 
   cfg_load();
 
-  /* Einmalig auswerten und sofort loeschen - sonst haengt das Board nach
-   * einem einzigen Fehlversuch dauerhaft im Portal fest. */
-  const bool portal_erzwungen = (s_portal_request == PORTAL_MAGIC);
+  /* Evaluate once and clear immediately - otherwise a single failed attempt
+   * would leave the board stuck in the portal for good. */
+  const bool portal_forced = (s_portal_request == PORTAL_MAGIC);
   s_portal_request = 0;
 
-  /* Fehlstarts zaehlen. Beim ersten Kaltstart ist der RTC-Speicher
-   * undefiniert - daran erkennen wir ihn am Magic-Wort. */
-  bool zu_viele_fehlstarts = false;
+  /* Count failed boots. On the very first power-on RTC memory is undefined;
+   * the missing magic word identifies that case. */
+  bool too_many_failures = false;
 
-  /* Ausnahme: kam dieser Boot von einem erzwungenen Watchdog-Neustart
-   * (bridge.cpp, Eskalationsstufe 2), zaehlt er NICHT als Fehlstart - das
-   * Geraet ist sauber gebootet und gelaufen, hat sich nur selbst aus
-   * WLAN-Gesundheitsgruenden neu gestartet. Ohne diese Ausnahme koennten
-   * mehrere Watchdog-Neustarts waehrend einer laengeren WLAN-Stoerung genau
-   * diesen Absturzschleifen-Schutz ausloesen, den sie gar nicht betreffen -
-   * am 2026-09-04 vermutlich genau so passiert (kein Coredump vorgefunden,
-   * also kein Absturz, aber die Bruecke landete trotzdem unerreichbar im
-   * Portal). Muss VOR dem Kaltstart-Zweig ausgewertet werden, sonst wird das
-   * einmalige Magic-Wort verschluckt, ohne je konsumiert worden zu sein. */
-  const bool geplanter_neustart = bridge_consume_planned_restart();
+  /* Exception: a boot caused by a deliberate watchdog restart (bridge.cpp,
+   * highest escalation level) does NOT count as a failed boot - the device
+   * booted and ran fine, it only restarted itself for Wi-Fi health reasons.
+   * Without this exception, several watchdog restarts during a longer Wi-Fi
+   * outage would trip the boot-loop protection, which is meant for something
+   * else entirely. Must be evaluated BEFORE the power-on branch below,
+   * otherwise the one-shot magic word would be cleared without being
+   * consumed. */
+  const bool planned_restart = bridge_consume_planned_restart();
 
-  /* Unerwarteten Reset des vorigen Boots protokollieren (Zeitpunkt aus dem
-   * RTC-Herzschlag) - in jedem Modus, auch wenn es gleich ins Portal geht. */
-  crashlog_boot(geplanter_neustart);
+  /* Log an unexpected reset of the previous boot (timestamp taken from the
+   * RTC heartbeat) - in every mode, even if we go straight to the portal. */
+  crashlog_boot(planned_restart);
 
   if (s_boot_magic != BOOT_MAGIC) {
     s_boot_magic = BOOT_MAGIC;
-    s_boot_fehlstarts = 0;
-  } else if (geplanter_neustart) {
-    /* s_boot_fehlstarts bleibt unveraendert. */
+    s_boot_failures = 0;
+  } else if (planned_restart) {
+    /* s_boot_failures stays unchanged. */
   } else {
-    s_boot_fehlstarts++;
-    if (s_boot_fehlstarts >= BOOT_MAX_FEHLSTARTS) {
-      zu_viele_fehlstarts = true;
-      s_boot_fehlstarts = 0;      /* einmalig, sonst haengt es dauerhaft */
+    s_boot_failures++;
+    if (s_boot_failures >= BOOT_MAX_FAILED_BOOTS) {
+      too_many_failures = true;
+      s_boot_failures = 0;      /* one-shot, otherwise it would stick forever */
     }
   }
 
   if (factory_reset_requested()) {
     cfg_factory_reset();
-    printf("[BOOT] Werksreset durchgefuehrt\n");
-    enter_provisioning("Werksreset");
+    printf("[BOOT] Factory reset done\n");
+    enter_provisioning("factory reset");
     return;
   }
 
-  if (zu_viele_fehlstarts) {
-    /* Mehrfach neu gestartet, ohne je stabil zu laufen. Weiterprobieren
-     * hiesse, die Schleife fortzusetzen - also lieber ins Portal, wo die
-     * Ursache korrigierbar ist. */
-    printf("[BOOT] Mehrere Starts ohne stabilen Betrieb\n");
-    enter_provisioning("wiederholte Neustarts - Einstellungen pruefen");
+  if (too_many_failures) {
+    /* Rebooted several times without ever running stably. Trying again would
+     * just continue the loop - go to the portal instead, where the cause can
+     * be fixed. */
+    printf("[BOOT] Several boots without stable operation\n");
+    enter_provisioning("repeated reboots - check settings");
     return;
   }
 
-  if (portal_erzwungen) {
-    enter_provisioning("vorheriger Bridge-Start gescheitert");
+  if (portal_forced) {
+    enter_provisioning("previous bridge start failed");
     return;
   }
 
   if (!g_cfg.configured || g_cfg.ssid1[0] == '\0') {
-    enter_provisioning("keine WLAN-Zugangsdaten gespeichert");
+    enter_provisioning("no Wi-Fi credentials stored");
     return;
   }
 
-  /* --- Bridge-Modus ------------------------------------------------------ */
+  /* --- Bridge mode ------------------------------------------------------- */
   if (!bridge_eth_init()) {
-    printf("[BOOT] Ethernet-Init fehlgeschlagen - Neustart in 5 s\n");
+    printf("[BOOT] Ethernet init failed - rebooting in 5 s\n");
     delay(5000);
     esp_restart();
   }
 
-  /* Client-MAC bestimmen.
+  /* Determine the client MAC.
    *
-   * Der Sniff allein reicht nicht: Er wartet auf ein Frame des Clients, und
-   * eine Kamera sendet nur, wenn SIE hochfaehrt. Startet die Bridge allein neu
-   * (Reboot, OTA), kommt nichts mehr - am 2026-08-14 im Labor genau so erlebt,
-   * das Geraet landete im Portal und war nicht mehr erreichbar.
+   * Sniffing alone is not enough: it waits for a frame from the client, and
+   * some clients (e.g. IP cameras) only send while THEY boot. If only the
+   * bridge restarts (reboot, OTA), nothing arrives and the board would end up
+   * in the portal, unreachable.
    *
-   * Deshalb: eine einmal gelernte MAC steht im NVS und dient als Rueckfall.
-   * Der Sniff laeuft trotzdem, damit ein GERAETEWECHSEL bemerkt wird.
+   * Therefore a MAC learned once is stored in NVS and used as a fallback. The
+   * sniff still runs so that a DEVICE CHANGE is noticed.
    *
-   * Zum Fenster von 30 s bei gespeicherter MAC: Es wird nur ausgeschoepft,
-   * wenn der Client WIRKLICH schweigt - sobald ein Frame kommt, geht es sofort
-   * weiter. Im Normalfall kostet es also nichts. Kuerzer waere trotzdem
-   * falsch: Beim Wechsel auf ein anderes Geraet muss dessen erstes Frame in
-   * dieses Fenster fallen, sonst klont die Bridge die alte MAC weiter - und
-   * dann kommt der Rueckweg vom AP nicht mehr an, weil dort eine andere MAC
-   * assoziiert ist. Eine bootende Kamera braucht laenger als 10 s. */
-  uint8_t gespeichert[6];
-  memcpy(gespeichert, g_cfg.client_mac, 6);
-  const bool haben_mac = (gespeichert[0] | gespeichert[1] | gespeichert[2] |
-                          gespeichert[3] | gespeichert[4] | gespeichert[5]) != 0;
+   * About the 30 s window when a MAC is stored: it is only used up if the
+   * client really stays silent - as soon as a frame arrives, boot continues
+   * immediately, so normally it costs nothing. A shorter window would still
+   * be wrong: when a different device is plugged in, its first frame must
+   * fall into this window, otherwise the bridge keeps cloning the old MAC and
+   * return traffic from the AP never arrives (the AP has a different MAC
+   * associated). A booting camera can take longer than 10 s. */
+  uint8_t stored_mac[6];
+  memcpy(stored_mac, g_cfg.client_mac, 6);
+  const bool have_mac = (stored_mac[0] | stored_mac[1] | stored_mac[2] |
+                         stored_mac[3] | stored_mac[4] | stored_mac[5]) != 0;
 
-  if (bridge_sniff_client_mac(haben_mac ? 30000 : MAC_SNIFF_TIMEOUT_MS)) {
-    uint8_t gelernt[6];
-    bridge_get_client_mac(gelernt);
-    if (memcmp(gelernt, g_cfg.client_mac, 6) != 0) {
-      memcpy(g_cfg.client_mac, gelernt, 6);
+  if (bridge_sniff_client_mac(have_mac ? 30000 : MAC_SNIFF_TIMEOUT_MS)) {
+    uint8_t learned[6];
+    bridge_get_client_mac(learned);
+    if (memcmp(learned, g_cfg.client_mac, 6) != 0) {
+      memcpy(g_cfg.client_mac, learned, 6);
       cfg_save();
-      printf("[ETH ] Neue Client-MAC gespeichert\n");
+      printf("[ETH ] New client MAC stored\n");
     }
-  } else if (haben_mac) {
-    bridge_set_client_mac(gespeichert);
+  } else if (have_mac) {
+    bridge_set_client_mac(stored_mac);
   } else {
-    /* Noch nie einen Client gesehen - dann bleibt nur das Portal. */
-    enter_provisioning("kein Client am Ethernet-Port erkannt");
+    /* Never seen a client - the portal is the only option left. */
+    enter_provisioning("no client detected on the Ethernet port");
     return;
   }
 
   if (!bridge_wifi_start()) {
-    /* NICHT direkt ins Portal wechseln. bridge_wifi_start() hat den WiFi-
-     * Stack bereits initialisiert und ein STA-Netif angelegt; portal_start_ap()
-     * wuerde beides erneut anlegen, und esp_netif_create_default_wifi_sta()
-     * meldet einen doppelten if_key nicht als Fehlercode, sondern per assert.
-     * Auf echter Hardware ergab das am 2026-08-13 eine Boot-Schleife, in der
-     * das Portal nie erschien - also genau der Zustand, aus dem man sich
-     * ohne seriellen Zugang nicht mehr befreien kann.
+    /* Do NOT switch to the portal directly. bridge_wifi_start() has already
+     * initialized the Wi-Fi stack and created a STA netif; portal_start_ap()
+     * would create both again, and esp_netif_create_default_wifi_sta()
+     * reports a duplicate if_key not with an error code but with an assert -
+     * a boot loop in which the portal never appears, exactly the state that
+     * cannot be escaped without serial access.
      *
-     * Statt den halben Stack von Hand zurueckzubauen (viele Fehlerquellen,
-     * selbst wieder ungetestet) erzwingen wir einen sauberen Neustart. */
-    printf("[BOOT] WLAN fehlgeschlagen - Neustart direkt ins Portal\n");
+     * Rather than tearing down half the stack by hand (many failure modes,
+     * itself untested), force a clean reboot straight into the portal. */
+    printf("[BOOT] Wi-Fi failed - rebooting straight into the portal\n");
     s_portal_request = PORTAL_MAGIC;
-    delay(200);            /* Logausgabe noch rausschreiben lassen */
+    delay(200);            /* let the log output drain */
     esp_restart();
   }
 
   bridge_activate();
 
-  /* Die aktive Adresse erfragen, nicht g_cfg.mgmt_ip ausgeben: bei einer
-   * Verbindung ueber das zweite WLAN gilt dessen IP-Satz. */
-  uint8_t aktiv[4];
-  bridge_get_mgmt_ip(aktiv);
+  /* Ask for the active address instead of printing g_cfg.mgmt_ip: when the
+   * location detection picked another profile, that profile's IP applies. */
+  uint8_t active_ip[4];
+  bridge_get_mgmt_ip(active_ip);
   char ip[16];
-  format_ipv4(aktiv, ip, sizeof(ip));
-  printf("[BOOT] Management-Oberflaeche: http://%s\n", ip);
+  format_ipv4(active_ip, ip, sizeof(ip));
+  printf("[BOOT] Management UI: http://%s\n", ip);
 
-  /* Uhrzeit fuer Absturz- und Disconnect-Zeitstempel. Gateway vom Netif
-   * erfragen - bei mehreren Profilen ist das die verbindliche Quelle. */
+  /* Wall-clock time for crash and disconnect timestamps. Ask the netif for
+   * the gateway - with several profiles it is the authoritative source. */
   esp_netif_ip_info_t ipi = {};
   if (esp_netif_get_ip_info(bridge_mgmt_netif(), &ipi) == ESP_OK && ipi.gw.addr) {
     uint8_t gw[4];
@@ -315,16 +322,16 @@ static void bridge_setup(void) {
   }
 
 #ifdef BRIDGE_MINIMAL
-  /* Weder Webserver noch MQTT - das ist der Sinn dieser Variante.
-   * Ohne Management-Zugang gibt es auch keinen Weg zurueck per OTA. Den
-   * liefert stattdessen der Rollback-Mechanismus: Ein frisch per OTA
-   * eingespieltes Image steht auf PENDING_VERIFY, und weil bridge_loop()
-   * hier NIE esp_ota_mark_app_valid_cancel_rollback() ruft, faellt der
-   * Bootloader beim naechsten Start automatisch auf den vorherigen Slot
-   * zurueck. Ein Stromausfall genuegt also, um die vollstaendige Firmware
-   * wiederzubekommen - ohne Kabel, ohne Jumper. */
-  printf("\n*** MINIMAL-VARIANTE - nur Bridge, kein Management ***\n");
-  printf("*** Neustart stellt automatisch die vollstaendige Firmware her ***\n\n");
+  /* Neither web server nor MQTT - that is the point of this build variant
+   * (it exists to measure whether the management stack costs throughput).
+   * Without management access there is also no way back via OTA. The
+   * rollback mechanism provides it instead: an image freshly flashed via OTA
+   * is PENDING_VERIFY, and because bridge_loop() NEVER calls
+   * esp_ota_mark_app_valid_cancel_rollback() in this variant, the bootloader
+   * falls back to the previous slot on the next boot. A power cycle is
+   * enough to get the full firmware back - no cable, no jumper. */
+  printf("\n*** MINIMAL VARIANT - bridge only, no management ***\n");
+  printf("*** A reboot automatically restores the full firmware ***\n\n");
 #else
   web_start(false);
   telemetry_start();
@@ -332,26 +339,28 @@ static void bridge_setup(void) {
 }
 
 /*
- * NetBIOS-Namen bekanntgeben.
+ * Announce a NetBIOS name for the management interface.
  *
- * Warum ueberhaupt: Die FritzBox holt Geraetenamen aus der DHCP-Anfrage
- * (Option 12). Unsere Management-Schnittstelle hat aber per Entwurf eine
- * STATISCHE IP und fragt deshalb nie - in der Geraeteliste steht darum
- * "unknown". NetBIOS ist der zweite Weg, ueber den die FritzBox Namen lernt
- * (so werden Windows-Rechner benannt), und lwIPs Responder ist in der IDF
- * bereits einkompiliert. Kein Component Manager, keine neue Abhaengigkeit.
+ * Why at all: many home routers take device names from the DHCP request
+ * (option 12). The management interface has a STATIC IP by design and never
+ * asks, so the router's device list shows "unknown". NetBIOS is the second
+ * way such routers learn names (that is how Windows machines get named), and
+ * lwIP's responder is already compiled into IDF - no component manager, no
+ * new dependency.
  *
- * Der Name traegt das letzte Oktett der Client-IP, damit in der Geraeteliste
- * sichtbar wird, WEN diese Bridge gerade bruecken - z.B. WIFIBRIDGE-109.
- * Beide teilen sich zwangslaeufig eine MAC, die Liste zeigt also nur einen
- * Eintrag; so steht wenigstens dran, worum es sich handelt.
+ * The name carries the last octet of the client IP, so the device list shows
+ * WHOM this bridge is currently bridging - e.g. WIFIBRIDGE-109. Both
+ * necessarily share one MAC, so the list shows only one entry; this way it
+ * at least says what it is.
  *
- * NetBIOS erlaubt 15 Zeichen. Der Gearetename wird entsprechend gekuerzt,
- * damit das Suffix immer passt - lieber der Name knapp als die Zuordnung weg.
+ * NetBIOS allows 15 characters. The device name is shortened accordingly so
+ * the suffix always fits - better a truncated name than a lost association.
+ * Called from every loop iteration; it only touches the responder when the
+ * resulting name changes.
  */
-static void netbios_namen_pflegen(void) {
+static void netbios_update_name(void) {
   static bool  init_done = false;
-  static char  gesetzt[16] = "";
+  static char  current[16] = "";
 
   if (s_provisioning || !bridge_is_active()) return;
 
@@ -360,69 +369,76 @@ static void netbios_namen_pflegen(void) {
   BridgeStats st;
   bridge_get_stats(&st);
 
-  /* Letztes Oktett der Client-IP herausziehen; "-" heisst noch unbekannt. */
-  const char *punkt = strrchr(st.client_ip, '.');
-  const char *suffix = (punkt && punkt[1]) ? punkt + 1 : NULL;
+  /* Extract the last octet of the client IP; "-" means not known yet. */
+  const char *dot = strrchr(st.client_ip, '.');
+  const char *suffix = (dot && dot[1]) ? dot + 1 : NULL;
 
   char name[16];
-  size_t platz = suffix ? 15 - 1 - strlen(suffix) : 15;   /* 1 fuer den Bindestrich */
+  size_t room = suffix ? 15 - 1 - strlen(suffix) : 15;   /* 1 for the hyphen */
   size_t o = 0;
-  for (size_t i = 0; g_cfg.name[i] && o < platz; i++) {
+  for (size_t i = 0; g_cfg.name[i] && o < room; i++) {
     const char c = g_cfg.name[i];
-    if      (c >= 'a' && c <= 'z') name[o++] = c - 32;    /* NetBIOS mag Grossbuchstaben */
+    if      (c >= 'a' && c <= 'z') name[o++] = c - 32;    /* NetBIOS prefers upper case */
     else if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) name[o++] = c;
-    else if (o) name[o++] = '-';                          /* alles andere ersetzen */
+    else if (o) name[o++] = '-';                          /* replace everything else */
   }
-  /* Trennzeichen am Ende abschneiden, sonst wird aus einem Namen wie
-   * "WIFIBRIDGE_1" das doppelt getrennte "WIFIBRIDGE--109". */
+  /* Strip trailing separators, otherwise a name like "WIFIBRIDGE_1" would
+   * become the double-separated "WIFIBRIDGE--109". */
   while (o && name[o - 1] == '-') o--;
   if (!o) { name[o++] = 'B'; name[o++] = 'R'; name[o++] = 'I'; name[o++] = 'D'; name[o++] = 'G'; name[o++] = 'E'; }
   if (suffix) { name[o++] = '-'; for (const char *q = suffix; *q && o < 15; q++) name[o++] = *q; }
   name[o] = '\0';
 
-  if (strcmp(name, gesetzt) != 0) {
+  if (strcmp(name, current) != 0) {
     netbiosns_set_name(name);
-    strcpy(gesetzt, name);
+    strcpy(current, name);
     printf("[NBNS] Name: %s\n", name);
   }
 }
 
+/* One iteration of the main loop (the counterpart of Arduino's loop()),
+ * called every ~50 ms.
+ *
+ * Handles OTA confirmation and the stable-boot marker in both modes; in
+ * bridge mode it drives the periodic bridge/watchdog/roaming logic, the
+ * NetBIOS name and MQTT telemetry; in provisioning mode it implements the
+ * portal idle reboot. */
 static void bridge_loop(void) {
-  /* Erst nach 30 s bestaetigen. Ein Absturz kurz nach dem Start soll noch
-   * zum Rollback fuehren - deshalb nicht sofort in setup() freigeben. */
+  /* Confirm only after 30 s. A crash shortly after boot should still lead to
+   * a rollback - that is why this is not done right away in setup. */
 #ifndef BRIDGE_MINIMAL
-  /* In der Minimal-Variante bewusst NICHT bestaetigen - siehe bridge_setup().
-   * Das Ausbleiben dieser Bestaetigung IST der Rueckweg. */
+  /* Deliberately NOT confirmed in the minimal variant - see bridge_setup().
+   * The missing confirmation IS the way back. */
   if (!s_ota_confirmed && millis() > 30000) ota_confirm_if_pending();
 #endif
 
-  /* Laeuft lange genug -> Fehlstartzaehler zuruecksetzen. Erst ab hier gilt
-   * ein Start als geglueckt; ein Absturz davor zaehlt weiter hoch. */
-  if (!s_stabil_gemeldet && millis() > BOOT_STABIL_MS) {
-    s_stabil_gemeldet = true;
-    s_boot_fehlstarts = 0;
+  /* Running long enough -> reset the failed-boot counter. Only from here on
+   * does a boot count as successful; a crash before this point keeps
+   * counting. */
+  if (!s_stable_reported && millis() > BOOT_STABLE_MS) {
+    s_stable_reported = true;
+    s_boot_failures = 0;
   }
 
   if (!s_provisioning) {
     bridge_tick();
-    netbios_namen_pflegen();
+    netbios_update_name();
 #ifndef BRIDGE_MINIMAL
     telemetry_tick();
 #endif
   } else if (g_cfg.configured) {
-    /* Portal-Modus: nach einer Weile ohne aktive Portal-Nutzung selbst einen
-     * normalen Neustart versuchen - siehe config.h: ap_idle_reboot_s. Nur mit
-     * vorhandenen Zugangsdaten (g_cfg.configured), sonst wuerde sich ein
-     * frisches oder werksrueckgesetztes Geraet sinnlos im Kreis neu starten,
-     * ohne dass sich je etwas aendern koennte. web_last_activity_ms() zaehlt
-     * bewusst nur echte Konfigurationshandlungen, nicht den 2s-Status-Poll -
-     * sonst wuerde ein offen gelassener Browser-Tab den Neustart fuer immer
-     * verhindern. */
-    const uint32_t schwelle_ms =
+    /* Portal mode: after a while without active portal use, try an ordinary
+     * reboot on our own - see config.h: ap_idle_reboot_s. Only with stored
+     * credentials (g_cfg.configured), otherwise a fresh or factory-reset
+     * device would reboot in circles without anything ever changing.
+     * web_last_activity_ms() deliberately only counts real configuration
+     * actions, not the 2 s status poll - otherwise a browser tab left open
+     * would prevent the reboot forever. */
+    const uint32_t threshold_ms =
         (g_cfg.ap_idle_reboot_s ? g_cfg.ap_idle_reboot_s : AP_IDLE_REBOOT_S_DEF) * 1000UL;
-    if (millis() - web_last_activity_ms() >= schwelle_ms) {
-      printf("[BOOT] %lu s ohne Portal-Nutzung - Neustart-Versuch mit vorhandenen Zugangsdaten\n",
-             (unsigned long)(schwelle_ms / 1000));
+    if (millis() - web_last_activity_ms() >= threshold_ms) {
+      printf("[BOOT] %lu s without portal use - trying a reboot with the stored credentials\n",
+             (unsigned long)(threshold_ms / 1000));
       delay(200);
       esp_restart();
     }
@@ -431,8 +447,8 @@ static void bridge_loop(void) {
 }
 
 /* ---------------------------------------------------------------------------
- * Einstiegspunkt. Ersetzt Arduinos setup()/loop() - inhaltlich identisch,
- * nur ohne den Arduino-Core dahinter.
+ * Entry point. Replaces Arduino's setup()/loop() - same structure, just
+ * without the Arduino core behind it.
  * ------------------------------------------------------------------------ */
 extern "C" void app_main(void) {
   bridge_setup();
