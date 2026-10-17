@@ -1,5 +1,9 @@
 /*
- * config.h - Persistente Konfiguration (NVS)
+ * config.h - Persistent configuration, stored as a single blob in NVS.
+ *
+ * The whole BridgeConfig struct is written to NVS as one binary blob,
+ * prefixed with a magic word. See cfg_load() for how blobs written by older
+ * firmware versions (with fewer fields) are handled.
  */
 #pragma once
 
@@ -13,177 +17,166 @@
 struct BridgeConfig {
   uint32_t magic;
 
-  char     name[32];          /* Geraetename, taucht in MQTT/HA auf         */
+  char     name[32];          /* device name, used for MQTT/Home Assistant,
+                               * the setup AP SSID and the NetBIOS name     */
 
   char     ssid1[33];
   char     pass1[65];
   char     ssid2[33];
   char     pass2[65];
 
-  uint8_t  mgmt_ip[4];        /* Management-IP - MUSS statisch sein         */
+  uint8_t  mgmt_ip[4];        /* management IP - MUST be static             */
   uint8_t  mgmt_mask[4];
   uint8_t  mgmt_gw[4];
 
-  char     mqtt_host[64];     /* leer = MQTT aus, 63 Zeichen nutzbar        */
+  char     mqtt_host[64];     /* empty = MQTT disabled, 63 usable chars     */
   uint16_t mqtt_port;
-  /* 65 statt 32/64: gefordert sind Werte von 64 Byte, und das abschliessende
-   * Nullbyte will auch untergebracht sein - mit [64] waeren nur 63 Zeichen
-   * nutzbar gewesen. Cloud-Broker vergeben gern Token dieser Laenge.
-   * ACHTUNG: Diese Aenderung hat Feldoffsets MITTEN in der Struktur
-   * verschoben und damit den Anhaenge-Kontrakt gebrochen - alte NVS-Blobs
-   * waeren ab hier falsch interpretiert worden. Zulaessig war das nur, weil
-   * das NVS am 2026-08-13 ohnehin geloescht wurde. Wer spaeter Feldgroessen
-   * aendern will: nicht ohne Werksreset, sonst liest cfg_load() Muell. */
+  /* 65 bytes so that 64-character values (common for cloud broker tokens)
+   * fit together with the terminating NUL byte.
+   * WARNING: changing the size of an existing field shifts the offsets of
+   * every field after it and breaks the append-only contract below - old
+   * NVS blobs would then be misinterpreted. Never resize a field without
+   * requiring a factory reset. */
   char     mqtt_user[65];
   char     mqtt_pass[65];
 
-  uint16_t telemetry_s;       /* Sendeintervall in Sekunden                 */
-  bool     configured;        /* false -> Provisionierungsmodus             */
+  uint16_t telemetry_s;       /* MQTT publish interval in seconds           */
+  bool     configured;        /* false -> boot into provisioning mode       */
 
-  /* --- Ab hier nur ANHAENGEN, nie dazwischenschieben. ---------------------
-   * cfg_load() akzeptiert auch kuerzere Blobs aus aelteren Firmwares und
-   * laesst neue Felder auf ihren Defaults. Das funktioniert nur, solange
-   * neue Felder hinten angehaengt werden - sonst verschiebt sich alles.   */
-  char     admin_pass[33];    /* schuetzt den OTA-Endpunkt, leer = offen    */
+  /* --- From here on only APPEND, never insert in between. ----------------
+   * cfg_load() also accepts shorter blobs written by older firmware and
+   * leaves the missing (newer) fields at their defaults. That only works as
+   * long as new fields are appended at the end - inserting a field shifts
+   * everything behind it. */
+  char     admin_pass[33];    /* protects OTA and coredump endpoints,
+                               * empty = unprotected                        */
 
-  /* --- Feinabstimmung (angehaengt 2026-08-11) -----------------------------
-   * Durchgaengige Konvention: 0 heisst "nicht anfassen, nimm den Wert aus
-   * sdkconfig bzw. den PHY-Default". Damit bleibt sdkconfig.defaults die
-   * einzige Quelle fuer die Standardwerte und das Portal ueberschreibt nur
-   * das, was jemand bewusst eingestellt hat. (Genau die doppelte Quelle war
-   * vorher der Grund, warum Erhoehungen in sdkconfig wirkungslos blieben.) */
+  /* --- Performance tuning -------------------------------------------------
+   * Convention for all tuning fields: 0 means "don't override, use the
+   * sdkconfig value or the PHY default". This keeps sdkconfig.defaults the
+   * single source of truth for baseline values; the portal only overrides
+   * what someone deliberately set. Having a second set of defaults here
+   * would make changes to sdkconfig.defaults silently ineffective. */
 
-  /* SOFORT wirksam, ohne Neustart: */
-  int8_t   tx_power;          /* esp_wifi_set_max_tx_power, 0.25-dBm-Schritte
-                               * gueltig 8..84, wird intern auf 11 Stufen
-                               * gerundet. 0 = PHY-Default (Maximum).       */
-  uint8_t  eth_tx_retries;    /* Ethernet->WiFi, Wiederholungen bei NO_MEM  */
-  uint8_t  wifi_tx_retries;   /* WiFi->Ethernet, Wiederholungen             */
+  /* Applied IMMEDIATELY, no reboot needed: */
+  int8_t   tx_power;          /* esp_wifi_set_max_tx_power, 0.25 dBm steps,
+                               * valid 8..84, rounded down by the PHY to one
+                               * of 11 steps. 0 = PHY default (maximum).    */
+  uint8_t  eth_tx_retries;    /* Ethernet->Wi-Fi, retries on NO_MEM         */
+  uint8_t  wifi_tx_retries;   /* Wi-Fi->Ethernet, retries                   */
 
-  /* Brauchen einen NEUSTART (gehen in wifi_init_config_t bzw. muessen vor
-   * dem Verbindungsaufbau stehen): */
+  /* Require a REBOOT (they go into wifi_init_config_t or must be set before
+   * connecting): */
   uint8_t  static_rx_buf;     /* wifi_init_config_t.static_rx_buf_num       */
   uint8_t  dynamic_rx_buf;    /* .dynamic_rx_buf_num                        */
-  uint8_t  dynamic_tx_buf;    /* .dynamic_tx_buf_num - Kamera-Upload-Pfad   */
-  uint8_t  rx_ba_win;         /* .rx_ba_win, muss <= static_rx_buf und
-                               * <= dynamic_rx_buf/2 sein                   */
-  uint8_t  ht40;              /* 1 = 40-MHz-Kanal erlauben (nur wirksam,
-                               * wenn der AP das auch anbietet)             */
-  uint8_t  no_11b;            /* 1 = 802.11b-Raten abschalten               */
+  uint8_t  dynamic_tx_buf;    /* .dynamic_tx_buf_num - client upload path   */
+  uint8_t  rx_ba_win;         /* .rx_ba_win, commonly recommended to stay
+                               * <= static_rx_buf and <= dynamic_rx_buf/2   */
+  uint8_t  ht40;              /* 1 = allow 40 MHz channel (only effective
+                               * if the AP offers it as well)               */
+  uint8_t  no_11b;            /* 1 = disable 802.11b rates                  */
 
-  /* --- Zweites Netzwerkprofil (angehaengt 2026-08-13) ---------------------
-   * Die Firmware kannte zwei WLANs, aber nur einen IP-Satz - beim Wechsel
-   * zwischen zwei Standorten (Labor / Zuhause) musste man deshalb jedes Mal
-   * umkonfigurieren. Diese Felder gehoeren zu ssid2/pass2 und werden nur
-   * angewandt, wenn die Verbindung tatsaechlich ueber ssid2 zustande kam.
+  /* --- Network profile 2 --------------------------------------------------
+   * IP settings belonging to ssid2/pass2, so the same configuration works at
+   * two sites with different subnets. They are only applied when the
+   * location detection (see bridge.cpp: detect_location()) selects this
+   * profile.
    *
-   * mgmt_ip2 == 0.0.0.0 heisst "nicht gesetzt": dann gilt auch fuer das
-   * zweite WLAN der erste IP-Satz. Damit bleiben bestehende Konfigurationen
-   * unveraendert gueltig, auch die aus aelteren Firmwares mit kuerzerem
-   * NVS-Blob. Maske und Gateway fallen einzeln auf den ersten Satz zurueck,
-   * falls sie leer bleiben - ein halb ausgefuelltes Profil soll das Board
-   * nicht unerreichbar machen. */
+   * mgmt_ip2 == 0.0.0.0 means "not set": profile 1's IP settings are used.
+   * Mask and gateway individually fall back to profile 1 if left empty, so a
+   * half-filled profile never leaves the board unreachable. */
   uint8_t  mgmt_ip2[4];
   uint8_t  mgmt_mask2[4];
   uint8_t  mgmt_gw2[4];
 
-  /* --- Gelernte Client-MAC (angehaengt 2026-08-14) ------------------------
-   * Die Bridge kann nur starten, wenn sie die MAC des angeschlossenen Geraets
-   * kennt - und die lernt sie aus dem ersten Frame. Ein MacBook plaudert
-   * sofort los, eine Kamera sendet nur beim EIGENEN Hochfahren. Startete die
-   * Bridge allein neu (z.B. nach einem OTA), kam nichts mehr, der Sniff lief
-   * in den Timeout und das Geraet landete im Portal - unerreichbar.
-   *
-   * Deshalb wird eine einmal gelernte MAC hier gesichert und beim naechsten
-   * Start als Rueckfall benutzt. 00:00:00:00:00:00 = noch keine gelernt. */
+  /* --- Learned client MAC -------------------------------------------------
+   * The bridge can only start once it knows the MAC of the device on the
+   * Ethernet port, and it learns it from the first frame that device sends.
+   * Some devices (e.g. IP cameras) only send when THEY boot, so after a
+   * reboot of the bridge alone nothing would arrive and the sniff would time
+   * out. The learned MAC is therefore stored here and used as a fallback on
+   * the next boot. 00:00:00:00:00:00 = none learned yet. */
   uint8_t  client_mac[6];
 
-  /* --- Drittes Netzwerkprofil (angehaengt 2026-08-15) ---------------------
-   * Gleiche Konvention wie beim zweiten: leere Felder fallen einzeln auf
-   * Profil 1 zurueck, eine leere IP heisst "Profil nicht belegt". */
+  /* --- Network profile 3 --------------------------------------------------
+   * Same convention as profile 2: empty fields individually fall back to
+   * profile 1, an empty IP means "profile not in use". */
   char     ssid3[33];
   char     pass3[65];
   uint8_t  mgmt_ip3[4];
   uint8_t  mgmt_mask3[4];
   uint8_t  mgmt_gw3[4];
 
-  /* --- Watchdog (angehaengt 2026-08-16) ------------------------------------
-   * Nach dem 2,4-GHz-Jammer-Test blieb wifi_up=true und RSSI unauffaellig,
-   * aber die Bruecke stellte kaum noch Pakete zu - erst ein manueller Reboot
-   * hat den haengenden Treiberzustand geloest. Der Watchdog erkennt dieses
-   * Muster (siehe bridge.cpp: hohe Verlustrate LAN->WLAN bzw. haeufige
-   * Reassoziierungen) und startet dann selbststaendig neu.
-   * Default aus: ein automatischer Reboot kann waehrend eines laufenden
-   * OTA-Uploads oder einer gezielten Diagnose unerwuenscht sein - deshalb
-   * ausdruecklich ein Portal-Schalter statt fest einprogrammiert. */
-  uint8_t  wd_enable;          /* 1 = Watchdog aktiv, 0 = aus (Default)      */
+  /* --- Watchdog -----------------------------------------------------------
+   * Detects a bridge that is nominally connected (wifi_up = true, normal
+   * RSSI) but has stopped delivering traffic, and escalates through
+   * Ethernet reset, Wi-Fi reconnect and reboot (see bridge.cpp:
+   * watchdog_tick()). Off by default: an automatic recovery action can be
+   * unwelcome during an OTA upload or a deliberate diagnosis session, so it
+   * is an explicit portal switch rather than always on. */
+  uint8_t  wd_enable;          /* 1 = watchdog active, 0 = off (default)    */
 
-  /* --- WLAN-Verbindungsaufbau und Portal-Idle-Neustart (angehaengt 2026-09-05)
-   * Ausgeloest durch einen echten Vorfall: nach einem erzwungenen
-   * Watchdog-Neustart scheiterte der einzige Verbindungsversuch (12 s, ohne
-   * Wiederholung) und die Bruecke landete unerreichbar im Portal - siehe
-   * history.md 2026-09-05. Beide Werte folgen der 0-Konvention von oben:
-   * 0 = Firmware-Standard, siehe bridge.cpp. */
-  uint16_t wifi_connect_timeout_s;  /* Timeout je Versuch, 0 = 20 s          */
-  uint8_t  wifi_connect_retries;    /* Versuche je SSID, 0 = 3               */
+  /* --- Wi-Fi connect behavior ---------------------------------------------
+   * Both follow the 0 = firmware default convention (see bridge.cpp). A
+   * single short attempt is not enough after a quick reboot, when the AP
+   * may still hold the old session of the cloned MAC. */
+  uint16_t wifi_connect_timeout_s;  /* timeout per attempt, 0 = 20 s        */
+  uint8_t  wifi_connect_retries;    /* attempts per SSID, 0 = 3             */
 
-  /* Wie lange die Bruecke im Portal-Modus auf eine aktive Konfigurations-
-   * Sitzung wartet, bevor sie von selbst einen normalen Neustart versucht
-   * (mit den vorhandenen Zugangsdaten - derselbe Weg wie jeder andere Boot).
-   * "Aktiv" heisst: Seite geladen, Konfiguration gespeichert oder gescannt -
-   * NICHT der automatische 2s-Status-Poll der Portal-Seite, sonst wuerde ein
-   * offen gelassener Browser-Tab den Neustart fuer immer verhindern.
-   * Greift nur, wenn g_cfg.configured gilt (siehe main.cpp) - sonst wuerde
-   * sich ein frisches oder werksrueckgesetztes Geraet alle paar Minuten
-   * sinnlos selbst neu starten, ohne dass sich etwas geaendert haette.
-   * 0 = Firmware-Standard (900 s = 15 min). */
+  /* --- Portal idle reboot -------------------------------------------------
+   * How long the bridge waits in provisioning mode for an active portal
+   * session before it tries an ordinary reboot on its own, using the stored
+   * credentials (the same path as any other boot). "Active" means: page
+   * loaded, configuration saved or a scan started - NOT the page's automatic
+   * 2 s status poll, otherwise a browser tab left open would prevent the
+   * reboot forever. Only applies when g_cfg.configured is set (see
+   * main.cpp); otherwise a fresh or factory-reset device would reboot
+   * pointlessly every few minutes. 0 = firmware default (900 s = 15 min). */
   uint16_t ap_idle_reboot_s;
 
-  /* --- Aktives Roaming (angehaengt 2026-09-13) ----------------------------
-   * WIFI_ALL_CHANNEL_SCAN + WIFI_CONNECT_AP_BY_SIGNAL (siehe bridge.cpp,
-   * 2026-08-15) waehlen den staerksten AP nur EINMAL beim Verbindungsaufbau.
-   * Einmal verbunden, bleibt die STA auf diesem AP, selbst wenn spaeter ein
-   * deutlich besserer auftaucht - ESP-IDF roamt nicht von sich aus. Der
-   * Watchdog hilft hier nicht zuverlaessig: ein schwacher Link kann noch
-   * unter dessen Verlustschwelle bleiben, obwohl ein objektiv viel besserer
-   * AP verfuegbar waere. Ausgeloest durch einen echten Fall: Bruecke haengt
-   * auf einem Mesh-Knoten auf Kanal 9, waehrend ein anderer Knoten auf Kanal
-   * 5 mehr als 15 dB besseres Signal liefert - erst ein manueller Neustart
-   * waehlte den besseren.
+  /* --- Active roaming -----------------------------------------------------
+   * WIFI_ALL_CHANNEL_SCAN + WIFI_CONNECT_AP_BY_SIGNAL (see bridge.cpp) pick
+   * the strongest AP only ONCE, at connect time. ESP-IDF does not roam on its
+   * own, so the station stays on that AP even if a much better one (e.g.
+   * another mesh node) becomes available later. The watchdog does not help
+   * reliably here: a weak link can stay below its loss threshold although a
+   * far better AP is in range. See bridge.cpp: roam_tick().
    *
-   * Alle vier Werte folgen der bestehenden Konvention: roam_enable ist ein
-   * Schalter wie wd_enable (explizit Portal, kein Kompilierschalter), die
-   * drei Zahlenwerte darunter 0 = Firmware-Standard wie die uebrige
-   * Feinabstimmung, siehe bridge.cpp fuer die tatsaechlichen Vorgaben. */
-  uint8_t  roam_enable;          /* 1 = aktiv, 0 = aus (Default)              */
-  uint16_t roam_check_s;         /* Pruefintervall, 0 = Standard              */
-  int8_t   roam_rssi_threshold;  /* nur unterhalb dieses RSSI ueberhaupt
-                                   * pruefen (0 dBm kommt real nie vor, daher
-                                   * unproblematisch als "Standard"-Marker),
-                                   * 0 = Standard                             */
-  uint8_t  roam_margin_db;       /* Mindestvorsprung eines Kandidaten in dB,
-                                   * um den Wechsel zu rechtfertigen, 0 = Standard */
+   * roam_enable is a switch like wd_enable; the three numeric values follow
+   * the 0 = firmware default convention, see bridge.cpp for the defaults. */
+  uint8_t  roam_enable;          /* 1 = active, 0 = off (default)           */
+  uint16_t roam_check_s;         /* check interval, 0 = default             */
+  int8_t   roam_rssi_threshold;  /* only check below this RSSI (0 dBm never
+                                   * occurs in practice, so it is safe as the
+                                   * "default" marker), 0 = default          */
+  uint8_t  roam_margin_db;       /* minimum advantage of a candidate in dB to
+                                   * justify switching, 0 = default          */
 
-  /* --- Watchdog-Eskalationsstufen (angehaengt 2026-10-11) -----------------
-   * Bisher eskalierte der Watchdog immer ueber alle Stufen bis zum Neustart.
-   * Gewuenscht war, die Eskalation zu begrenzen - z.B. bei haengender Kamera
-   * nur den Ethernet-Treiber neu starten, aber das WLAN nie anfassen.
-   * wd_actions ist eine Bitmaske der ERLAUBTEN Massnahmen (WD_ACT_* in
-   * bridge.h); nicht erlaubte Stufen werden uebersprungen. 0 = Standard
-   * (alle drei), passend zur 0-Konvention der uebrigen Feinabstimmung -
-   * damit verhalten sich bestehende Konfigurationen genau wie vorher. */
-  uint8_t  wd_actions;           /* Bitmaske WD_ACT_*, 0 = alle               */
-  uint8_t  wd_bad_windows;       /* schlechte Messfenster in Folge bis zur
-                                   * naechsten Massnahme, 0 = Standard (3)    */
+  /* --- Watchdog escalation levels -----------------------------------------
+   * Allows limiting how far the watchdog escalates, e.g. only ever restart
+   * the Ethernet driver and never touch Wi-Fi. wd_actions is a bit mask of
+   * the ALLOWED actions (WD_ACT_* in bridge.h); disallowed levels are
+   * skipped. 0 = default (all three), matching the 0 convention of the other
+   * tuning fields. */
+  uint8_t  wd_actions;           /* bit mask of WD_ACT_*, 0 = all           */
+  uint8_t  wd_bad_windows;       /* consecutive bad measurement windows
+                                   * before the next action, 0 = default (3) */
 };
 
 extern BridgeConfig g_cfg;
 
-void cfg_load(void);          /* laedt aus NVS, sonst Defaults              */
+/* Load the configuration from NVS into g_cfg; falls back to defaults if
+ * nothing (valid) is stored. */
+void cfg_load(void);
+/* Write g_cfg to NVS. Returns false if NVS could not be opened or written. */
 bool cfg_save(void);
+/* Fill *c with factory defaults. */
 void cfg_defaults(BridgeConfig *c);
+/* Erase the stored configuration and reset g_cfg to defaults. */
 bool cfg_factory_reset(void);
 
-/* Hilfsfunktionen */
+/* Parse a dotted-quad IPv4 string ("192.168.1.10") into four bytes.
+ * Returns false (and leaves `out` untouched) on malformed input. */
 bool parse_ipv4(const char *s, uint8_t out[4]);
+/* Format four IPv4 bytes as a dotted-quad string. */
 void format_ipv4(const uint8_t ip[4], char *out, size_t out_len);
