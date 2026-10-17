@@ -538,20 +538,24 @@ const DSRC=['extern','Verbindungsaufbau','Watchdog','Roaming'];
 async function loadDisc(){
   try{
     const j=await(await fetch('/api/disconnects')).json();
-    $('dlsum').innerHTML=j.by_reason.length
-      ? 'Seit diesem Start (nur extern): '+j.by_reason.map(x=>'<b>'+x.rs+'</b> ('+x.r+') '+x.n+'&times;').join(', ')+
-        (j.rest?', sonstige '+j.rest+'&times;':'')
-      : 'Seit diesem Start keine extern verursachten Abbrueche.';
-    const td=TD;
+    /* Echte Abbrueche (bestehende Verbindung getrennt) und die darauf folgenden
+       gescheiterten Wiederverbindungsversuche getrennt ausweisen - sonst
+       verdecken die Folgefehler die eigentliche Ursache. */
+    $('dlsum').innerHTML='Seit diesem Start (nur extern): <b>'+j.kicks+'</b> echte Abbrueche'+
+      (j.by_reason.length?' - '+j.by_reason.map(x=>'<b>'+x.rs+'</b> ('+x.r+') '+x.n+'&times;').join(', ')+
+        (j.rest?', sonstige '+j.rest+'&times;':''):'')+
+      '<br>dazu <b>'+j.fails+'</b> gescheiterte Wiederverbindungsversuche';
+    const td=TD, leer=e=>e.bssid==='00:00:00:00:00:00';
     $('dltab').innerHTML=j.log.length
-      ? '<tr>'+['Wann','Grund','Ausloeser','RSSI','AP','Weg'].map(t=>td(t,1)).join('')+'</tr>'+
-        j.log.map(e=>'<tr>'+
+      ? '<tr>'+['Wann','Art','Grund','Ausloeser','RSSI','AP','Weg'].map(t=>td(t,1)).join('')+'</tr>'+
+        j.log.map(e=>'<tr'+(e.up?'':' style="opacity:.6"')+'>'+
           td((e.e?ts(e.e)+'<br><span class="hint">':'')+
              (e.prev?(e.prev===1?'voriger Start':e.prev+' Starts zurueck')+', bei '+sdur(e.t):'vor '+sdur(e.ago))+
              (e.e?'</span>':''))+
+          td(e.up?'<b class="bad">Abbruch</b>':'Fehlversuch')+
           td('<b>'+e.rs+'</b> ('+e.r+')')+
           td(e.src?'<span class="hint">'+(DSRC[e.src]||e.src)+'</span>':'extern')+
-          td(e.rssi+' dBm')+td(e.bssid)+
+          td(leer(e)?'-':e.rssi+' dBm')+td(leer(e)?'-':e.bssid)+
           td(e.down<0?'-':sdur(e.down))+'</tr>').join('')
       : '';
   }catch(e){$('dlsum').textContent='Konnte /api/disconnects nicht laden'}
@@ -586,7 +590,8 @@ async function tick(){
       ' &middot; Name: <b>'+(s.client_name||'-')+'</b><br>Verbunden mit: <b>'+
       (s.ssid||'-')+'</b> ('+s.bssid+')'+
       ' &middot; Ethernet: <span class="'+(s.eth?'ok':'bad')+'">'+(s.eth?'verbunden':'kein Link')+
-      '</span> &middot; Reconnects: <b>'+s.wifi_disc+'</b>'+
+      '</span> &middot; WLAN-Abbrueche: <b>'+(s.wifi_kicks!==undefined?s.wifi_kicks:s.wifi_disc)+'</b>'+
+      (s.wifi_kicks!==undefined&&s.wifi_disc>s.wifi_kicks?' <span class="hint">(+'+(s.wifi_disc-s.wifi_kicks)+' Fehlversuche/eigene Trennungen)</span>':'')+
       (s.disc_r ? ' (zuletzt <b>'+s.disc_rs+'</b> vor '+sdur(s.disc_ago)+
         (s.disc_src?', '+(DSRC[s.disc_src]||s.disc_src):'')+')' : '')+
       (s.wd_probe ? ' &middot; Watchdog-Sonde: <span class="'+(s.wd_probe===1?'ok':'bad')+'">'+
@@ -754,7 +759,7 @@ static esp_err_t h_status(httpd_req_t *r) {
   snprintf(buf, sizeof(buf),
     "{\"prov\":%d,\"wifi\":%d,\"eth\":%d,\"rssi\":%d,\"ch\":%u,"
     "\"kbps_up\":%lu,\"kbps_down\":%lu,\"pkt_up\":%lu,\"pkt_down\":%lu,"
-    "\"drop_up\":%lu,\"drop_down\":%lu,\"wifi_disc\":%lu,"
+    "\"drop_up\":%lu,\"drop_down\":%lu,\"wifi_disc\":%lu,\"wifi_kicks\":%lu,"
     "\"disc_r\":%u,\"disc_rs\":\"%s\",\"disc_src\":%u,\"disc_ago\":%lu,\"wd_probe\":%u,"
     "\"wd_reconnects\":%lu,\"wd_eth_resets\":%lu,\"wd_last_reason\":%u,"
     "\"roam_count\":%lu,\"uptime\":%lu,"
@@ -768,7 +773,7 @@ static esp_err_t h_status(httpd_req_t *r) {
     (unsigned long)st.kbps_eth2wifi, (unsigned long)st.kbps_wifi2eth,
     (unsigned long)st.pkt_eth2wifi,  (unsigned long)st.pkt_wifi2eth,
     (unsigned long)st.drop_eth2wifi, (unsigned long)st.drop_wifi2eth,
-    (unsigned long)st.wifi_disc_count,
+    (unsigned long)st.wifi_disc_count, (unsigned long)st.wifi_kicks,
     /* Letzter Abriss in diesem Boot - disc_r 0 = keiner. Die ganze Historie
      * (auch ueber Neustarts) liefert /api/disconnects. */
     (unsigned)st.disc_last_reason,
@@ -808,23 +813,32 @@ static esp_err_t h_status(httpd_req_t *r) {
  * Boot plus die letzten DISC_LOG_N Abrisse, auch aus frueheren Boots.
  * "prev" = wie viele Boots zurueck (0 = laufender); "ago" gibt es nur fuer
  * den laufenden Boot, weil die Laufzeit frueherer Boots unbekannt ist.
- * "down" = Sekunden bis zur Wiederverbindung, -1 = keine (mehr) erfolgt. */
+ * "down" = Sekunden bis zur Wiederverbindung, -1 = keine (mehr) erfolgt.
+ * "up" = 1: bestehende Verbindung getrennt (echter Abbruch), 0: nur ein
+ * gescheiterter Verbindungsversuch. "by_reason" zaehlt nur echte Abbrueche,
+ * "kicks"/"fails" sind die Summen seit diesem Boot (nur extern). */
 static esp_err_t h_disconnects(httpd_req_t *r) {
-  bridge_disc_t log[DISC_LOG_N];
+  /* Heap statt Stack: 48 Eintraege plus Antwortpuffer sprengen die 6 KB
+   * Stack des HTTP-Tasks. */
+  bridge_disc_t *log = (bridge_disc_t *)malloc(sizeof(bridge_disc_t) * DISC_LOG_N);
+  const size_t cap = 10240;
+  char *buf = (char *)malloc(cap);
+  if (!log || !buf) {
+    free(log); free(buf);
+    httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "kein Speicher");
+    return ESP_FAIL;
+  }
   uint8_t boot = 0;
   const size_t n = bridge_get_disc_log(log, DISC_LOG_N, &boot);
   bridge_disc_count_t cnt[12];
   uint16_t rest = 0;
   const size_t nc = bridge_get_disc_counts(cnt, 12, &rest);
+  uint32_t kicks = 0, fails = 0;
+  bridge_get_disc_totals(&kicks, &fails);
 
-  const size_t cap = 3200;
-  char *buf = (char *)malloc(cap);
-  if (!buf) {
-    httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "kein Speicher");
-    return ESP_FAIL;
-  }
   const uint32_t now_s = millis() / 1000;
-  size_t o = snprintf(buf, cap, "{\"rest\":%u,\"by_reason\":[", (unsigned)rest);
+  size_t o = snprintf(buf, cap, "{\"kicks\":%lu,\"fails\":%lu,\"rest\":%u,\"by_reason\":[",
+                      (unsigned long)kicks, (unsigned long)fails, (unsigned)rest);
   for (size_t i = 0; i < nc && o < cap; i++) {
     o += snprintf(buf + o, cap - o, "%s{\"r\":%u,\"rs\":\"%s\",\"n\":%u}", i ? "," : "",
                   (unsigned)cnt[i].reason, bridge_wifi_reason_str(cnt[i].reason),
@@ -835,16 +849,18 @@ static esp_err_t h_disconnects(httpd_req_t *r) {
     const bridge_disc_t *e = &log[i];
     const unsigned prev = (uint8_t)(boot - e->boot);
     o += snprintf(buf + o, cap - o,
-      "%s{\"prev\":%u,\"t\":%lu,\"e\":%lu,\"ago\":%ld,\"r\":%u,\"rs\":\"%s\",\"src\":%u,"
+      "%s{\"prev\":%u,\"t\":%lu,\"e\":%lu,\"ago\":%ld,\"r\":%u,\"rs\":\"%s\",\"src\":%u,\"up\":%u,"
       "\"rssi\":%d,\"bssid\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"down\":%ld}",
       i ? "," : "", prev, (unsigned long)e->t_s, (unsigned long)e->epoch,
       prev ? -1L : (long)(now_s - e->t_s),
       (unsigned)e->reason, bridge_wifi_reason_str(e->reason), (unsigned)e->src,
+      (unsigned)e->was_up,
       (int)e->rssi, e->bssid[0], e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5],
       e->down_s >= 0xFFFE ? -1L : (long)e->down_s);
   }
   if (o < cap) o += snprintf(buf + o, cap - o, "]}");
-  if (o >= cap) o = cap - 1;   /* abgeschnitten - sollte bei 16+12 Eintraegen nie passieren */
+  if (o >= cap) o = cap - 1;   /* abgeschnitten - bei 48+12 Eintraegen (~200 B je) nicht zu erwarten */
+  free(log);
 
   httpd_resp_set_type(r, "application/json");
   httpd_resp_set_hdr(r, "Cache-Control", "no-store");

@@ -200,7 +200,7 @@ static char s_bssid_str[18] = "-";
  * von Kopf/Fuellstand verwirft das. Geschrieben wird aus dem Event-Task,
  * gelesen aus dem HTTP- und dem Haupttask, daher der Spinlock.
  * ------------------------------------------------------------------------ */
-#define DISC_LOG_MAGIC 0x44495332u   /* "DIS2" - bei Layoutaenderung hochzaehlen */
+#define DISC_LOG_MAGIC 0x44495333u   /* "DIS3" - bei Layoutaenderung hochzaehlen */
 RTC_NOINIT_ATTR static uint32_t      s_dl_magic;
 RTC_NOINIT_ATTR static uint8_t       s_dl_boot;
 RTC_NOINIT_ATTR static uint8_t       s_dl_head;   /* naechster Schreibplatz */
@@ -214,6 +214,7 @@ static portMUX_TYPE s_dl_mux = portMUX_INITIALIZER_UNLOCKED;
 #define DISC_REASON_SLOTS 12
 static bridge_disc_count_t s_dr[DISC_REASON_SLOTS];
 static uint16_t s_dr_rest = 0;
+static uint32_t s_kicks = 0, s_fails = 0;   /* extern, seit Boot */
 
 /* Vor einem eigenen esp_wifi_disconnect() gesetzt, damit der folgende
  * Disconnect-Event nicht als Funkproblem zaehlt. Mit Zeitstempel: kommt
@@ -240,7 +241,12 @@ static void dl_ensure_locked(void) {
   }
 }
 
-static void disc_log_add(const wifi_event_sta_disconnected_t *d) {
+/* was_up: war die STA zu diesem Zeitpunkt verbunden? Der Treiber meldet
+ * einen gescheiterten Verbindungsversuch mit demselben Event wie das Ende
+ * einer bestehenden Verbindung - nach einem Rauswurf durch den AP folgen
+ * oft ein Dutzend solcher Fehlversuche, die die eigentliche Ursache in der
+ * Statistik verdecken wuerden. */
+static void disc_log_add(const wifi_event_sta_disconnected_t *d, bool was_up) {
   uint8_t src = DISC_SRC_EXTERN;
   if (s_disc_src != DISC_SRC_EXTERN && millis() - s_disc_src_ms < 3000) src = s_disc_src;
   s_disc_src = DISC_SRC_EXTERN;
@@ -259,10 +265,13 @@ static void disc_log_add(const wifi_event_sta_disconnected_t *d) {
   if (d) memcpy(e->bssid, d->bssid, 6);
   e->boot   = s_dl_boot;
   e->src    = src;
+  e->was_up = was_up ? 1 : 0;
   s_dl_head = (uint8_t)((s_dl_head + 1) % DISC_LOG_N);
   if (s_dl_used < DISC_LOG_N) s_dl_used++;
 
-  if (src == DISC_SRC_EXTERN) {
+  if (src == DISC_SRC_EXTERN && !was_up) s_fails++;
+  if (src == DISC_SRC_EXTERN && was_up) {
+    s_kicks++;
     size_t k = 0;
     while (k < DISC_REASON_SLOTS && s_dr[k].n && s_dr[k].reason != reason) k++;
     if (k == DISC_REASON_SLOTS) {
@@ -275,17 +284,28 @@ static void disc_log_add(const wifi_event_sta_disconnected_t *d) {
   portEXIT_CRITICAL(&s_dl_mux);
 }
 
-/* Beim Wiederverbinden die Ausfalldauer des juengsten Eintrags nachtragen. */
+/* Beim Wiederverbinden die Ausfalldauer nachtragen - fuer alle noch offenen
+ * Eintraege dieses Boots bis einschliesslich des ausloesenden Abbruchs. So
+ * steht beim Rauswurf die GESAMTE Ausfallzeit, nicht nur die nach dem
+ * letzten Fehlversuch. */
 static void disc_log_reconnected(void) {
   portENTER_CRITICAL(&s_dl_mux);
   dl_ensure_locked();
-  if (s_dl_used) {
-    bridge_disc_t *e = &s_dl[(s_dl_head + DISC_LOG_N - 1) % DISC_LOG_N];
-    if (e->boot == s_dl_boot && e->down_s == 0xFFFF) {
-      const uint32_t d = millis() / 1000 - e->t_s;
-      e->down_s = d < 0xFFFE ? (uint16_t)d : 0xFFFE;
-    }
+  const uint32_t now_s = millis() / 1000;
+  for (size_t i = 0; i < s_dl_used; i++) {
+    bridge_disc_t *e = &s_dl[(s_dl_head + DISC_LOG_N - 1 - i) % DISC_LOG_N];
+    if (e->boot != s_dl_boot || e->down_s != 0xFFFF) break;
+    const uint32_t d = now_s - e->t_s;
+    e->down_s = d < 0xFFFE ? (uint16_t)d : 0xFFFE;
+    if (e->was_up) break;
   }
+  portEXIT_CRITICAL(&s_dl_mux);
+}
+
+void bridge_get_disc_totals(uint32_t *kicks, uint32_t *fails) {
+  portENTER_CRITICAL(&s_dl_mux);
+  if (kicks) *kicks = s_kicks;
+  if (fails) *fails = s_fails;
   portEXIT_CRITICAL(&s_dl_mux);
 }
 
@@ -617,13 +637,14 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
     }
 
   } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
+    const bool was_up = s_wifi_up;   /* vor dem Zuruecksetzen merken */
     s_wifi_up = false;
     strcpy(s_bssid_str, "-");
     s_wifi_disc_count = s_wifi_disc_count + 1;
     wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
     printf("[WIFI] Getrennt (reason %d %s, %d dBm)\n", d ? d->reason : -1,
            bridge_wifi_reason_str(d ? d->reason : 0), d ? d->rssi : 0);
-    disc_log_add(d);
+    disc_log_add(d, was_up);
     if (s_active) esp_wifi_connect();     /* im Betrieb dauerhaft nachfassen */
   }
 }
@@ -1788,12 +1809,23 @@ void bridge_get_stats(BridgeStats *o) {
   o->wd_last_reason = (s_wd_reason_magic == WD_REASON_MAGIC) ? s_wd_reason : 0;
   o->roam_count     = s_roam_count;
 
-  bridge_disc_t last; uint8_t boot;
-  if (bridge_get_disc_log(&last, 1, &boot) && last.boot == boot) {
-    o->disc_last_reason = last.reason;
-    o->disc_last_src    = last.src;
-    o->disc_last_ago_s  = millis() / 1000 - last.t_s;
+  /* Juengster ECHTER Abbruch dieses Boots - nicht der juengste Eintrag, das
+   * ist nach einem Rauswurf meist nur der letzte gescheiterte Versuch
+   * (z.B. NO_AP_FOUND) und verschleiert die Ursache. Direkt im Puffer
+   * suchen statt 48 Eintraege auf den Stack zu kopieren. */
+  portENTER_CRITICAL(&s_dl_mux);
+  dl_ensure_locked();
+  for (size_t i = 0; i < s_dl_used; i++) {
+    const bridge_disc_t *e = &s_dl[(s_dl_head + DISC_LOG_N - 1 - i) % DISC_LOG_N];
+    if (e->boot != s_dl_boot) break;
+    if (!e->was_up) continue;
+    o->disc_last_reason = e->reason;
+    o->disc_last_src    = e->src;
+    o->disc_last_ago_s  = millis() / 1000 - e->t_s;
+    break;
   }
+  o->wifi_kicks = s_kicks;
+  portEXIT_CRITICAL(&s_dl_mux);
 
   o->eth_link      = s_eth_link;
   o->wifi_up       = s_wifi_up;

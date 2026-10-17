@@ -28,8 +28,10 @@ struct BridgeStats {
                                * Bleibt nach dem Neustart stehen (RTC-Speicher),
                                * damit Portal/MQTT zeigen koennen WARUM.       */
   uint32_t roam_count;        /* Aktive AP-Wechsel seit Boot (roam_tick())    */
-  uint8_t  disc_last_reason;  /* Grund des letzten Abrisses in diesem Boot,
-                               * 0 = keiner (siehe bridge_get_disc_log())    */
+  uint32_t wifi_kicks;        /* echte Abbrueche (extern, Verbindung bestand)
+                               * seit Boot - ohne die Fehlversuche danach    */
+  uint8_t  disc_last_reason;  /* Grund des letzten ECHTEN Abbruchs in diesem
+                               * Boot, 0 = keiner (siehe bridge_get_disc_log()) */
   uint8_t  disc_last_src;     /* DISC_SRC_* dazu                              */
   uint32_t disc_last_ago_s;   /* wie lange her, in s                          */
   int8_t   rssi;
@@ -195,7 +197,11 @@ uint8_t bridge_get_bandwidth_mhz(void);
  * sichtbar, was VOR einem Neustart los war.
  * ========================================================================= */
 
-#define DISC_LOG_N 16
+/* 48 statt anfangs 16: ein einziger Rauswurf durch den AP zieht oft ein
+ * Dutzend gescheiterter Wiederverbindungsversuche nach sich (2026-10-17 so
+ * beobachtet) - bei 16 Plaetzen war der Ausloeser eines Schubs schon wieder
+ * aus dem Puffer gefallen. 48 x 24 Byte RTC-Speicher. */
+#define DISC_LOG_N 48
 
 /* Wer die Trennung ausgeloest hat. Alles ausser EXTERN ist eine bewusste
  * Trennung der Firmware selbst und kein Funkproblem. */
@@ -213,6 +219,9 @@ typedef struct {
   uint8_t  bssid[6];
   uint8_t  boot;       /* Boot-Zaehler (mod 256) - siehe bridge_get_disc_log() */
   uint8_t  src;        /* DISC_SRC_* */
+  uint8_t  was_up;     /* 1 = bestehende Verbindung getrennt (echter Abbruch),
+                        * 0 = Verbindungsversuch gescheitert (Folgefehler) */
+  uint8_t  _pad[3];
 } bridge_disc_t;
 
 typedef struct {
@@ -225,10 +234,15 @@ typedef struct {
  * bezieht sich dann auf deren Laufzeit. */
 size_t bridge_get_disc_log(bridge_disc_t *out, size_t max, uint8_t *boot_now);
 
-/* Abrisse je Grund seit DIESEM Boot (nur extern ausgeloeste), absteigend
- * nach Haeufigkeit. *rest = Abrisse, deren Grund nicht mehr in die Tabelle
- * passte. */
+/* Echte Abbrueche (extern, bestehende Verbindung) je Grund seit DIESEM
+ * Boot, absteigend nach Haeufigkeit. *rest = Abbrueche, deren Grund nicht
+ * mehr in die Tabelle passte. Gescheiterte Wiederverbindungsversuche zaehlen
+ * hier NICHT - die sind Folge, nicht Ursache; siehe bridge_get_disc_totals(). */
 size_t bridge_get_disc_counts(bridge_disc_count_t *out, size_t max, uint16_t *rest);
+
+/* Summen seit diesem Boot, nur extern ausgeloeste: echte Abbrueche einer
+ * bestehenden Verbindung bzw. gescheiterte Verbindungsversuche. */
+void bridge_get_disc_totals(uint32_t *kicks, uint32_t *fails);
 
 /* Kurzname eines wifi_err_reason_t, z.B. "BEACON_TIMEOUT". */
 const char *bridge_wifi_reason_str(uint8_t reason);
