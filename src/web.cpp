@@ -948,8 +948,8 @@ static esp_err_t h_status(httpd_req_t *r) {
     (unsigned long)st.wd_reconnects, (unsigned long)st.wd_eth_resets,
     (unsigned)st.wd_last_reason, (unsigned long)st.roam_count,
     (unsigned long)(millis() / 1000), st.client_mac, st.client_ip, st.client_name, st.ssid, st.bssid,
-    (int)bridge_autotune_state(), bridge_autotune_schritt(),
-    bridge_autotune_anzahl(), bridge_autotune_ergebnis(), bridge_autotune_kandidat(),
+    (int)bridge_autotune_state(), bridge_autotune_step(),
+    bridge_autotune_count(), bridge_autotune_result(), bridge_autotune_candidate(),
     (unsigned long)esp_get_free_heap_size(),
     /* Tiefststand seit dem Start - zeigt Einbrueche, die zwischen zwei
      * Abfragen liegen und sonst unsichtbar bleiben. */

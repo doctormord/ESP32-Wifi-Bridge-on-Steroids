@@ -12,13 +12,13 @@ Goal: no German left anywhere in code or UI, every function documented, no histo
 1. [x] Record the rules in `CLAUDE.md`, record this roadmap here.
 2. [x] `src/compat.h`, `src/config.h`, `src/config.cpp` — translate comments, document every function/field, strip dated "appended on …" / incident narratives from the struct comments (keep the append-only rule itself).
 3. [x] `src/main.cpp` — translate comments and serial logs, rename German identifiers, strip incident dates, neutralize personal references (router brand, lab/home).
-4. [ ] `src/bridge.h`, `src/bridge.cpp` — same; biggest file, data path comments must keep the buffer-ownership / IRAM reasoning intact.
+4. [x] `src/bridge.h`, `src/bridge.cpp` — same; biggest file, data path comments must keep the buffer-ownership / IRAM reasoning intact.
 5. [ ] `src/telemetry.h`, `src/telemetry.cpp`, `src/crashlog.h`, `src/crashlog.cpp` — comments, logs, Home Assistant entity names, watchdog reason codes.
 6. [ ] `src/web.h`, `src/web.cpp` — comments, API strings, and the full portal UI (`PAGE[]` HTML/JS) translated to English.
 7. [ ] Build files and scripts: `CMakeLists.txt`, `src/CMakeLists.txt`, `platformio.ini`, `sdkconfig.defaults`, `partitions_*.csv`, `scripts/*`.
 8. [ ] Verify: build passes, a comment-stripped diff of old vs. new sources shows only string-literal and identifier-rename changes, `grep` for umlaut transliterations (`ae/oe/ue`, common German words) comes back clean.
 9. [ ] Flash to the board and check the portal renders and saves correctly (needs hardware — user).
-10. [ ] Docs under `docs/content/` that still quote German strings (e.g. `handover.md` quoting `sdkconfig.defaults`) — update quotes to the new English text.
+10. [ ] Note for users: MQTT watchdog event reason codes changed `verlust`→`loss`, `sonde`→`probe` (Home Assistant automations matching the old strings need updating). Docs under `docs/content/` that still quote German strings (e.g. `handover.md` quoting `sdkconfig.defaults`) — update quotes to the new English text.
 
 ## Next up
 
