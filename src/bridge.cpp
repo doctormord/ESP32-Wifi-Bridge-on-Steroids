@@ -1267,33 +1267,82 @@ void bridge_set_paused(bool paused) {
  * Autotune der Sendewiederholungen
  * ========================================================================= */
 
-static const uint8_t AT_KANDIDATEN[] = { 1, 2, 4, 6, 8, 12, 16, 20 };
+/*
+ * Ablauf (seit 2026-10-17, vorher stur aufsteigend ab 1):
+ *
+ *   1. Den AKTUELLEN Wert messen - liefert zugleich die Referenz-Paketrate
+ *      des Streams.
+ *   2. Verfehlt er das Ziel: AUFWAERTS, solange jeder Schritt deutlich
+ *      weniger Verlust bringt.
+ *   3. ABWAERTS ab dem Startwert, solange der Verlust im erlaubten Rahmen
+ *      bleibt; beim ersten Ausreisser Schluss - kleiner wird es nur schlechter.
+ *
+ * Warum nicht mehr von unten: bei 1-2 Retries brach der TCP-Stream der Kamera
+ * zusammen (2026-10-17 auf Hardware: <400 statt ~3500 Pakete je 15 s, Bridge
+ * ~3,5 min kaum erreichbar, Heap-Tiefststand 32 -> 15 KB) - die Einmessung
+ * scheiterte an "zu wenig Verkehr", den sie selbst verursacht hatte. Von oben
+ * kommend erreicht sie so einen Wert gar nicht erst, und der Einbruch-
+ * Waechter bricht einen Schritt nach wenigen Sekunden ab, statt ihn 19 s
+ * durchzuziehen.
+ */
+static const uint8_t AT_KANDIDATEN[] = { 2, 3, 4, 6, 8, 10, 12, 14, 16, 20 };
 #define AT_N            (sizeof(AT_KANDIDATEN) / sizeof(AT_KANDIDATEN[0]))
 #define AT_EINSCHWINGEN 4000u    /* Puffer leerlaufen lassen              */
 #define AT_MESSDAUER   15000u    /* danach so lange zaehlen               */
 #define AT_MIN_PAKETE    400u    /* darunter ist die Messung wertlos      */
-#define AT_ZIEL_PROMILLE  10u    /* 0,10 % - erreicht? dann reicht es     */
+#define AT_ZIEL_PROMILLE  10u    /* Hundertstelprozent: 0,10 % - reicht   */
+#define AT_EINBRUCH_MS  6000u    /* ab hier im Schritt auf Einbruch pruefen */
+#define AT_EINBRUCH_PROZ  30u    /* < 30 % der Referenzrate = Einbruch    */
+#define AT_VERLUST_EINBRUCH 0xFFFEu  /* Markierung in s_at_verlust        */
+
+typedef enum { AT_PH_START = 0, AT_PH_AUF, AT_PH_AB } at_phase_t;
 
 static autotune_state_t s_at_state = AT_IDLE;
 static uint8_t   s_at_idx, s_at_ergebnis;
-static uint32_t  s_at_t0, s_at_pkt0, s_at_drop0;
+static uint8_t   s_at_start_idx, s_at_schritte;
+static at_phase_t s_at_phase;
+static uint32_t  s_at_t0, s_at_pkt0, s_at_drop0, s_at_pkt_schritt0;
+static uint32_t  s_at_ref_pps;           /* Pakete/s bei der Startmessung */
 static bool      s_at_messend;
 static uint16_t  s_at_verlust[AT_N];
 static uint8_t   s_at_alt;               /* Wert vor dem Lauf, fuer Abbruch */
 
+/* Index des Kandidaten, der dem aktuellen Wert am naechsten liegt. */
+static uint8_t at_naechster_idx(uint8_t wert) {
+  uint8_t best = 0;
+  for (uint8_t i = 1; i < AT_N; i++) {
+    const int di = abs((int)AT_KANDIDATEN[i] - (int)wert);
+    const int db = abs((int)AT_KANDIDATEN[best] - (int)wert);
+    if (di < db || (di == db && AT_KANDIDATEN[i] > AT_KANDIDATEN[best])) best = i;
+  }
+  return best;
+}
+
+static void at_schritt_starten(uint8_t idx) {
+  s_at_idx = idx;
+  s_eth_tx_retries = AT_KANDIDATEN[idx];
+  s_at_messend = false;
+  s_at_t0 = millis();
+  s_at_pkt_schritt0 = s_pkt_e2w;
+}
+
 bool bridge_autotune_start(void) {
   if (!s_active || s_at_state == AT_LAEUFT) return false;
-  s_at_alt   = s_eth_tx_retries;
-  s_at_idx   = 0;
-  s_at_state = AT_LAEUFT;
-  s_at_messend = false;
-  s_at_t0    = millis();
+  s_at_alt       = s_eth_tx_retries;
+  s_at_start_idx = at_naechster_idx(s_at_alt);
+  s_at_phase     = AT_PH_START;
+  s_at_schritte  = 0;
+  s_at_ref_pps   = 0;
+  s_at_state     = AT_LAEUFT;
   for (size_t i = 0; i < AT_N; i++) s_at_verlust[i] = 0xFFFF;
-  s_eth_tx_retries = AT_KANDIDATEN[0];
-  printf("[AUTO] Start - %u Kandidaten, je %u s\n",
-         (unsigned)AT_N, (unsigned)((AT_EINSCHWINGEN + AT_MESSDAUER) / 1000));
+  at_schritt_starten(s_at_start_idx);
+  printf("[AUTO] Start bei %u Retries (aktuell %u), je Schritt %u s\n",
+         (unsigned)AT_KANDIDATEN[s_at_start_idx], (unsigned)s_at_alt,
+         (unsigned)((AT_EINSCHWINGEN + AT_MESSDAUER) / 1000));
   return true;
 }
+
+uint8_t bridge_autotune_kandidat(void) { return AT_KANDIDATEN[s_at_idx]; }
 
 void bridge_autotune_reset(void) {
   if (s_at_state == AT_LAEUFT)
@@ -1302,17 +1351,126 @@ void bridge_autotune_reset(void) {
 }
 
 autotune_state_t bridge_autotune_state(void)  { return s_at_state; }
-uint8_t bridge_autotune_schritt(void)         { return s_at_idx; }
+uint8_t bridge_autotune_schritt(void)         { return s_at_schritte; }
 uint8_t bridge_autotune_anzahl(void)          { return AT_N; }
 uint8_t bridge_autotune_ergebnis(void)        { return s_at_ergebnis; }
 void bridge_autotune_werte(uint8_t *k, uint16_t *v) {
   for (size_t i = 0; i < AT_N; i++) { k[i] = AT_KANDIDATEN[i]; v[i] = s_at_verlust[i]; }
 }
 
-/* Wird aus bridge_tick() gerufen, also etwa im Sekundentakt. */
+/* Geringster bisher gemessener Verlust (ohne Einbrueche), 0xFFFF = keiner. */
+static uint16_t at_bester_verlust(void) {
+  uint16_t b = 0xFFFF;
+  for (size_t i = 0; i < AT_N; i++)
+    if (s_at_verlust[i] < AT_VERLUST_EINBRUCH && s_at_verlust[i] < b) b = s_at_verlust[i];
+  return b;
+}
+
+/* Was noch als "gut genug" gilt: das Ziel, oder - wenn selbst der beste Wert
+ * es verfehlt - knapp ueber dem besten (Messrauschen). Ohne diesen Puffer
+ * wuerde ein zufaellig minimal besserer hoher Wert stets gewinnen, obwohl er
+ * den Ethernet-Empfang laenger blockiert. */
+static uint16_t at_erlaubt(void) {
+  const uint16_t b = at_bester_verlust();
+  if (b == 0xFFFF) return AT_ZIEL_PROMILLE;
+  const uint32_t puffer = b / 4 > 3 ? b / 4 : 3;
+  const uint32_t e = (uint32_t)b + puffer;
+  return (uint16_t)(e > AT_ZIEL_PROMILLE ? e : AT_ZIEL_PROMILLE);
+}
+
+static void at_abschliessen(void) {
+  /* Kleinster gemessener Kandidat im erlaubten Rahmen. */
+  const uint16_t erlaubt = at_erlaubt();
+  uint8_t gewaehlt = 0;
+  for (size_t i = 0; i < AT_N; i++)
+    if (s_at_verlust[i] <= erlaubt) { gewaehlt = AT_KANDIDATEN[i]; break; }
+  if (!gewaehlt) {                    /* nichts Brauchbares gemessen */
+    s_eth_tx_retries = s_at_alt;
+    s_at_state = AT_ZU_WENIG_VERKEHR;
+    printf("[AUTO] Keine gueltige Messung - bleibe bei %u\n", (unsigned)s_at_alt);
+    return;
+  }
+  s_at_ergebnis = gewaehlt;
+  s_eth_tx_retries = gewaehlt;
+  g_cfg.eth_tx_retries = gewaehlt;
+  cfg_save();
+  s_at_state = AT_FERTIG;
+  printf("[AUTO] Fertig nach %u Messungen - gewaehlt: %u (gespeichert)\n",
+         (unsigned)s_at_schritte, (unsigned)gewaehlt);
+}
+
+/* Naechster Schritt nach einer Messung (oder einem Einbruch) am Index
+ * s_at_idx. Startet entweder den naechsten Schritt oder schliesst ab. */
+static void at_weiter(bool einbruch) {
+  const uint16_t v = s_at_verlust[s_at_idx];
+  const uint16_t erlaubt = at_erlaubt();
+
+  if (s_at_phase == AT_PH_START) {
+    if (!einbruch && v > AT_ZIEL_PROMILLE && s_at_idx + 1 < (int)AT_N) {
+      s_at_phase = AT_PH_AUF;
+      at_schritt_starten(s_at_idx + 1);
+      return;
+    }
+    s_at_phase = AT_PH_AB;
+  } else if (s_at_phase == AT_PH_AUF) {
+    /* Weiter hoch nur, solange es spuerbar besser wird (>= 25 % und mind.
+     * 0,02 Prozentpunkte) und das Ziel noch verfehlt ist. */
+    const uint16_t vorher = s_at_verlust[s_at_idx - 1];
+    const bool besser = !einbruch && vorher < AT_VERLUST_EINBRUCH &&
+                        v + 2 <= vorher && (uint32_t)v * 4 <= (uint32_t)vorher * 3;
+    if (besser && v > AT_ZIEL_PROMILLE && s_at_idx + 1 < (int)AT_N) {
+      at_schritt_starten(s_at_idx + 1);
+      return;
+    }
+    /* Abwaerts lohnt nur, wenn schon der Startwert im Rahmen lag - sonst
+     * werden kleinere Werte nur noch schlechter. */
+    if (s_at_verlust[s_at_start_idx] > erlaubt || s_at_start_idx == 0) {
+      at_abschliessen();
+      return;
+    }
+    s_eth_tx_retries = AT_KANDIDATEN[s_at_start_idx];
+    s_at_phase = AT_PH_AB;
+    at_schritt_starten(s_at_start_idx - 1);
+    return;
+  } else {  /* AT_PH_AB */
+    if (einbruch || v > erlaubt) {
+      at_abschliessen();
+      return;
+    }
+  }
+
+  /* AT_PH_AB: weiter nach unten, falls noch Platz. Beim Wechsel aus der
+   * Startphase geht es direkt unter dem Startwert los. */
+  if (s_at_idx == 0) { at_abschliessen(); return; }
+  if (s_at_phase == AT_PH_AB && s_at_verlust[s_at_idx] <= erlaubt) {
+    at_schritt_starten(s_at_idx - 1);
+    return;
+  }
+  at_abschliessen();
+}
+
+/* Wird aus bridge_tick() gerufen, also mehrmals pro Sekunde. */
 static void autotune_tick(void) {
   if (s_at_state != AT_LAEUFT) return;
   const uint32_t seit = millis() - s_at_t0;
+
+  /* Einbruch-Waechter: ab der Startmessung ist die normale Paketrate
+   * bekannt. Faellt sie in einem Schritt weit darunter, bricht gerade der
+   * Stream zusammen - sofort zurueck auf den sicheren Startwert, nicht erst
+   * nach 19 s. */
+  if (s_at_ref_pps && seit >= AT_EINBRUCH_MS) {
+    const uint32_t pkt = s_pkt_e2w - s_at_pkt_schritt0;
+    const uint32_t soll = (uint32_t)((uint64_t)s_at_ref_pps * seit / 1000);
+    if ((uint64_t)pkt * 100 < (uint64_t)soll * AT_EINBRUCH_PROZ) {
+      printf("[AUTO] Retries %2u -> Einbruch (%u statt ~%u Pakete) - Abbruch des Schritts\n",
+             (unsigned)AT_KANDIDATEN[s_at_idx], (unsigned)pkt, (unsigned)soll);
+      s_at_verlust[s_at_idx] = AT_VERLUST_EINBRUCH;
+      s_at_schritte++;
+      s_eth_tx_retries = AT_KANDIDATEN[s_at_start_idx];
+      at_weiter(true);
+      return;
+    }
+  }
 
   if (!s_at_messend) {
     if (seit < AT_EINSCHWINGEN) return;
@@ -1324,44 +1482,33 @@ static void autotune_tick(void) {
 
   const uint32_t dp = s_pkt_e2w  - s_at_pkt0;
   const uint32_t dd = s_drop_e2w - s_at_drop0;
+  s_at_schritte++;
 
   if (dp + dd < AT_MIN_PAKETE) {
-    /* Ohne nennenswerten Verkehr ist jede Zahl Zufall - lieber ehrlich
-     * abbrechen als ein Ergebnis vortaeuschen. */
-    printf("[AUTO] Abbruch: nur %u Pakete in %u s - zu wenig Verkehr\n",
-           (unsigned)(dp + dd), (unsigned)(AT_MESSDAUER / 1000));
-    s_eth_tx_retries = s_at_alt;
-    s_at_state = AT_ZU_WENIG_VERKEHR;
+    if (s_at_phase == AT_PH_START) {
+      /* Schon beim Startwert kaum Verkehr: jede Zahl waere Zufall - lieber
+       * ehrlich abbrechen als ein Ergebnis vortaeuschen. */
+      printf("[AUTO] Abbruch: nur %u Pakete in %u s - zu wenig Verkehr\n",
+             (unsigned)(dp + dd), (unsigned)(AT_MESSDAUER / 1000));
+      s_eth_tx_retries = s_at_alt;
+      s_at_state = AT_ZU_WENIG_VERKEHR;
+      return;
+    }
+    /* Spaeter: wie ein Einbruch behandeln. */
+    s_at_verlust[s_at_idx] = AT_VERLUST_EINBRUCH;
+    s_eth_tx_retries = AT_KANDIDATEN[s_at_start_idx];
+    at_weiter(true);
     return;
   }
 
   s_at_verlust[s_at_idx] = (uint16_t)((10000ULL * dd) / (dp + dd));
-  printf("[AUTO] Retries %2u -> %u.%02u %% Verlust\n",
+  if (s_at_phase == AT_PH_START)
+    s_at_ref_pps = (dp + dd) * 1000 / AT_MESSDAUER;
+  printf("[AUTO] Retries %2u -> %u.%02u %% Verlust (%u Pakete)\n",
          (unsigned)AT_KANDIDATEN[s_at_idx],
          (unsigned)(s_at_verlust[s_at_idx] / 100),
-         (unsigned)(s_at_verlust[s_at_idx] % 100));
-
-  if (++s_at_idx < AT_N) {
-    s_eth_tx_retries = AT_KANDIDATEN[s_at_idx];
-    s_at_messend = false;
-    s_at_t0 = millis();
-    return;
-  }
-
-  /* Auswertung: kleinster Kandidat, der das Ziel erreicht. Verfehlen alle
-   * das Ziel, nehmen wir den mit dem geringsten Verlust. */
-  uint8_t  gewaehlt = 0;
-  uint16_t bestes   = 0xFFFF;
-  for (size_t i = 0; i < AT_N; i++) {
-    if (s_at_verlust[i] <= AT_ZIEL_PROMILLE) { gewaehlt = AT_KANDIDATEN[i]; break; }
-    if (s_at_verlust[i] < bestes) { bestes = s_at_verlust[i]; gewaehlt = AT_KANDIDATEN[i]; }
-  }
-  s_at_ergebnis = gewaehlt;
-  s_eth_tx_retries = gewaehlt;
-  g_cfg.eth_tx_retries = gewaehlt;
-  cfg_save();
-  s_at_state = AT_FERTIG;
-  printf("[AUTO] Fertig - gewaehlt: %u (gespeichert)\n", (unsigned)gewaehlt);
+         (unsigned)(s_at_verlust[s_at_idx] % 100), (unsigned)(dp + dd));
+  at_weiter(false);
 }
 
 /* ===========================================================================

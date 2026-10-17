@@ -152,8 +152,11 @@ void bridge_apply_live_tuning(void);
 /* ---------------------------------------------------------------------------
  * Autotune fuer die Sendewiederholungen
  *
- * Probiert mehrere Werte fuer eth_tx_retries durch und misst zu jedem die
- * Verlustrate. Gewaehlt wird der KLEINSTE Wert, der das Verlustziel einhaelt -
+ * Misst die Verlustrate zuerst beim aktuellen Wert von eth_tx_retries, geht
+ * dann - falls der das Ziel verfehlt - aufwaerts, danach abwaerts, solange es
+ * im Rahmen bleibt (Details und Begruendung in bridge.cpp). Bricht ein Schritt
+ * den Stream ein, wird er nach wenigen Sekunden abgebrochen.
+ * Gewaehlt wird der KLEINSTE Wert, der das Verlustziel einhaelt -
  * nicht der mit dem besten Ergebnis. Grund: Jede Wiederholung blockiert den
  * Ethernet-Empfangstask ein Stueck laenger, und was in dieser Zeit hereinkommt,
  * verliert der DMA unsichtbar. Mehr Geduld ist also nicht kostenlos.
@@ -168,8 +171,9 @@ bool             bridge_autotune_start(void);
  * beim haendischen Speichern gerufen, damit der eingetragene Wert gilt. */
 void             bridge_autotune_reset(void);
 autotune_state_t bridge_autotune_state(void);
-uint8_t          bridge_autotune_schritt(void);   /* aktueller Kandidat 0..n */
-uint8_t          bridge_autotune_anzahl(void);
+uint8_t          bridge_autotune_schritt(void);   /* abgeschlossene Messungen */
+uint8_t          bridge_autotune_anzahl(void);    /* Kandidaten insgesamt (Obergrenze) */
+uint8_t          bridge_autotune_kandidat(void);  /* gerade getesteter Retry-Wert */
 uint8_t          bridge_autotune_ergebnis(void);  /* gewaehlter Wert, 0 = keiner */
 /* Verlust je Kandidat in Hundertstelprozent, 0xFFFF = nicht gemessen */
 void             bridge_autotune_werte(uint8_t *kandidaten, uint16_t *verlust);

@@ -579,8 +579,10 @@ async function tick(){
     /* Ist-Wert vom Treiber: zeigt, ob HT40 wirklich ausgehandelt wurde. */
     $('bw').textContent=(s.wifi&&s.bw)?s.bw+' MHz':'-';
     /* Fortschritt der Einmessung. at: 0=untaetig 1=laeuft 2=fertig 3=zu wenig Verkehr */
-    if(s.at===1) $('atmsg').textContent='Einmessung laeuft - Schritt '+(s.at_s+1)+' von '+s.at_n+
-                 ' (etwa '+Math.max(0,Math.round((s.at_n-s.at_s)*19/60*10)/10)+' min uebrig)';
+    /* Die Zahl der Schritte steht vorher nicht fest (erst hoch, dann runter,
+       Abbruch beim ersten Ausreisser) - daher keine Restzeit, nur der Stand. */
+    if(s.at===1) $('atmsg').textContent='Einmessung laeuft - Messung '+(s.at_s+1)+
+                 ', teste '+s.at_k+' Retries (je ca. 19 s, meist 3-6 Messungen)';
     else if(s.at===2){ $('atmsg').textContent='Fertig - gewaehlt: '+s.at_r+' Retries, gespeichert.';
                        if(ATPREV===1) $('eth_tx_retries').value=s.at_r; }
     else if(s.at===3) $('atmsg').textContent='Abgebrochen: zu wenig Verkehr waehrend der Messung. '+
@@ -765,7 +767,7 @@ static esp_err_t h_status(httpd_req_t *r) {
     "\"roam_count\":%lu,\"uptime\":%lu,"
     "\"client_mac\":\"%s\",\"client_ip\":\"%s\",\"client_name\":\"%s\","
     "\"ssid\":\"%s\",\"bssid\":\"%s\","
-    "\"at\":%d,\"at_s\":%u,\"at_n\":%u,\"at_r\":%u,"
+    "\"at\":%d,\"at_s\":%u,\"at_n\":%u,\"at_r\":%u,\"at_k\":%u,"
     "\"heap\":%lu,\"heap_min\":%lu,\"heap_dma\":%lu,\"heap_blk\":%lu,"
     "\"txp\":%d,\"bw\":%u,\"time\":%lu,\"build\":\"" GIT_REV "\"}",
     s_provisioning ? 1 : 0, st.wifi_up ? 1 : 0, st.eth_link ? 1 : 0,
@@ -784,7 +786,7 @@ static esp_err_t h_status(httpd_req_t *r) {
     (unsigned)st.wd_last_reason, (unsigned long)st.roam_count,
     (unsigned long)(millis() / 1000), st.client_mac, st.client_ip, st.client_name, st.ssid, st.bssid,
     (int)bridge_autotune_state(), bridge_autotune_schritt(),
-    bridge_autotune_anzahl(), bridge_autotune_ergebnis(),
+    bridge_autotune_anzahl(), bridge_autotune_ergebnis(), bridge_autotune_kandidat(),
     (unsigned long)esp_get_free_heap_size(),
     /* Tiefststand seit dem Start - zeigt Einbrueche, die zwischen zwei
      * Abfragen liegen und sonst unsichtbar bleiben. */
