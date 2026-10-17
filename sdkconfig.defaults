@@ -59,7 +59,13 @@ CONFIG_ETH_DMA_RX_BUFFER_NUM=30
 CONFIG_ETH_DMA_TX_BUFFER_NUM=30
 
 # --- Sonstiges --------------------------------------------------------------
-CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=768
+# IDLE-Stack: IDF-Standard 1536. 768 (das Kconfig-Minimum) stand hier seit dem
+# ersten Commit ohne Begruendung und fuehrte am 2026-10-15 zu einem Absturz
+# "stack overflow in task IDLE0" (Coredump, Build f2a3290). Der IDLE-Task
+# raeumt geloeschte Tasks auf (u.a. die Ping-Session-Tasks der Gateway-Sonde)
+# und traegt Interrupt-Frames unter WLAN-/EMAC-Last - 768 Byte reichen dafuer
+# nur meistens. Kostet ~1,5 KB RAM (zwei Kerne), Heap hat genug Reserve.
+CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=1536
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
 # CPU auf voller Taktrate, kein Powermanagement
