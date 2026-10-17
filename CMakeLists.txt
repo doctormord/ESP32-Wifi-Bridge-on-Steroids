@@ -1,19 +1,19 @@
-# Projekt-CMakeLists fuer den reinen ESP-IDF-Build.
-# Wird von PlatformIO bei framework = espidf erwartet.
+# Project CMakeLists for the pure ESP-IDF build.
+# Expected by PlatformIO with framework = espidf.
 cmake_minimum_required(VERSION 3.16)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(esp32_wifi_bridge)
 
-# NBSTAT-Antworten in lwIPs NetBIOS-Responder einschalten.
+# Enable NBSTAT answers in lwIP's NetBIOS responder.
 #
-# Ohne das beantwortet die Bridge nur Abfragen nach ihrem exakt bekannten
-# Namen - ein Router kann den aber nicht kennen, bevor er ihn erfragt hat.
-# NBSTAT ("Node Status") ist genau die Abfrage, mit der Namen ENTDECKT werden;
-# so lernt die FritzBox die Namen von Windows-Rechnern.
+# Without this the bridge only answers queries for its exact known name - but
+# a router cannot know that name before it has asked for it. NBSTAT ("node
+# status") is exactly the query used to DISCOVER names; that is how many home
+# routers learn the names of Windows machines.
 #
-# lwIP setzt LWIP_NETBIOS_RESPOND_NAME_QUERY per Vorgabe auf 0, und ESP-IDF
-# bietet keine Kconfig-Option dafuer. Deshalb hier direkt an der lwip-
-# Komponente definiert - der von ESP-IDF vorgesehene Weg, eine Fremdkomponente
-# zu parametrisieren, ohne sie zu patchen.
+# lwIP defaults LWIP_NETBIOS_RESPOND_NAME_QUERY to 0, and ESP-IDF offers no
+# Kconfig option for it. So it is defined directly on the lwip component -
+# the way ESP-IDF intends third-party components to be parameterized without
+# patching them.
 idf_component_get_property(lwip_lib lwip COMPONENT_LIB)
 target_compile_definitions(${lwip_lib} PRIVATE LWIP_NETBIOS_RESPOND_NAME_QUERY=1)

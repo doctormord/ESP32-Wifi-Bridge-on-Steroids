@@ -8,7 +8,7 @@ Firmware for a WT32-ETH01 board (ESP32-D0WD + LAN8720A Ethernet PHY, 2 MB flash)
 
 The comments in the code frame the primary use case as bridging something Ethernet-only (an IP camera is mentioned specifically, e.g. in the OTA-pause rationale in `web.cpp`) onto a Wi-Fi-only network segment. As of 2026-08-31 that's not hypothetical — a real camera has been bridged in continuous use for weeks, and the two most recent pieces of work (an optional WiFi watchdog, a crash-forensics endpoint) both exist because of failure modes that only showed up under that real, unattended deployment.
 
-`sdkconfig.defaults` notes it was "abgeleitet aus dem Rust-Original" (derived from a Rust original) — there is or was a Rust implementation of this same bridge that the current sdkconfig tuning traces back to. Not otherwise referenced in this repo; worth knowing if a second implementation surfaces elsewhere.
+`sdkconfig.defaults` notes it was "derived from the Rust implementation this project is based on" — there is or was a Rust implementation of this same bridge that the current sdkconfig tuning traces back to. Not otherwise referenced in this repo; worth knowing if a second implementation surfaces elsewhere.
 
 ## Hardware constraints shaping the design
 
