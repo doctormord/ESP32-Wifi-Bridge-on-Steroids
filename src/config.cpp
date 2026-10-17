@@ -1,3 +1,9 @@
+/*
+ * config.cpp - Loading, saving and resetting the persistent configuration.
+ *
+ * The configuration lives in g_cfg and is persisted as a single NVS blob
+ * (namespace CFG_NVS_NS, key CFG_NVS_KEY). See config.h for the layout rules.
+ */
 #include "config.h"
 
 #include <string.h>
@@ -8,12 +14,16 @@
 
 BridgeConfig g_cfg;
 
+/* Fill *c with factory defaults.
+ *
+ * Everything is zeroed first, then the few fields that need a non-zero
+ * starting value are set. The management IP defaults are only a starting
+ * point - they are meant to be corrected in the portal. */
 void cfg_defaults(BridgeConfig *c) {
   memset(c, 0, sizeof(*c));
   c->magic = CFG_MAGIC;
   strcpy(c->name, "wifibridge");
 
-  /* Sinnvolle Startwerte - der Nutzer korrigiert sie im Portal ohnehin. */
   c->mgmt_ip[0] = 192; c->mgmt_ip[1] = 168; c->mgmt_ip[2] = 178; c->mgmt_ip[3] = 250;
   c->mgmt_mask[0] = 255; c->mgmt_mask[1] = 255; c->mgmt_mask[2] = 255; c->mgmt_mask[3] = 0;
   c->mgmt_gw[0] = 192; c->mgmt_gw[1] = 168; c->mgmt_gw[2] = 178; c->mgmt_gw[3] = 1;
@@ -22,32 +32,35 @@ void cfg_defaults(BridgeConfig *c) {
   c->telemetry_s  = 10;
   c->configured   = false;
 
-  /* Die Feinabstimmungsfelder bleiben bewusst auf 0. Das ist kein
-   * vergessener Default, sondern die Konvention aus config.h: 0 heisst
-   * "nimm den Wert aus sdkconfig bzw. den PHY-Default". Wer hier feste
-   * Zahlen eintraegt, baut sich die zweite Quelle wieder ein, die in
-   * bridge.cpp gerade erst entfernt wurde. */
+  /* The tuning fields deliberately stay at 0. That is not a forgotten
+   * default but the convention from config.h: 0 means "use the sdkconfig
+   * value or the PHY default". Putting real numbers here would create a
+   * second source of truth next to sdkconfig.defaults. */
 }
 
+/* Load the configuration from NVS into g_cfg.
+ *
+ * Starts from defaults, then overlays whatever is stored. The stored blob may
+ * be shorter than sizeof(BridgeConfig) (written by older firmware with fewer
+ * fields) or longer (after a downgrade); in both cases the common prefix is
+ * copied and the rest stays at its default. Without this, every firmware
+ * update that adds a field would wipe the configuration and leave the board
+ * stuck in the setup AP instead of doing its job. */
 void cfg_load(void) {
   cfg_defaults(&g_cfg);
 
   nvs_handle_t h;
   if (nvs_open(CFG_NVS_NS, NVS_READONLY, &h) != ESP_OK) {
-    printf("[CFG ] Kein NVS-Namespace - Defaults\n");
+    printf("[CFG ] No NVS namespace - using defaults\n");
     return;
   }
 
-  /* Erst die abgelegte Groesse erfragen. Nach einem OTA-Update kann die
-   * Struktur gewachsen (oder bei einem Downgrade geschrumpft) sein - dann
-   * uebernehmen wir den gemeinsamen Anfang und lassen den Rest auf Default.
-   * Ohne das waere nach jedem Firmware-Update die Konfiguration weg, und
-   * das Board haenge im AP-Modus statt an seinem Einbauort zu arbeiten. */
+  /* Query the stored size first. */
   size_t sz = 0;
   esp_err_t err = nvs_get_blob(h, CFG_NVS_KEY, NULL, &sz);
   if (err != ESP_OK || sz < sizeof(uint32_t)) {
     nvs_close(h);
-    printf("[CFG ] Keine gespeicherte Konfiguration - Defaults\n");
+    printf("[CFG ] No stored configuration - using defaults\n");
     return;
   }
 
@@ -63,7 +76,7 @@ void cfg_load(void) {
   memcpy(&magic, raw, sizeof(magic));
   if (magic != CFG_MAGIC) {
     free(raw);
-    printf("[CFG ] Magic passt nicht - Defaults\n");
+    printf("[CFG ] Magic mismatch - using defaults\n");
     return;
   }
 
@@ -73,10 +86,11 @@ void cfg_load(void) {
   free(raw);
 
   g_cfg = tmp;
-  printf("[CFG ] Geladen (%u von %u Byte): name='%s' ssid1='%s'\n",
+  printf("[CFG ] Loaded (%u of %u bytes): name='%s' ssid1='%s'\n",
                 (unsigned)sz, (unsigned)sizeof(tmp), g_cfg.name, g_cfg.ssid1);
 }
 
+/* Persist g_cfg to NVS (always the full current struct size). */
 bool cfg_save(void) {
   g_cfg.magic = CFG_MAGIC;
 
@@ -87,10 +101,12 @@ bool cfg_save(void) {
   if (err == ESP_OK) err = nvs_commit(h);
   nvs_close(h);
 
-  printf("[CFG ] Speichern: %s\n", err == ESP_OK ? "ok" : "FEHLER");
+  printf("[CFG ] Save: %s\n", err == ESP_OK ? "ok" : "FAILED");
   return err == ESP_OK;
 }
 
+/* Erase everything in the configuration namespace and reset g_cfg to
+ * defaults. Only our own namespace is erased, not the whole NVS partition. */
 bool cfg_factory_reset(void) {
   nvs_handle_t h;
   if (nvs_open(CFG_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
@@ -102,9 +118,11 @@ bool cfg_factory_reset(void) {
 }
 
 /* --------------------------------------------------------------------------
- * IPv4-Helfer
+ * IPv4 helpers
  * ------------------------------------------------------------------------ */
 
+/* Parse "a.b.c.d" into out[0..3]. Rejects anything that is not four decimal
+ * numbers in the range 0..255; `out` is only written on success. */
 bool parse_ipv4(const char *s, uint8_t out[4]) {
   if (!s) return false;
   unsigned a, b, c, d;
@@ -115,6 +133,7 @@ bool parse_ipv4(const char *s, uint8_t out[4]) {
   return true;
 }
 
+/* Format ip[0..3] as "a.b.c.d" into out (needs at least 16 bytes). */
 void format_ipv4(const uint8_t ip[4], char *out, size_t out_len) {
   snprintf(out, out_len, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
 }

@@ -1,22 +1,21 @@
 """
-Erzeugt src/build_info.h mit dem aktuellen Git-Stand, vor jedem Build neu.
+Generates src/build_info.h with the current git revision, before every build.
 
-Grund: ein Coredump verweist nur auf nackte Adressen, keine Quelltextstellen -
-die lassen sich nur mit dem GENAU passenden firmware.elf aufloesen (addr2line
-gegen das falsche .elf liefert scheinbar gueltige, aber voellig sinnlose
-Funktionsnamen - am 2026-08-31 auf echter Hardware genau so erlebt). PlatformIO
-ueberschreibt .pio/build/.../firmware.elf bei jedem Build, darum archiviert
-scripts/ota_flash.sh es nach dem Git-Stand benannt. Damit sich ein spaeter
-gefundener Coredump ueberhaupt einem Archiv-Eintrag zuordnen laesst, muss die
-laufende Firmware ihren eigenen Git-Stand kennen - das liefert dieses Skript
-als GIT_REV, ausgegeben unter anderem in /api/status.
+Reason: a coredump only points at bare addresses, not source locations - those
+can only be resolved with the EXACTLY matching firmware.elf (addr2line against
+the wrong .elf yields plausible-looking but completely meaningless function
+names). PlatformIO overwrites .pio/build/.../firmware.elf on every build, which
+is why scripts/ota_flash.sh archives it under the git revision. For a coredump
+found later to be matched to an archive entry at all, the running firmware
+must know its own git revision - this script provides it as GIT_REV, which is
+reported in /api/status among other places.
 """
 import os
 import subprocess
 
-# __file__ ist in SCons-ausgefuehrten extra_scripts nicht verlaesslich
-# gesetzt (SConscript() fuehrt per exec() aus, ohne es zu injizieren) -
-# deshalb ueber PlatformIOs env["PROJECT_DIR"] statt relativ zum Skript.
+# __file__ is not reliably set in extra_scripts executed by SCons
+# (SConscript() runs them via exec() without injecting it) - hence
+# PlatformIO's env["PROJECT_DIR"] instead of a path relative to this script.
 Import("env")
 
 ROOT = env["PROJECT_DIR"]
@@ -24,6 +23,8 @@ OUT = os.path.join(ROOT, "src", "build_info.h")
 
 
 def git_rev():
+    """Short HEAD hash, with "-dirty" appended if the work tree has
+    uncommitted changes; "unknown" outside a git checkout."""
     try:
         rev = subprocess.check_output(
             ["git", "rev-parse", "--short", "HEAD"],
