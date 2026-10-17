@@ -28,6 +28,12 @@ struct BridgeStats {
                                * Bleibt nach dem Neustart stehen (RTC-Speicher),
                                * damit Portal/MQTT zeigen koennen WARUM.       */
   uint32_t roam_count;        /* Aktive AP-Wechsel seit Boot (roam_tick())    */
+  uint32_t wifi_kicks;        /* echte Abbrueche (extern, Verbindung bestand)
+                               * seit Boot - ohne die Fehlversuche danach    */
+  uint8_t  disc_last_reason;  /* Grund des letzten ECHTEN Abbruchs in diesem
+                               * Boot, 0 = keiner (siehe bridge_get_disc_log()) */
+  uint8_t  disc_last_src;     /* DISC_SRC_* dazu                              */
+  uint32_t disc_last_ago_s;   /* wie lange her, in s                          */
   int8_t   rssi;
   uint8_t  channel;
   bool     eth_link;
@@ -146,8 +152,11 @@ void bridge_apply_live_tuning(void);
 /* ---------------------------------------------------------------------------
  * Autotune fuer die Sendewiederholungen
  *
- * Probiert mehrere Werte fuer eth_tx_retries durch und misst zu jedem die
- * Verlustrate. Gewaehlt wird der KLEINSTE Wert, der das Verlustziel einhaelt -
+ * Misst die Verlustrate zuerst beim aktuellen Wert von eth_tx_retries, geht
+ * dann - falls der das Ziel verfehlt - aufwaerts, danach abwaerts, solange es
+ * im Rahmen bleibt (Details und Begruendung in bridge.cpp). Bricht ein Schritt
+ * den Stream ein, wird er nach wenigen Sekunden abgebrochen.
+ * Gewaehlt wird der KLEINSTE Wert, der das Verlustziel einhaelt -
  * nicht der mit dem besten Ergebnis. Grund: Jede Wiederholung blockiert den
  * Ethernet-Empfangstask ein Stueck laenger, und was in dieser Zeit hereinkommt,
  * verliert der DMA unsichtbar. Mehr Geduld ist also nicht kostenlos.
@@ -162,8 +171,9 @@ bool             bridge_autotune_start(void);
  * beim haendischen Speichern gerufen, damit der eingetragene Wert gilt. */
 void             bridge_autotune_reset(void);
 autotune_state_t bridge_autotune_state(void);
-uint8_t          bridge_autotune_schritt(void);   /* aktueller Kandidat 0..n */
-uint8_t          bridge_autotune_anzahl(void);
+uint8_t          bridge_autotune_schritt(void);   /* abgeschlossene Messungen */
+uint8_t          bridge_autotune_anzahl(void);    /* Kandidaten insgesamt (Obergrenze) */
+uint8_t          bridge_autotune_kandidat(void);  /* gerade getesteter Retry-Wert */
 uint8_t          bridge_autotune_ergebnis(void);  /* gewaehlter Wert, 0 = keiner */
 /* Verlust je Kandidat in Hundertstelprozent, 0xFFFF = nicht gemessen */
 void             bridge_autotune_werte(uint8_t *kandidaten, uint16_t *verlust);
@@ -179,3 +189,64 @@ int16_t bridge_get_tx_power(void);
  * Anzeige laesst sich nicht unterscheiden, ob HT40 nichts brachte oder gar
  * nicht zustande kam. 0 = nicht ermittelbar. */
 uint8_t bridge_get_bandwidth_mhz(void);
+
+/* ===========================================================================
+ * Disconnect-Protokoll
+ * ---------------------------------------------------------------------------
+ * Bisher gab es nur den Zaehler wifi_disc - WARUM die Verbindung abriss, stand
+ * allein im seriellen Log, und an das kommt man im Einsatz nicht heran. Jeder
+ * WIFI_EVENT_STA_DISCONNECTED landet deshalb mit Grund, RSSI und AP in einem
+ * kleinen Ringpuffer im RTC-Speicher: der ueberlebt Soft-Neustarts, Watchdog-
+ * Neustarts und Abstuerze, nur nicht das Abschalten der Versorgung. So bleibt
+ * sichtbar, was VOR einem Neustart los war.
+ * ========================================================================= */
+
+/* 48 statt anfangs 16: ein einziger Rauswurf durch den AP zieht oft ein
+ * Dutzend gescheiterter Wiederverbindungsversuche nach sich (2026-10-17 so
+ * beobachtet) - bei 16 Plaetzen war der Ausloeser eines Schubs schon wieder
+ * aus dem Puffer gefallen. 48 x 24 Byte RTC-Speicher. */
+#define DISC_LOG_N 48
+
+/* Wer die Trennung ausgeloest hat. Alles ausser EXTERN ist eine bewusste
+ * Trennung der Firmware selbst und kein Funkproblem. */
+#define DISC_SRC_EXTERN   0u   /* AP oder Funkstrecke */
+#define DISC_SRC_CONNECT  1u   /* Verbindungsaufbau beim Start abgebrochen */
+#define DISC_SRC_WATCHDOG 2u   /* Watchdog-Stufe "WLAN neu verbinden" */
+#define DISC_SRC_ROAM     3u   /* aktiver AP-Wechsel */
+
+typedef struct {
+  uint32_t t_s;        /* Laufzeit in s beim Abriss (des Boots in 'boot') */
+  uint32_t epoch;      /* Uhrzeit UTC beim Abriss, 0 = Uhr nicht gestellt */
+  uint16_t down_s;     /* Sekunden bis zur Wiederverbindung, 0xFFFF = offen */
+  uint8_t  reason;     /* wifi_err_reason_t */
+  int8_t   rssi;       /* RSSI beim Abriss, vom Treiber */
+  uint8_t  bssid[6];
+  uint8_t  boot;       /* Boot-Zaehler (mod 256) - siehe bridge_get_disc_log() */
+  uint8_t  src;        /* DISC_SRC_* */
+  uint8_t  was_up;     /* 1 = bestehende Verbindung getrennt (echter Abbruch),
+                        * 0 = Verbindungsversuch gescheitert (Folgefehler) */
+  uint8_t  _pad[3];
+} bridge_disc_t;
+
+typedef struct {
+  uint8_t  reason;
+  uint16_t n;
+} bridge_disc_count_t;
+
+/* Eintraege, neueste zuerst. *boot_now erhaelt den Zaehler des laufenden
+ * Boots; Eintraege mit anderem 'boot' stammen aus frueheren Boots, ihr t_s
+ * bezieht sich dann auf deren Laufzeit. */
+size_t bridge_get_disc_log(bridge_disc_t *out, size_t max, uint8_t *boot_now);
+
+/* Echte Abbrueche (extern, bestehende Verbindung) je Grund seit DIESEM
+ * Boot, absteigend nach Haeufigkeit. *rest = Abbrueche, deren Grund nicht
+ * mehr in die Tabelle passte. Gescheiterte Wiederverbindungsversuche zaehlen
+ * hier NICHT - die sind Folge, nicht Ursache; siehe bridge_get_disc_totals(). */
+size_t bridge_get_disc_counts(bridge_disc_count_t *out, size_t max, uint16_t *rest);
+
+/* Summen seit diesem Boot, nur extern ausgeloeste: echte Abbrueche einer
+ * bestehenden Verbindung bzw. gescheiterte Verbindungsversuche. */
+void bridge_get_disc_totals(uint32_t *kicks, uint32_t *fails);
+
+/* Kurzname eines wifi_err_reason_t, z.B. "BEACON_TIMEOUT". */
+const char *bridge_wifi_reason_str(uint8_t reason);

@@ -17,6 +17,7 @@
 #include "esp_heap_caps.h"
 #include "esp_core_dump.h"
 #include "build_info.h"
+#include "crashlog.h"
 
 #define AP_PASSWORD   "bridgesetup"   /* mind. 8 Zeichen, sonst offen */
 
@@ -163,6 +164,12 @@ input,select{width:100%;padding:9px 10px;border-radius:7px;border:1px solid #2f3
 .row{display:flex;gap:10px}.row>*{flex:1}
 button{margin-top:16px;padding:11px 18px;border:0;border-radius:7px;background:var(--acc);color:#06101c;font-weight:600;font-size:14px;cursor:pointer}
 button.sec{background:#2f3542;color:var(--fg)}
+/* Rueckmeldung fuer ALLE Knoepfe: heller beim Ueberfahren, deutlich dunkler
+   und leicht eingedrueckt beim Druecken. */
+button{transition:background .1s,transform .08s,filter .1s}
+button:hover:not(:disabled){filter:brightness(1.12)}
+button:active:not(:disabled){background:#2a78d0;transform:scale(.97);filter:none}
+button.sec:active:not(:disabled){background:#4a5367}
 .bar{height:6px;background:#232833;border-radius:3px;overflow:hidden;margin-top:6px}
 .bar i{display:block;height:100%;background:var(--acc)}
 .ok{color:var(--ok)}.bad{color:var(--bad)}
@@ -172,6 +179,23 @@ button.sec{background:#2f3542;color:var(--fg)}
 .tag.live{background:rgba(62,207,142,.15);color:var(--ok)}
 .tag.reboot{background:rgba(255,183,77,.15);color:#ffb74d}
 .hint{text-transform:none;letter-spacing:0;color:#6b7383;font-size:11px;margin-left:6px}
+/* Neustart-Knoepfe: beim Druecken rot, ausgeloest erst beim Loslassen. */
+button.hold{transition:background .12s,color .12s,transform .12s;touch-action:manipulation;user-select:none}
+/* Gleiche Spezifitaet wie button.sec:active:not(:disabled) und weiter unten -
+   damit gewinnt Rot auch bei grauen Neustart-Knoepfen. */
+button.hold.armed,button.hold.armed:active{background:var(--bad);color:#fff;transform:scale(.97)}
+button:disabled{opacity:.6;cursor:default}
+/* Hinweis auf ungespeicherte Aenderungen, unten rechts. */
+#dirty{position:fixed;right:16px;bottom:16px;z-index:10;max-width:calc(100% - 32px);width:340px;
+  background:#2a1b1f;border:1px solid rgba(255,107,107,.55);border-radius:10px;padding:12px 14px;
+  box-shadow:0 8px 24px rgba(0,0,0,.45);font-size:13px}
+#dirty[hidden]{display:none}
+#dirty b{color:var(--bad)}
+#dirty .row button{margin-top:10px;padding:8px 12px}
+#dirtymsg{margin-top:6px;color:var(--mut);font-size:12px}
+/* Solange die Box steht, Platz am Seitenende - sonst verdeckt sie (vor allem
+   am Handy) die letzten Felder dauerhaft. */
+body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
 </style></head><body><div class="wrap">
 <h1 id="title">WiFi-Ethernet-Bridge</h1>
 <div class="sub" id="mode"></div>
@@ -196,6 +220,17 @@ button.sec{background:#2f3542;color:var(--fg)}
     <div id="cdtext" class="sub" style="margin:4px 0 8px"></div>
     <button class="sec" onclick="cdErase()" style="margin-top:0">Abbild loeschen</button>
   </div>
+  <div id="crbox" style="display:none;margin-top:10px">
+    <b>Absturz-Historie</b> <span class="hint" id="crhint"></span>
+    <div style="overflow-x:auto"><table id="crtab" class="sub" style="border-collapse:collapse;width:100%;font-size:12px;margin-top:4px"></table></div>
+    <button class="sec" onclick="crErase()" style="margin-top:6px">Historie loeschen</button>
+  </div>
+  <details id="dlbox" style="margin-top:10px" ontoggle="if(this.open)loadDisc()">
+    <summary class="sub" style="cursor:pointer">WLAN-Abbrueche: Gruende und Verlauf</summary>
+    <div id="dlsum" class="sub" style="margin:6px 0"></div>
+    <div style="overflow-x:auto"><table id="dltab" class="sub" style="border-collapse:collapse;width:100%;font-size:12px"></table></div>
+    <button class="sec" onclick="loadDisc()" style="margin-top:6px">Aktualisieren</button>
+  </details>
 </div>
 
 <div class="card">
@@ -237,8 +272,8 @@ button.sec{background:#2f3542;color:var(--fg)}
   <label>Admin-Schluessel (schuetzt Firmware-Update und Absturz-Abbild, leer = offen)</label>
   <input id="admin_pass" type="password" placeholder="unveraendert lassen = leer">
 
-  <button onclick="save(true)">Speichern &amp; neu starten</button>
-  <button class="sec" onclick="reboot()">Nur neu starten</button>
+  <button class="hold" data-act="saverb">Speichern &amp; neu starten</button>
+  <button class="sec hold" data-act="reboot">Nur neu starten</button>
   <div id="msg"></div>
 </div>
 
@@ -457,7 +492,7 @@ button.sec{background:#2f3542;color:var(--fg)}
 
   <button onclick="save(false)">Speichern</button>
   <button class="sec" onclick="defaults()">Standardwerte</button>
-  <button class="sec" onclick="reboot()">Neu starten</button>
+  <button class="sec hold" data-act="reboot">Neu starten</button>
   <div id="tmsg"></div>
 </div>
 
@@ -475,6 +510,14 @@ button.sec{background:#2f3542;color:var(--fg)}
   <button onclick="upload()">Hochladen &amp; flashen</button>
   <div id="omsg"></div>
 </div>
+</div>
+<div id="dirty" hidden role="status">
+  <b>Ungespeicherte Aenderungen</b> <span id="dirtyn" class="hint"></span>
+  <div class="row" id="dirtybtns">
+    <button onclick="dirtySave()">Speichern</button>
+    <button class="sec" onclick="dirtyCancel()">Verwerfen</button>
+  </div>
+  <div id="dirtymsg"></div>
 </div><script>
 const $=i=>document.getElementById(i);
 /* Im Provisionierungsmodus laeuft der STA-Datenpfad noch nicht, dort greift
@@ -489,6 +532,65 @@ let ATPREV=-1;
 function fmt(k){return k>1000?(k/1000).toFixed(1)+' Mbit/s':k+' kbit/s'}
 function dur(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
   return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m')}
+function sdur(s){return s<60?s+'s':dur(s)}
+/* Unix-Sekunden -> Ortszeit des Browsers; 0 heisst "Uhr war nicht gestellt". */
+function ts(e){return e?new Date(e*1000).toLocaleString('de-DE'):''}
+const TD=(t,h)=>'<'+(h?'th':'td')+' style="text-align:left;padding:2px 6px;border-bottom:1px solid rgba(128,128,128,.25);vertical-align:top">'+t+'</'+(h?'th':'td')+'>';
+/* esp_reset_reason_t -> Klartext. 255 = aus der Zeit vor der Historie importiert. */
+const RST={4:'Absturz (Panic)',5:'Interrupt-Watchdog',6:'Task-Watchdog',7:'Hardware-Watchdog',9:'Brownout (Spannung)',255:'Absturz (importiert)'};
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+async function checkCrashes(){
+  try{
+    const r=await fetch('/api/crashes',{headers:cdHeaders()});
+    if(!r.ok){$('crbox').style.display='none';return}
+    const j=await r.json();
+    if(!j.recs.length){$('crbox').style.display='none';return}
+    $('crbox').style.display='block';
+    $('crhint').textContent=j.recs.length+' Eintrag/Eintraege, neueste zuerst'+(j.now?'':' - Uhr der Bridge noch nicht gestellt');
+    $('crtab').innerHTML='<tr>'+['Wann','Art','Task / Grund','Build'].map(t=>TD(t,1)).join('')+'</tr>'+
+      j.recs.map(c=>{
+        const wann=c.e?ts(c.e):(c.f&4?'unbekannt (vor Einfuehrung)':'unbekannt (Uhr nicht gestellt)');
+        let art=(c.f&2)?'Watchdog-Neustart (gewollt)':(RST[c.rst]||('Reset '+c.rst));
+        const det=(c.f&1)?'<b>'+esc(c.task)+'</b> @ 0x'+c.pc+(c.reason?'<br>'+esc(c.reason):'')+
+            (c.bt.length?'<br><span class="hint">BT: '+c.bt.map(a=>'0x'+a).join(' ')+(c.f&8?' (unvollstaendig)':'')+'</span>':'')
+          :(c.f&16?'<span class="hint">kein neues Abbild geschrieben</span>':'<span class="hint">kein Abbild (Reset ohne Coredump)</span>');
+        return '<tr>'+TD(wann+(c.up>=0?'<br><span class="hint">nach '+sdur(c.up)+' Laufzeit</span>':''))+
+          TD(art)+TD(det)+TD(esc(c.build))+'</tr>';
+      }).join('');
+  }catch(e){}
+}
+async function crErase(){
+  if(!confirm('Absturz-Historie loeschen?'))return;
+  await fetch('/api/crashes',{method:'DELETE',headers:cdHeaders()});
+  checkCrashes();
+}
+/* Wer getrennt hat - alles ausser 0 ist die Firmware selbst, kein Funkproblem. */
+const DSRC=['extern','Verbindungsaufbau','Watchdog','Roaming'];
+async function loadDisc(){
+  try{
+    const j=await(await fetch('/api/disconnects')).json();
+    /* Echte Abbrueche (bestehende Verbindung getrennt) und die darauf folgenden
+       gescheiterten Wiederverbindungsversuche getrennt ausweisen - sonst
+       verdecken die Folgefehler die eigentliche Ursache. */
+    $('dlsum').innerHTML='Seit diesem Start (nur extern): <b>'+j.kicks+'</b> echte Abbrueche'+
+      (j.by_reason.length?' - '+j.by_reason.map(x=>'<b>'+x.rs+'</b> ('+x.r+') '+x.n+'&times;').join(', ')+
+        (j.rest?', sonstige '+j.rest+'&times;':''):'')+
+      '<br>dazu <b>'+j.fails+'</b> gescheiterte Wiederverbindungsversuche';
+    const td=TD, leer=e=>e.bssid==='00:00:00:00:00:00';
+    $('dltab').innerHTML=j.log.length
+      ? '<tr>'+['Wann','Art','Grund','Ausloeser','RSSI','AP','Weg'].map(t=>td(t,1)).join('')+'</tr>'+
+        j.log.map(e=>'<tr'+(e.up?'':' style="opacity:.6"')+'>'+
+          td((e.e?ts(e.e)+'<br><span class="hint">':'')+
+             (e.prev?(e.prev===1?'voriger Start':e.prev+' Starts zurueck')+', bei '+sdur(e.t):'vor '+sdur(e.ago))+
+             (e.e?'</span>':''))+
+          td(e.up?'<b class="bad">Abbruch</b>':'Fehlversuch')+
+          td('<b>'+e.rs+'</b> ('+e.r+')')+
+          td(e.src?'<span class="hint">'+(DSRC[e.src]||e.src)+'</span>':'extern')+
+          td(leer(e)?'-':e.rssi+' dBm')+td(leer(e)?'-':e.bssid)+
+          td(e.down<0?'-':sdur(e.down))+'</tr>').join('')
+      : '';
+  }catch(e){$('dlsum').textContent='Konnte /api/disconnects nicht laden'}
+}
 async function tick(){
   try{const s=await(await fetch('/api/status')).json();
     PROV=s.prov;
@@ -508,10 +610,15 @@ async function tick(){
     /* Ist-Wert vom Treiber: zeigt, ob HT40 wirklich ausgehandelt wurde. */
     $('bw').textContent=(s.wifi&&s.bw)?s.bw+' MHz':'-';
     /* Fortschritt der Einmessung. at: 0=untaetig 1=laeuft 2=fertig 3=zu wenig Verkehr */
-    if(s.at===1) $('atmsg').textContent='Einmessung laeuft - Schritt '+(s.at_s+1)+' von '+s.at_n+
-                 ' (etwa '+Math.max(0,Math.round((s.at_n-s.at_s)*19/60*10)/10)+' min uebrig)';
+    /* Die Zahl der Schritte steht vorher nicht fest (erst hoch, dann runter,
+       Abbruch beim ersten Ausreisser) - daher keine Restzeit, nur der Stand. */
+    if(s.at===1) $('atmsg').textContent='Einmessung laeuft - Messung '+(s.at_s+1)+
+                 ', teste '+s.at_k+' Retries (je ca. 19 s, meist 3-6 Messungen)';
     else if(s.at===2){ $('atmsg').textContent='Fertig - gewaehlt: '+s.at_r+' Retries, gespeichert.';
-                       if(ATPREV===1) $('eth_tx_retries').value=s.at_r; }
+                       if(ATPREV===1){ $('eth_tx_retries').value=s.at_r;
+                         /* Hat das Board selbst gespeichert - ist also keine
+                            offene Aenderung. */
+                         if(SNAP){SNAP.eth_tx_retries=String(s.at_r);dirtyCheck()} } }
     else if(s.at===3) $('atmsg').textContent='Abgebrochen: zu wenig Verkehr waehrend der Messung. '+
                       'Kamera streamen lassen und erneut starten.';
     ATPREV=s.at;
@@ -519,7 +626,10 @@ async function tick(){
       ' &middot; Name: <b>'+(s.client_name||'-')+'</b><br>Verbunden mit: <b>'+
       (s.ssid||'-')+'</b> ('+s.bssid+')'+
       ' &middot; Ethernet: <span class="'+(s.eth?'ok':'bad')+'">'+(s.eth?'verbunden':'kein Link')+
-      '</span> &middot; Reconnects: <b>'+s.wifi_disc+'</b>'+
+      '</span> &middot; WLAN-Abbrueche: <b>'+(s.wifi_kicks!==undefined?s.wifi_kicks:s.wifi_disc)+'</b>'+
+      (s.wifi_kicks!==undefined&&s.wifi_disc>s.wifi_kicks?' <span class="hint">(+'+(s.wifi_disc-s.wifi_kicks)+' Fehlversuche/eigene Trennungen)</span>':'')+
+      (s.disc_r ? ' (zuletzt <b>'+s.disc_rs+'</b> vor '+sdur(s.disc_ago)+
+        (s.disc_src?', '+(DSRC[s.disc_src]||s.disc_src):'')+')' : '')+
       (s.wd_probe ? ' &middot; Watchdog-Sonde: <span class="'+(s.wd_probe===1?'ok':'bad')+'">'+
         (s.wd_probe===1?'Gateway erreicht':'Gateway nicht erreicht')+'</span>' : '')+
       (s.wd_reconnects ? ' &middot; Watchdog-WLAN-Reconnects: <b>'+s.wd_reconnects+'</b>' : '')+
@@ -550,6 +660,7 @@ async function load(){
   const c=await(await fetch('/api/config')).json();
   DEF=c.def||null;
   for(const k of CFG) if(c[k]!==undefined)$(k).value=c[k];
+  snapshot();
   /* Puffer: im Formular steht der GESPEICHERTE Wert (sonst ging eine
      Aenderung vor dem Neustart beim naechsten Speichern wieder verloren).
      Weicht der laufende davon ab, steht er als Hinweis darunter. */
@@ -572,17 +683,22 @@ async function scan(){
    rb=false -> nur speichern; TX-Power und Retries greifen dann sofort, das
    Board bleibt online und man kann direkt oben am Zaehler ablesen, ob die
    Aenderung etwas gebracht hat. Genau dafuer ist das Tuning-Panel da. */
-async function save(rb){
-  const f=CFG.concat(['pass1','pass2','pass3','mqtt_pass','admin_pass']);
-  const body=f.map(k=>k+'='+encodeURIComponent($(k).value)).join('&');
-  const tgt=rb?$('msg'):$('tmsg');
+async function save(rb,tgtOverride){
+  const body=CFG.concat(PW).map(k=>k+'='+encodeURIComponent($(k).value)).join('&');
+  const tgt=tgtOverride||(rb?$('msg'):$('tmsg'));
   tgt.textContent='Speichere...';
-  const r=await fetch('/api/config',{method:'POST',body:body,
-    headers:{'Content-Type':'application/x-www-form-urlencoded'}});
-  if(!r.ok){tgt.textContent='Fehler beim Speichern';return}
+  let r;
+  try{r=await fetch('/api/config',{method:'POST',body:body,
+    headers:{'Content-Type':'application/x-www-form-urlencoded'}});}catch(e){}
+  if(!r||!r.ok){tgt.textContent='Fehler beim Speichern';return false}
+  /* Gespeichert = neuer Ausgangsstand. Passwortfelder leeren: leer heisst
+     "unveraendert", ein stehengebliebenes Passwort wuerde sonst als
+     Aenderung gelten und bei jedem Speichern erneut geschickt. */
+  for(const k of PW)$(k).value='';
+  snapshot();
   if(rb){
-    tgt.textContent='Gespeichert. Neustart laeuft...';
-    setTimeout(()=>fetch('/api/reboot',{method:'POST'}),600);
+    tgt.textContent='Gespeichert.';
+    setTimeout(()=>reboot(tgt),600);
   }else if(PROV){
     tgt.textContent='Gespeichert. Im Provisionierungsmodus greift noch nichts davon - '
       +'die Werte werden beim ersten Bridge-Start uebernommen.';
@@ -590,6 +706,7 @@ async function save(rb){
     tgt.textContent='Gespeichert. Sendeleistung, Retries und Watchdog sind sofort aktiv - '
       +'Puffer, Kanalbreite und 802.11b erst nach einem Neustart.';
   }
+  return true;
 }
 let DEF=null;
 /* Fuellt die Zahlenfelder mit den Firmware-Vorgaben. Gespeichert wird erst
@@ -599,6 +716,7 @@ function defaults(){
   for(const k in DEF) if($(k)) $(k).value=DEF[k];
   $('tx_power').value='0';
   $('tmsg').textContent='Standardwerte eingetragen - zum Uebernehmen speichern.';
+  dirtyCheck();   /* per Skript gesetzt - loest kein input-Ereignis aus */
 }
 async function autotune(){
   $('atmsg').textContent='Starte...';
@@ -608,7 +726,128 @@ async function autotune(){
                                :('Nicht gestartet: '+(j.err||'unbekannt'));
   }catch(e){$('atmsg').textContent='Fehler beim Starten'}
 }
-async function reboot(){await fetch('/api/reboot',{method:'POST'});$('msg').textContent='Neustart...';}
+/* Neustart ausloesen und die Seite neu laden, sobald das Board wieder
+   antwortet - sonst steht man vor einer toten Seite und weiss nicht, wann es
+   weitergeht. Erst nach 8 s fragen: vorher antwortet womoeglich noch die
+   alte Instanz. */
+async function reboot(tgt){
+  tgt=tgt||$('msg');
+  document.querySelectorAll('button.hold').forEach(b=>b.disabled=true);
+  try{await fetch('/api/reboot',{method:'POST'})}catch(e){}
+  REBOOTING=true;
+  const t0=Date.now();
+  tgt.textContent='Neustart laeuft - die Seite laedt neu, sobald die Bridge wieder antwortet...';
+  const poll=async()=>{
+    const ctl=new AbortController();const to=setTimeout(()=>ctl.abort(),3000);
+    try{const r=await fetch('/api/status',{cache:'no-store',signal:ctl.signal});
+        if(r.ok){location.reload();return}}catch(e){}
+    clearTimeout(to);
+    tgt.textContent='Neustart laeuft... ('+Math.round((Date.now()-t0)/1000)+' s)';
+    setTimeout(poll,2000);
+  };
+  setTimeout(poll,8000);
+}
+let REBOOTING=false;
+/* Knopf, der erst beim LOSLASSEN ausloest: Druecken faerbt ihn rot
+   ("Loslassen = Neustart"), Loslassen ueber dem Knopf loest aus, Wegziehen
+   oder Scrollen bricht ab. Ein versehentlicher Tipp beim Scrollen startet so
+   nichts neu. Per Tastatur (kein Zeiger) stattdessen mit Rueckfrage. */
+function holdBtn(b,act){
+  const txt=b.textContent;let armed=false;
+  const reset=()=>{armed=false;b.classList.remove('armed');b.textContent=txt};
+  b.addEventListener('pointerdown',e=>{
+    if(e.button||b.disabled)return;
+    armed=true;b.classList.add('armed');b.textContent='Loslassen = Neustart';
+  });
+  b.addEventListener('pointerup',e=>{
+    if(!armed)return;
+    /* Bei Touch bleibt der Zeiger am Knopf "gefangen" - ob der Finger noch
+       darueber ist, sagt erst elementFromPoint. */
+    const over=b.contains(document.elementFromPoint(e.clientX,e.clientY));
+    reset();
+    if(over)act();
+  });
+  b.addEventListener('pointercancel',reset);
+  b.addEventListener('pointerleave',e=>{if(e.pointerType==='mouse')reset()});
+  b.addEventListener('click',e=>{
+    if(e.detail===0&&!b.disabled&&confirm(txt+' - wirklich?'))act();
+  });
+}
+/* ---------------------------------------------------------------------------
+   Ungespeicherte Aenderungen. Ausgangsstand = Formular nach load() bzw. nach
+   dem letzten erfolgreichen Speichern. Passwortfelder: leer = unveraendert.
+   ------------------------------------------------------------------------- */
+const PW=['pass1','pass2','pass3','mqtt_pass','admin_pass'];
+/* Diese Felder greifen ohne Neustart (im Code geprueft: werden bei jeder
+   Verwendung frisch aus g_cfg gelesen bzw. von bridge_apply_live_tuning()
+   uebernommen). Alles andere erst nach einem Neustart. */
+const LIVE=['tx_power','eth_tx_retries','wifi_tx_retries','wd_enable','wd_actions','wd_bad_windows',
+            'roam_enable','roam_check_s','roam_rssi_threshold','roam_margin_db',
+            'ap_idle_reboot_s','telemetry_s','admin_pass'];
+let SNAP=null;
+function snapshot(){SNAP={};for(const k of CFG)SNAP[k]=$(k).value;dirtyCheck()}
+function geaendert(){
+  if(!SNAP)return[];
+  return CFG.filter(k=>$(k).value!==SNAP[k]).concat(PW.filter(k=>$(k).value!==''));
+}
+function dirtyCheck(){
+  const g=geaendert();
+  if(!g.length){
+    /* Nach dem Speichern bleibt die Box stehen, solange sie noch etwas zu
+       sagen hat (Neustart noetig) - sonst verschwindet sie. */
+    if(!DIRTY_NEEDS_RB)$('dirty').hidden=true;
+    return;
+  }
+  DIRTY_NEEDS_RB=false;
+  const rb=g.filter(k=>!LIVE.includes(k)).length;
+  $('dirtyn').textContent=g.length+(g.length===1?' Feld':' Felder')+
+    (rb?', davon '+rb+' erst nach Neustart wirksam':'');
+  $('dirtymsg').textContent='';
+  $('dirtybtns').innerHTML='<button onclick="dirtySave()">Speichern</button>'+
+    '<button class="sec" onclick="dirtyCancel()">Verwerfen</button>';
+  $('dirty').querySelector('b').textContent='Ungespeicherte Aenderungen';
+  $('dirty').hidden=false;
+}
+let DIRTY_NEEDS_RB=false;
+async function dirtySave(){
+  const rb=geaendert().filter(k=>!LIVE.includes(k)).length;
+  if(!await save(false,$('dirtymsg')))return;
+  if(rb&&!PROV){
+    /* Gespeichert, aber ein Teil greift erst nach dem Neustart - den gleich
+       hier anbieten, wieder als Loslassen-Knopf. */
+    DIRTY_NEEDS_RB=true;
+    $('dirty').querySelector('b').textContent='Gespeichert - Neustart noetig';
+    $('dirtyn').textContent='';
+    $('dirtymsg').textContent=rb+(rb===1?' Aenderung greift':' Aenderungen greifen')+' erst nach einem Neustart.';
+    $('dirtybtns').innerHTML='<button class="hold" data-act="reboot">Jetzt neu starten</button>'+
+      '<button class="sec" onclick="DIRTY_NEEDS_RB=false;$(\'dirty\').hidden=true">Spaeter</button>';
+    holdBtn($('dirtybtns').firstChild,()=>reboot($('dirtymsg')));
+    /* save() hat beim neuen Ausgangsstand "keine Aenderung" gesehen und die
+       Box versteckt, bevor DIRTY_NEEDS_RB stand - wieder einblenden. */
+    $('dirty').hidden=false;
+  }else{
+    $('dirtymsg').textContent='Gespeichert.';
+    setTimeout(()=>{if(!geaendert().length)$('dirty').hidden=true},1500);
+  }
+}
+function dirtyCancel(){
+  if(!SNAP)return;
+  for(const k of CFG)$(k).value=SNAP[k];
+  for(const k of PW)$(k).value='';
+  dirtyCheck();
+}
+/* Eingaben ueberall auf der Seite pruefen (delegiert), plus Warnung beim
+   Verlassen der Seite mit offenen Aenderungen. */
+document.addEventListener('input',dirtyCheck);
+document.addEventListener('change',dirtyCheck);
+window.addEventListener('beforeunload',e=>{
+  if(!REBOOTING&&geaendert().length){e.preventDefault();e.returnValue=''}
+});
+/* iOS Safari zeigt :active (Druck-Feedback) nur, wenn irgendein
+   touchstart-Listener existiert - ein leerer genuegt. */
+document.addEventListener('touchstart',()=>{},{passive:true});
+document.querySelectorAll('button.hold').forEach(b=>
+  holdBtn(b,b.dataset.act==='saverb'?()=>save(true):()=>reboot()));
 async function ethReset(){
   $('ethmsg').textContent='Setze Ethernet zurueck...';
   try{
@@ -658,7 +897,7 @@ function upload(){
   $('omsg').textContent='Starte Upload...';
   x.send(f);
 }
-load();tick();checkCoredump();setInterval(tick,2000);
+load();tick();checkCoredump();checkCrashes();setInterval(tick,2000);
 </script></body></html>)HTML";
 
 /* ===========================================================================
@@ -681,29 +920,36 @@ static esp_err_t h_status(httpd_req_t *r) {
   BridgeStats st;
   bridge_get_stats(&st);
 
-  char buf[730];
+  char buf[860];
   snprintf(buf, sizeof(buf),
     "{\"prov\":%d,\"wifi\":%d,\"eth\":%d,\"rssi\":%d,\"ch\":%u,"
     "\"kbps_up\":%lu,\"kbps_down\":%lu,\"pkt_up\":%lu,\"pkt_down\":%lu,"
-    "\"drop_up\":%lu,\"drop_down\":%lu,\"wifi_disc\":%lu,\"wd_probe\":%u,"
+    "\"drop_up\":%lu,\"drop_down\":%lu,\"wifi_disc\":%lu,\"wifi_kicks\":%lu,"
+    "\"disc_r\":%u,\"disc_rs\":\"%s\",\"disc_src\":%u,\"disc_ago\":%lu,\"wd_probe\":%u,"
     "\"wd_reconnects\":%lu,\"wd_eth_resets\":%lu,\"wd_last_reason\":%u,"
     "\"roam_count\":%lu,\"uptime\":%lu,"
     "\"client_mac\":\"%s\",\"client_ip\":\"%s\",\"client_name\":\"%s\","
     "\"ssid\":\"%s\",\"bssid\":\"%s\","
-    "\"at\":%d,\"at_s\":%u,\"at_n\":%u,\"at_r\":%u,"
+    "\"at\":%d,\"at_s\":%u,\"at_n\":%u,\"at_r\":%u,\"at_k\":%u,"
     "\"heap\":%lu,\"heap_min\":%lu,\"heap_dma\":%lu,\"heap_blk\":%lu,"
-    "\"txp\":%d,\"bw\":%u,\"build\":\"" GIT_REV "\"}",
+    "\"txp\":%d,\"bw\":%u,\"time\":%lu,\"build\":\"" GIT_REV "\"}",
     s_provisioning ? 1 : 0, st.wifi_up ? 1 : 0, st.eth_link ? 1 : 0,
     (int)st.rssi, (unsigned)st.channel,
     (unsigned long)st.kbps_eth2wifi, (unsigned long)st.kbps_wifi2eth,
     (unsigned long)st.pkt_eth2wifi,  (unsigned long)st.pkt_wifi2eth,
     (unsigned long)st.drop_eth2wifi, (unsigned long)st.drop_wifi2eth,
-    (unsigned long)st.wifi_disc_count, (unsigned)st.wd_probe,
+    (unsigned long)st.wifi_disc_count, (unsigned long)st.wifi_kicks,
+    /* Letzter Abriss in diesem Boot - disc_r 0 = keiner. Die ganze Historie
+     * (auch ueber Neustarts) liefert /api/disconnects. */
+    (unsigned)st.disc_last_reason,
+    st.disc_last_reason ? bridge_wifi_reason_str(st.disc_last_reason) : "",
+    (unsigned)st.disc_last_src, (unsigned long)st.disc_last_ago_s,
+    (unsigned)st.wd_probe,
     (unsigned long)st.wd_reconnects, (unsigned long)st.wd_eth_resets,
     (unsigned)st.wd_last_reason, (unsigned long)st.roam_count,
     (unsigned long)(millis() / 1000), st.client_mac, st.client_ip, st.client_name, st.ssid, st.bssid,
     (int)bridge_autotune_state(), bridge_autotune_schritt(),
-    bridge_autotune_anzahl(), bridge_autotune_ergebnis(),
+    bridge_autotune_anzahl(), bridge_autotune_ergebnis(), bridge_autotune_kandidat(),
     (unsigned long)esp_get_free_heap_size(),
     /* Tiefststand seit dem Start - zeigt Einbrueche, die zwischen zwei
      * Abfragen liegen und sonst unsichtbar bleiben. */
@@ -719,11 +965,73 @@ static esp_err_t h_status(httpd_req_t *r) {
     (int)bridge_get_tx_power(),
     /* Ebenso die tatsaechlich ausgehandelte Kanalbreite: der ht40-Schalter
      * sagt nur, was wir anbieten. */
-    (unsigned)bridge_get_bandwidth_mhz());
+    (unsigned)bridge_get_bandwidth_mhz(),
+    /* Uhrzeit UTC, 0 = per SNTP noch nicht gestellt. */
+    (unsigned long)crashlog_now());
 
   httpd_resp_set_type(r, "application/json");
   httpd_resp_set_hdr(r, "Cache-Control", "no-store");
   return httpd_resp_send(r, buf, HTTPD_RESP_USE_STRLEN);
+}
+
+/* Disconnect-Protokoll (siehe bridge.h): Haeufigkeit je Grund seit diesem
+ * Boot plus die letzten DISC_LOG_N Abrisse, auch aus frueheren Boots.
+ * "prev" = wie viele Boots zurueck (0 = laufender); "ago" gibt es nur fuer
+ * den laufenden Boot, weil die Laufzeit frueherer Boots unbekannt ist.
+ * "down" = Sekunden bis zur Wiederverbindung, -1 = keine (mehr) erfolgt.
+ * "up" = 1: bestehende Verbindung getrennt (echter Abbruch), 0: nur ein
+ * gescheiterter Verbindungsversuch. "by_reason" zaehlt nur echte Abbrueche,
+ * "kicks"/"fails" sind die Summen seit diesem Boot (nur extern). */
+static esp_err_t h_disconnects(httpd_req_t *r) {
+  /* Heap statt Stack: 48 Eintraege plus Antwortpuffer sprengen die 6 KB
+   * Stack des HTTP-Tasks. */
+  bridge_disc_t *log = (bridge_disc_t *)malloc(sizeof(bridge_disc_t) * DISC_LOG_N);
+  const size_t cap = 10240;
+  char *buf = (char *)malloc(cap);
+  if (!log || !buf) {
+    free(log); free(buf);
+    httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "kein Speicher");
+    return ESP_FAIL;
+  }
+  uint8_t boot = 0;
+  const size_t n = bridge_get_disc_log(log, DISC_LOG_N, &boot);
+  bridge_disc_count_t cnt[12];
+  uint16_t rest = 0;
+  const size_t nc = bridge_get_disc_counts(cnt, 12, &rest);
+  uint32_t kicks = 0, fails = 0;
+  bridge_get_disc_totals(&kicks, &fails);
+
+  const uint32_t now_s = millis() / 1000;
+  size_t o = snprintf(buf, cap, "{\"kicks\":%lu,\"fails\":%lu,\"rest\":%u,\"by_reason\":[",
+                      (unsigned long)kicks, (unsigned long)fails, (unsigned)rest);
+  for (size_t i = 0; i < nc && o < cap; i++) {
+    o += snprintf(buf + o, cap - o, "%s{\"r\":%u,\"rs\":\"%s\",\"n\":%u}", i ? "," : "",
+                  (unsigned)cnt[i].reason, bridge_wifi_reason_str(cnt[i].reason),
+                  (unsigned)cnt[i].n);
+  }
+  if (o < cap) o += snprintf(buf + o, cap - o, "],\"log\":[");
+  for (size_t i = 0; i < n && o < cap; i++) {
+    const bridge_disc_t *e = &log[i];
+    const unsigned prev = (uint8_t)(boot - e->boot);
+    o += snprintf(buf + o, cap - o,
+      "%s{\"prev\":%u,\"t\":%lu,\"e\":%lu,\"ago\":%ld,\"r\":%u,\"rs\":\"%s\",\"src\":%u,\"up\":%u,"
+      "\"rssi\":%d,\"bssid\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"down\":%ld}",
+      i ? "," : "", prev, (unsigned long)e->t_s, (unsigned long)e->epoch,
+      prev ? -1L : (long)(now_s - e->t_s),
+      (unsigned)e->reason, bridge_wifi_reason_str(e->reason), (unsigned)e->src,
+      (unsigned)e->was_up,
+      (int)e->rssi, e->bssid[0], e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5],
+      e->down_s >= 0xFFFE ? -1L : (long)e->down_s);
+  }
+  if (o < cap) o += snprintf(buf + o, cap - o, "]}");
+  if (o >= cap) o = cap - 1;   /* abgeschnitten - bei 48+12 Eintraegen (~200 B je) nicht zu erwarten */
+  free(log);
+
+  httpd_resp_set_type(r, "application/json");
+  httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+  esp_err_t err = httpd_resp_send(r, buf, o);
+  free(buf);
+  return err;
 }
 
 static esp_err_t h_config_get(httpd_req_t *r) {
@@ -1312,6 +1620,71 @@ static esp_err_t h_coredump_delete(httpd_req_t *r) {
 #endif /* CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH && CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF */
 
 /* ===========================================================================
+ * Absturz-Historie (crashlog.h)
+ * ---------------------------------------------------------------------------
+ * Der Coredump oben ist immer nur der LETZTE und traegt keine Uhrzeit. Hier
+ * stehen die letzten CRASHLOG_N unerwarteten Resets mit Zeitpunkt - auch
+ * solche ohne Coredump (Brownout, Hardware-Watchdog). Schutz wie /api/coredump.
+ * "e" = Absturzzeit UTC (0 = unbekannt), "up" = Laufzeit bis dahin (-1 =
+ * unbekannt), "rst" = esp_reset_reason_t (255 = vor Einfuehrung importiert).
+ * ========================================================================= */
+
+static esp_err_t h_crashes_get(httpd_req_t *r) {
+  if (!admin_key_ok(r)) {
+    httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "falscher Schluessel");
+    return ESP_FAIL;
+  }
+  crash_rec_t *recs = (crash_rec_t *)malloc(sizeof(crash_rec_t) * CRASHLOG_N);
+  const size_t cap = 4608;
+  char *buf = (char *)malloc(cap);
+  if (!recs || !buf) {
+    free(recs); free(buf);
+    httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "kein Speicher");
+    return ESP_FAIL;
+  }
+  const size_t n = crashlog_get(recs, CRASHLOG_N);
+
+  size_t o = snprintf(buf, cap, "{\"now\":%lu,\"recs\":[", (unsigned long)crashlog_now());
+  for (size_t i = 0; i < n && o < cap; i++) {
+    const crash_rec_t *c = &recs[i];
+    char task[40], reason[200], build[28];
+    json_escape(c->task, task, sizeof(task));
+    json_escape(c->reason, reason, sizeof(reason));
+    json_escape(c->build, build, sizeof(build));
+    char bt[8 * 13 + 1] = "";
+    size_t b = 0;
+    for (uint8_t k = 0; k < c->bt_n && k < 8; k++)
+      b += snprintf(bt + b, sizeof(bt) - b, "%s\"%08lx\"", k ? "," : "", (unsigned long)c->bt[k]);
+    o += snprintf(buf + o, cap - o,
+      "%s{\"e\":%lu,\"up\":%ld,\"rst\":%u,\"f\":%u,\"build\":\"%s\",\"task\":\"%s\","
+      "\"pc\":\"%08lx\",\"reason\":\"%s\",\"bt\":[%s]}",
+      i ? "," : "", (unsigned long)c->epoch,
+      c->uptime_s == 0xFFFFFFFFu ? -1L : (long)c->uptime_s,
+      (unsigned)c->rst, (unsigned)c->flags, build, task,
+      (unsigned long)c->pc, reason, bt);
+  }
+  if (o < cap) o += snprintf(buf + o, cap - o, "]}");
+  if (o >= cap) o = cap - 1;
+  free(recs);
+
+  httpd_resp_set_type(r, "application/json");
+  httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+  esp_err_t err = httpd_resp_send(r, buf, o);
+  free(buf);
+  return err;
+}
+
+static esp_err_t h_crashes_delete(httpd_req_t *r) {
+  if (!admin_key_ok(r)) {
+    httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "falscher Schluessel");
+    return ESP_FAIL;
+  }
+  crashlog_clear();
+  httpd_resp_set_type(r, "application/json");
+  return httpd_resp_send(r, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+/* ===========================================================================
  * Start
  * ========================================================================= */
 
@@ -1320,7 +1693,8 @@ bool web_start(bool provisioning) {
 
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.stack_size       = 6144;
-  cfg.max_uri_handlers = 12;
+  cfg.max_uri_handlers = 16;    /* aktuell 14 Routen (uris[] unten) - zu knapp
+                                 * bemessen scheitert die Registrierung still */
   cfg.recv_wait_timeout = 20;   /* OTA-Upload braucht Geduld */
   cfg.lru_purge_enable = true;
 
@@ -1349,6 +1723,7 @@ bool web_start(bool provisioning) {
   const httpd_uri_t uris[] = {
     { "/",            HTTP_GET,  h_root,        NULL },
     { "/api/status",  HTTP_GET,  h_status,      NULL },
+    { "/api/disconnects",HTTP_GET,h_disconnects,NULL },
     { "/api/config",  HTTP_GET,  h_config_get,  NULL },
     { "/api/config",  HTTP_POST, h_config_post, NULL },
     { "/api/reboot",  HTTP_POST, h_reboot,      NULL },
@@ -1360,6 +1735,8 @@ bool web_start(bool provisioning) {
     { "/api/coredump",HTTP_GET,    h_coredump_get,    NULL },
     { "/api/coredump",HTTP_DELETE, h_coredump_delete, NULL },
 #endif
+    { "/api/crashes", HTTP_GET,    h_crashes_get,     NULL },
+    { "/api/crashes", HTTP_DELETE, h_crashes_delete,  NULL },
   };
   for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
     httpd_register_uri_handler(s_httpd, &uris[i]);

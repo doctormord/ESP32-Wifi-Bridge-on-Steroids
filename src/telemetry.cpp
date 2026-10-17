@@ -91,6 +91,13 @@ static void announce_all(void) {
   announce_one("wd_reconnects","Watchdog-WLAN-Reconnects",NULL, NULL, "total_increasing", "mdi:wifi-refresh");
   announce_one("wd_eth_resets","Watchdog-Ethernet-Resets",NULL, NULL, "total_increasing", "mdi:lan-connect");
   announce_one("roam_count","Aktive AP-Wechsel",NULL, NULL, "total_increasing", "mdi:wifi-arrow-left-right");
+  /* Alle WLAN-Abbrueche seit Boot und der Grund des letzten - die Historie
+   * mit RSSI/AP/Dauer liefert /api/disconnects. */
+  announce_one("wifi_disc","WLAN-Trennungen gesamt",NULL, NULL, "total_increasing", "mdi:wifi-off");
+  /* Nur echte Abbrueche einer bestehenden Verbindung, ohne die Fehlversuche
+   * danach - das ist die aussagekraeftige Kurve. */
+  announce_one("wifi_kicks","WLAN-Abbrueche",NULL, NULL, "total_increasing", "mdi:wifi-alert");
+  announce_one("disc_reason","Letzter Abbruchgrund",NULL, NULL, NULL, "mdi:wifi-alert");
 
   char topic[160], payload[512];
   snprintf(topic, sizeof(topic),
@@ -159,10 +166,11 @@ void telemetry_tick(void) {
   BridgeStats st;
   bridge_get_stats(&st);
 
-  char payload[500];
+  char payload[600];
   snprintf(payload, sizeof(payload),
     "{\"rssi\":%d,\"ch\":%u,\"kbps_up\":%lu,\"kbps_down\":%lu,"
     "\"pkt_up\":%lu,\"pkt_down\":%lu,\"drop_up\":%lu,\"drop_down\":%lu,"
+    "\"wifi_disc\":%lu,\"wifi_kicks\":%lu,\"disc_reason\":\"%s\","
     "\"wd_reconnects\":%lu,\"wd_eth_resets\":%lu,\"roam_count\":%lu,"
     "\"eth\":%d,\"uptime\":%lu,\"heap\":%lu,\"bssid\":\"%s\","
     "\"client_ip\":\"%s\"}",
@@ -170,6 +178,8 @@ void telemetry_tick(void) {
     (unsigned long)st.kbps_eth2wifi, (unsigned long)st.kbps_wifi2eth,
     (unsigned long)st.pkt_eth2wifi,  (unsigned long)st.pkt_wifi2eth,
     (unsigned long)st.drop_eth2wifi, (unsigned long)st.drop_wifi2eth,
+    (unsigned long)st.wifi_disc_count, (unsigned long)st.wifi_kicks,
+    st.disc_last_reason ? bridge_wifi_reason_str(st.disc_last_reason) : "-",
     (unsigned long)st.wd_reconnects, (unsigned long)st.wd_eth_resets, (unsigned long)st.roam_count,
     st.eth_link ? 1 : 0, (unsigned long)(millis() / 1000),
     (unsigned long)esp_get_free_heap_size(), st.bssid, st.client_ip);

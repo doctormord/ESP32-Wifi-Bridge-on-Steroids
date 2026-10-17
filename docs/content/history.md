@@ -341,3 +341,41 @@ Auf Hardware verifiziert: Build sauber, OTA erfolgreich, Bridge nach Neustart ge
 - **Watchdog-Eskalation waehlbar.** Neue, angehaengte Config-Felder `wd_actions` (Bitmaske: Ethernet-Reset / WLAN-Reconnect / Neustart, 0 = alle wie bisher) und `wd_bad_windows` (schlechte 20-s-Fenster bis zur naechsten Stufe, 0 = 3). Reihenfolge bleibt Ethernet -> WLAN -> Neustart, abgewaehlte Stufen werden uebersprungen; ist die hoechste erlaubte Stufe erreicht, wird wieder von vorn begonnen (z.B. "nur Ethernet-Reset" wiederholt den Ethernet-Reset). Bestehende Konfigurationen verhalten sich unveraendert. Beides wirkt sofort, ohne Neustart.
 - Nur Build- und statische JS-Pruefung (Flash 28,6 %), noch nicht auf Hardware getestet.
 - **Auf Hardware verifiziert (2026-10-11):** OTA von `197d2f6-dirty` auf `f2a3290`, Bridge nach Neustart gesund (`wifi:1 eth:1`, Kamera-Traffic sofort wieder da, `drop_up:0`), kein Rollback. Per API geprueft: `dynamic_tx_buf` 32->28 ohne Neustart gespeichert -> Formularwert 28, `eff` weiter 32; `wd_actions=1&wd_bad_windows=5` uebernommen, `wd_actions=255&wd_bad_windows=99` auf 7/30 begrenzt; laufende Einmessung durch haendisches Speichern abgebrochen (`at` 1->0, Retries blieben 12). Danach alle Werte auf den Ausgangsstand zurueckgesetzt. Nicht getestet: eine komplette Einmessung (der Uebergang "laeuft" -> "fertig" im Portal) und das tatsaechliche Ausloesen einer begrenzten Eskalation.
+
+---
+
+## 2026-10-17 — Absturz "stack overflow in task IDLE0" aufgeklaert, Disconnect-Protokoll und Absturz-Historie gebaut
+
+### Der Absturz
+
+`/api/coredump` meldete `IDLE0`, *"A stack overflow in task IDLE0 has been detected"*, Backtrace als beschaedigt markiert. Aufgeloest gegen das `firmware.elf` des laufenden Builds `f2a3290`: `_frxt_dispatch -> vTaskSwitchContext -> vApplicationStackOverflowHook -> esp_system_abort -> panic_abort` - also nur die Stelle, an der der Canary-Check den Ueberlauf beim Kontextwechsel bemerkte, nicht der Verursacher. Laut Laufzeit war der Neustart am 2026-10-15 gegen 14:23. Mit `wd_actions=1` kein Watchdog-Neustart, also ein echter Absturz.
+
+Ursache: `sdkconfig.defaults` setzte seit dem ersten Commit unbegruendet `CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=768` - das Kconfig-Minimum, der IDF-Standard ist 1536. Der IDLE-Task raeumt geloeschte Tasks auf (u.a. den Task jeder Ping-Session der Watchdog-Gateway-Sonde) und traegt Interrupt-Frames unter WLAN-/EMAC-Last. Jetzt 1536 (kostet ~1,5 KB RAM).
+
+### Disconnect-Protokoll
+
+`wifi_disc` stand bei 1106 in 44 h, aber WARUM, stand nur im seriellen Log. Jetzt landet jeder `WIFI_EVENT_STA_DISCONNECTED` mit Grund, RSSI, BSSID, Uhrzeit und Dauer bis zur Wiederverbindung in einem 16er-Ringpuffer im RTC-Speicher (ueberlebt Neustarts und Abstuerze). Eigene Trennungen (Verbindungsaufbau, Watchdog, Roaming) sind markiert. `/api/disconnects`, letzter Grund in `/api/status` und Portal, `wifi_disc`/`disc_reason` per MQTT. In 2 + 25 min Beobachtung nach dem Update trat kein einziger Disconnect auf - die 1106 kamen offenbar schubweise. Die Aufzeichnung eines ECHTEN Disconnects ist daher noch nicht auf Hardware gesehen.
+
+### Absturz-Historie mit Zeitstempel
+
+Die Coredump-Partition fasst nur ein Abbild ohne Uhrzeit. Jetzt (`crashlog.cpp`): SNTP (Gateway, ersatzweise `pool.ntp.org`), ein sekuendlicher Herzschlag im RTC-Speicher (Uhrzeit, Laufzeit, Build), und beim ersten Boot nach Panic/Interrupt-WDT/Task-WDT/RTC-WDT/Brownout ein Eintrag im NVS (die letzten 8) mit Zeitpunkt, Art, Task, PC, Backtrace, Panic-Grund, Build und ELF-SHA. Ein unveraendertes altes Abbild (gleiche CRC) wird einem neuen Panic nicht zugeschrieben. Ein beim ersten Start schon vorhandener Coredump wird einmalig als "importiert" uebernommen. `/api/crashes` (GET/DELETE, Admin-Key wie `/api/coredump`), Tabelle im Portal.
+
+**Auf Hardware verifiziert:** OTA `f2a3290 -> 2d64f9e -> 1f9bdec -> 5433c8e`, jeweils gesund, kein Rollback. (Der erste Upload brach nach 246 KB ab - `wifi_disc` stieg dabei um 1 -, der zweite Versuch lief durch.) SNTP stellte die Uhr innerhalb einer Minute korrekt, der IDLE0-Absturz vom 15.10. steht als importierter Eintrag in `/api/crashes`. **Nicht getestet:** ein neuer Absturz mit Zeitstempel (kein Weg, ihn gefahrlos auszuloesen) und ein echter Disconnect im Protokoll.
+
+### Erste echte Disconnects im Protokoll: der AP wirft raus
+
+Kurz darauf 34 Eintraege in 14 min, in zwei Schueben (11:25:40-11:26:08 und 11:27:15-11:27:32 Ortszeit) mit je 15-25 s Ausfall. Schub 2 begann mit einer Trennung der bestehenden Verbindung durch den AP mit `ASSOC_TOOMANY` (Grund 5, "AP kann nicht alle Stationen bedienen"), danach im Wechsel `INACTIVITY`/`AUTH_EXPIRE` (lokale Auth-/Assoc-Timeouts - der AP antwortete nicht) und `CONNECTION_FAIL`, zuletzt `NO_AP_FOUND` (keine Probe-Response mehr), dann nach 2-3 s wieder verbunden. RSSI durchgehend -61 bis -66 dBm, kein `BEACON_TIMEOUT` - kein Funkproblem. Nur ein AP sendet `BMI_2G_STREAM` (Zyxel NWA90AX, mehrere SSIDs auf demselben Geraet). Das Muster passt zu Lastverteilung/Client-Steering am AP ("Disassociate station when overloaded" bzw. Smart Steering): Rauswurf, dann Auth-/Probe-Anfragen kurz ignorieren. Die 1106 Disconnects in 44 h vom Anfang des Tages sind damit ~70-80 solcher Schuebe.
+
+Daraus folgte eine Schaerfung des Protokolls: Jeder Eintrag haelt fest, ob eine Verbindung **bestand** (echter Abbruch) oder nur ein **Verbindungsversuch scheiterte**. Die Grund-Statistik, der neue Zaehler `wifi_kicks` (Status, Portal, MQTT/HA) und der "letzte Grund" beziehen sich nur noch auf echte Abbrueche; Fehlversuche werden getrennt summiert, im Portal ausgegraut. Die Ausfalldauer wird beim Wiederverbinden bis zum ausloesenden Abbruch zurueck eingetragen. Ringpuffer 16 -> 48, weil bei 16 der Ausloeser von Schub 1 bereits verdraengt war. Auf Hardware: OTA auf `e0c4727`, neue Felder vorhanden, Bridge gesund. Die Unterscheidung selbst ist mangels Abbruch seit dem Update noch nicht an echten Daten gesehen.
+
+### Ursache am AP gefunden: Smart Steering + gesenkte Sendeleistung
+
+Nebula (Zyxel NWA90AX): Load Balancing aus, aber **Smart Steering an, 2,4 GHz "Disassociate Station Threshold" -75 dBm**. Nebula sah die Bridge mit -77 dBm, die Bridge den AP mit -62 bis -67 dBm. Die Asymmetrie ist die Sendeleistung: AP ~20 dBm, Bridge seit dem 08-xx-Tuning bewusst ~10 dBm (Waerme) - der AP hoert sie also ~10 dB leiser und lag damit dauerhaft unter der Schwelle. Es gibt nur diesen einen AP, Steering kann also nirgendwohin lenken und trennt nur. Die damalige Messung "kein Verlust bei 10 dBm" stimmte - sie zaehlte aber nur Paketverluste bei bestehender Verbindung, keine Rauswuerfe. Massnahme (Christian): Schwelle auf -80 dBm, Sendeleistung auf 14,5 dBm (`txp` 58).
+
+Erste echte Daten der neuen Unterscheidung: das Uebernehmen der Nebula-Konfiguration startete den Funk neu - 1 echter Abbruch (`INACTIVITY`, 11:46:32), danach 21 `NO_AP_FOUND`-Fehlversuche, 54 s Gesamtausfall. Korrekt als **ein** Abbruch gezaehlt.
+
+### Einmessung der Retries: brach den eigenen Stream, neu gebaut
+
+Die alte Einmessung lief stur aufsteigend ab 1 Retry. Auf Hardware brach bei 1-2 Retries der TCP-Stream der Kamera zusammen (<400 statt ~3500 Pakete je 15 s), die Bridge war ~3,5 min kaum erreichbar, Heap-Tiefststand 32 -> 15 KB - und die Einmessung brach mit "zu wenig Verkehr" ab, den sie selbst verursacht hatte (Wert korrekt auf 12 zurueckgesetzt).
+
+Neu (`380bf01`): Start beim aktuellen Wert (liefert die Referenz-Paketrate); verfehlt der das Ziel 0,10 %, aufwaerts solange jeder Schritt deutlich besser wird; dann abwaerts, solange der Verlust im Rahmen bleibt, Stopp beim ersten Ausreisser. Einbruch-Waechter: faellt die Paketrate in einem Schritt unter 30 % der Referenz, wird er nach 6 s abgebrochen und der Startwert wiederhergestellt. Kandidaten 2..20 (1 entfaellt). Entscheidungslogik vorher offline an fuenf Verlustprofilen durchgespielt. Auf Hardware: Lauf 12 -> 10 -> 8 -> 6 -> 4 (Verlust ~0 / 0 / ~0,03 / ~0,1 / ~1,7 %), Stopp bei 4, **gewaehlt 6**, Stream und Erreichbarkeit durchgehend intakt, Heap-Tiefststand stabil bei 34 KB. Der Einbruch-Waechter selbst hat dabei nicht ausgeloest, ist also noch nicht an echten Daten gesehen.

@@ -14,6 +14,7 @@
 #include "driver/gpio.h"
 #include "config.h"
 #include "telemetry.h"
+#include "crashlog.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -190,6 +191,187 @@ static uint32_t s_kbps_e2w = 0, s_kbps_w2e = 0;
 static volatile uint32_t s_wifi_disc_count = 0;
 
 static char s_bssid_str[18] = "-";
+
+/* ---------------------------------------------------------------------------
+ * Disconnect-Protokoll (siehe bridge.h)
+ *
+ * Ringpuffer im RTC-Speicher, damit er Neustarts ueberlebt. Nach dem
+ * Einschalten steht dort Zufall - die Magic plus Plausibilitaetspruefung
+ * von Kopf/Fuellstand verwirft das. Geschrieben wird aus dem Event-Task,
+ * gelesen aus dem HTTP- und dem Haupttask, daher der Spinlock.
+ * ------------------------------------------------------------------------ */
+#define DISC_LOG_MAGIC 0x44495333u   /* "DIS3" - bei Layoutaenderung hochzaehlen */
+RTC_NOINIT_ATTR static uint32_t      s_dl_magic;
+RTC_NOINIT_ATTR static uint8_t       s_dl_boot;
+RTC_NOINIT_ATTR static uint8_t       s_dl_head;   /* naechster Schreibplatz */
+RTC_NOINIT_ATTR static uint8_t       s_dl_used;
+RTC_NOINIT_ATTR static bridge_disc_t s_dl[DISC_LOG_N];
+static bool s_dl_ready = false;      /* pro Boot einmal pruefen/hochzaehlen */
+static portMUX_TYPE s_dl_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* Haeufigkeit je Grund, nur dieser Boot. 12 Plaetze reichen praktisch
+ * immer - es treten erfahrungsgemaess nur eine Handvoll Gruende auf. */
+#define DISC_REASON_SLOTS 12
+static bridge_disc_count_t s_dr[DISC_REASON_SLOTS];
+static uint16_t s_dr_rest = 0;
+static uint32_t s_kicks = 0, s_fails = 0;   /* extern, seit Boot */
+
+/* Vor einem eigenen esp_wifi_disconnect() gesetzt, damit der folgende
+ * Disconnect-Event nicht als Funkproblem zaehlt. Mit Zeitstempel: kommt
+ * zu einem eigenen Trennen kein Event (war gar nicht verbunden), darf die
+ * Markierung nicht an einem spaeteren, echten Abriss haengen bleiben. */
+static volatile uint8_t  s_disc_src = DISC_SRC_EXTERN;
+static volatile uint32_t s_disc_src_ms = 0;
+
+static void disc_mark_own(uint8_t src) {
+  s_disc_src_ms = millis();
+  s_disc_src    = src;
+}
+
+/* Nur unter s_dl_mux aufrufen. */
+static void dl_ensure_locked(void) {
+  if (s_dl_ready) return;
+  s_dl_ready = true;
+  if (s_dl_magic != DISC_LOG_MAGIC || s_dl_head >= DISC_LOG_N || s_dl_used > DISC_LOG_N) {
+    memset(s_dl, 0, sizeof(s_dl));
+    s_dl_head = 0; s_dl_used = 0; s_dl_boot = 0;
+    s_dl_magic = DISC_LOG_MAGIC;
+  } else {
+    s_dl_boot++;
+  }
+}
+
+/* was_up: war die STA zu diesem Zeitpunkt verbunden? Der Treiber meldet
+ * einen gescheiterten Verbindungsversuch mit demselben Event wie das Ende
+ * einer bestehenden Verbindung - nach einem Rauswurf durch den AP folgen
+ * oft ein Dutzend solcher Fehlversuche, die die eigentliche Ursache in der
+ * Statistik verdecken wuerden. */
+static void disc_log_add(const wifi_event_sta_disconnected_t *d, bool was_up) {
+  uint8_t src = DISC_SRC_EXTERN;
+  if (s_disc_src != DISC_SRC_EXTERN && millis() - s_disc_src_ms < 3000) src = s_disc_src;
+  s_disc_src = DISC_SRC_EXTERN;
+
+  const uint8_t reason = d ? d->reason : 0;
+  const uint32_t epoch = crashlog_now();
+  portENTER_CRITICAL(&s_dl_mux);
+  dl_ensure_locked();
+  bridge_disc_t *e = &s_dl[s_dl_head];
+  memset(e, 0, sizeof(*e));
+  e->t_s    = millis() / 1000;
+  e->epoch  = epoch;
+  e->down_s = 0xFFFF;
+  e->reason = reason;
+  e->rssi   = d ? d->rssi : 0;
+  if (d) memcpy(e->bssid, d->bssid, 6);
+  e->boot   = s_dl_boot;
+  e->src    = src;
+  e->was_up = was_up ? 1 : 0;
+  s_dl_head = (uint8_t)((s_dl_head + 1) % DISC_LOG_N);
+  if (s_dl_used < DISC_LOG_N) s_dl_used++;
+
+  if (src == DISC_SRC_EXTERN && !was_up) s_fails++;
+  if (src == DISC_SRC_EXTERN && was_up) {
+    s_kicks++;
+    size_t k = 0;
+    while (k < DISC_REASON_SLOTS && s_dr[k].n && s_dr[k].reason != reason) k++;
+    if (k == DISC_REASON_SLOTS) {
+      if (s_dr_rest < 0xFFFF) s_dr_rest++;
+    } else {
+      s_dr[k].reason = reason;
+      if (s_dr[k].n < 0xFFFF) s_dr[k].n++;
+    }
+  }
+  portEXIT_CRITICAL(&s_dl_mux);
+}
+
+/* Beim Wiederverbinden die Ausfalldauer nachtragen - fuer alle noch offenen
+ * Eintraege dieses Boots bis einschliesslich des ausloesenden Abbruchs. So
+ * steht beim Rauswurf die GESAMTE Ausfallzeit, nicht nur die nach dem
+ * letzten Fehlversuch. */
+static void disc_log_reconnected(void) {
+  portENTER_CRITICAL(&s_dl_mux);
+  dl_ensure_locked();
+  const uint32_t now_s = millis() / 1000;
+  for (size_t i = 0; i < s_dl_used; i++) {
+    bridge_disc_t *e = &s_dl[(s_dl_head + DISC_LOG_N - 1 - i) % DISC_LOG_N];
+    if (e->boot != s_dl_boot || e->down_s != 0xFFFF) break;
+    const uint32_t d = now_s - e->t_s;
+    e->down_s = d < 0xFFFE ? (uint16_t)d : 0xFFFE;
+    if (e->was_up) break;
+  }
+  portEXIT_CRITICAL(&s_dl_mux);
+}
+
+void bridge_get_disc_totals(uint32_t *kicks, uint32_t *fails) {
+  portENTER_CRITICAL(&s_dl_mux);
+  if (kicks) *kicks = s_kicks;
+  if (fails) *fails = s_fails;
+  portEXIT_CRITICAL(&s_dl_mux);
+}
+
+size_t bridge_get_disc_log(bridge_disc_t *out, size_t max, uint8_t *boot_now) {
+  portENTER_CRITICAL(&s_dl_mux);
+  dl_ensure_locked();
+  size_t n = s_dl_used < max ? s_dl_used : max;
+  for (size_t i = 0; i < n; i++)
+    out[i] = s_dl[(s_dl_head + DISC_LOG_N - 1 - i) % DISC_LOG_N];
+  if (boot_now) *boot_now = s_dl_boot;
+  portEXIT_CRITICAL(&s_dl_mux);
+  return n;
+}
+
+size_t bridge_get_disc_counts(bridge_disc_count_t *out, size_t max, uint16_t *rest) {
+  bridge_disc_count_t tmp[DISC_REASON_SLOTS];
+  portENTER_CRITICAL(&s_dl_mux);
+  memcpy(tmp, s_dr, sizeof(tmp));
+  if (rest) *rest = s_dr_rest;
+  portEXIT_CRITICAL(&s_dl_mux);
+
+  size_t n = 0;
+  while (n < DISC_REASON_SLOTS && tmp[n].n) n++;
+  /* Absteigend nach Haeufigkeit - bei 12 Eintraegen reicht Insertion Sort. */
+  for (size_t i = 1; i < n; i++)
+    for (size_t j = i; j > 0 && tmp[j].n > tmp[j - 1].n; j--) {
+      bridge_disc_count_t t = tmp[j]; tmp[j] = tmp[j - 1]; tmp[j - 1] = t;
+    }
+  if (n > max) n = max;
+  memcpy(out, tmp, n * sizeof(*out));
+  return n;
+}
+
+const char *bridge_wifi_reason_str(uint8_t r) {
+  switch (r) {
+    case WIFI_REASON_UNSPECIFIED:                   return "UNSPECIFIED";
+    case WIFI_REASON_AUTH_EXPIRE:                   return "AUTH_EXPIRE";
+    case WIFI_REASON_AUTH_LEAVE:                    return "AUTH_LEAVE";
+    case WIFI_REASON_DISASSOC_DUE_TO_INACTIVITY:    return "INACTIVITY";
+    case WIFI_REASON_ASSOC_TOOMANY:                 return "ASSOC_TOOMANY";
+    case WIFI_REASON_CLASS2_FRAME_FROM_NONAUTH_STA: return "CLASS2_FRAME";
+    case WIFI_REASON_CLASS3_FRAME_FROM_NONASSOC_STA:return "CLASS3_FRAME";
+    case WIFI_REASON_ASSOC_LEAVE:                   return "ASSOC_LEAVE";
+    case WIFI_REASON_ASSOC_NOT_AUTHED:              return "ASSOC_NOT_AUTHED";
+    case WIFI_REASON_BSS_TRANSITION_DISASSOC:       return "BSS_TRANSITION";
+    case WIFI_REASON_MIC_FAILURE:                   return "MIC_FAILURE";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:        return "4WAY_HANDSHAKE_TIMEOUT";
+    case WIFI_REASON_GROUP_KEY_UPDATE_TIMEOUT:      return "GROUP_KEY_TIMEOUT";
+    case WIFI_REASON_802_1X_AUTH_FAILED:            return "802_1X_AUTH_FAILED";
+    case WIFI_REASON_MISSING_ACKS:                  return "MISSING_ACKS";
+    case WIFI_REASON_STA_LEAVING:                   return "STA_LEAVING";
+    case WIFI_REASON_TIMEOUT:                       return "TIMEOUT";
+    case WIFI_REASON_PEER_INITIATED:                return "PEER_INITIATED";
+    case WIFI_REASON_AP_INITIATED:                  return "AP_INITIATED";
+    case WIFI_REASON_BEACON_TIMEOUT:                return "BEACON_TIMEOUT";
+    case WIFI_REASON_NO_AP_FOUND:                   return "NO_AP_FOUND";
+    case WIFI_REASON_AUTH_FAIL:                     return "AUTH_FAIL";
+    case WIFI_REASON_ASSOC_FAIL:                    return "ASSOC_FAIL";
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:             return "HANDSHAKE_TIMEOUT";
+    case WIFI_REASON_CONNECTION_FAIL:               return "CONNECTION_FAIL";
+    case WIFI_REASON_AP_TSF_RESET:                  return "AP_TSF_RESET";
+    case WIFI_REASON_ROAMING:                       return "ROAMING";
+    case WIFI_REASON_SA_QUERY_TIMEOUT:              return "SA_QUERY_TIMEOUT";
+    default:                                        return "OTHER";
+  }
+}
 
 /* Sendeleistung, die die PHY nach dem Start von sich aus einstellt.
  * Wird beim ersten bridge_apply_live_tuning() gemerkt, damit ein
@@ -444,6 +626,7 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
     wifi_event_sta_connected_t *e = (wifi_event_sta_connected_t *)data;
     if (e) mac2str(e->bssid, s_bssid_str);
     printf("[WIFI] Verbunden (AP %s)\n", s_bssid_str);
+    disc_log_reconnected();
 
     /* WICHTIG: erst hier registrieren. esp_netif hat sich beim Attach
      * bereits eingetragen - dieser Aufruf ueberschreibt das gezielt, damit
@@ -454,11 +637,14 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
     }
 
   } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
+    const bool was_up = s_wifi_up;   /* vor dem Zuruecksetzen merken */
     s_wifi_up = false;
     strcpy(s_bssid_str, "-");
     s_wifi_disc_count = s_wifi_disc_count + 1;
     wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
-    printf("[WIFI] Getrennt (reason %d)\n", d ? d->reason : -1);
+    printf("[WIFI] Getrennt (reason %d %s, %d dBm)\n", d ? d->reason : -1,
+           bridge_wifi_reason_str(d ? d->reason : 0), d ? d->rssi : 0);
+    disc_log_add(d, was_up);
     if (s_active) esp_wifi_connect();     /* im Betrieb dauerhaft nachfassen */
   }
 }
@@ -906,6 +1092,7 @@ bool bridge_wifi_start(void) {
       uint32_t t0 = millis();
       while (!s_wifi_up && (millis() - t0) < connect_timeout_ms) delay(100);
       if (s_wifi_up) break;
+      disc_mark_own(DISC_SRC_CONNECT);
       esp_wifi_disconnect();
     }
     if (s_wifi_up) {
@@ -922,6 +1109,7 @@ bool bridge_wifi_start(void) {
 
     printf("[WIFI] '%s' fehlgeschlagen nach %d Versuchen\n",
            nets[i].ssid, connect_retries);
+    disc_mark_own(DISC_SRC_CONNECT);
     esp_wifi_disconnect();
     esp_wifi_stop();
   }
@@ -1079,33 +1267,82 @@ void bridge_set_paused(bool paused) {
  * Autotune der Sendewiederholungen
  * ========================================================================= */
 
-static const uint8_t AT_KANDIDATEN[] = { 1, 2, 4, 6, 8, 12, 16, 20 };
+/*
+ * Ablauf (seit 2026-10-17, vorher stur aufsteigend ab 1):
+ *
+ *   1. Den AKTUELLEN Wert messen - liefert zugleich die Referenz-Paketrate
+ *      des Streams.
+ *   2. Verfehlt er das Ziel: AUFWAERTS, solange jeder Schritt deutlich
+ *      weniger Verlust bringt.
+ *   3. ABWAERTS ab dem Startwert, solange der Verlust im erlaubten Rahmen
+ *      bleibt; beim ersten Ausreisser Schluss - kleiner wird es nur schlechter.
+ *
+ * Warum nicht mehr von unten: bei 1-2 Retries brach der TCP-Stream der Kamera
+ * zusammen (2026-10-17 auf Hardware: <400 statt ~3500 Pakete je 15 s, Bridge
+ * ~3,5 min kaum erreichbar, Heap-Tiefststand 32 -> 15 KB) - die Einmessung
+ * scheiterte an "zu wenig Verkehr", den sie selbst verursacht hatte. Von oben
+ * kommend erreicht sie so einen Wert gar nicht erst, und der Einbruch-
+ * Waechter bricht einen Schritt nach wenigen Sekunden ab, statt ihn 19 s
+ * durchzuziehen.
+ */
+static const uint8_t AT_KANDIDATEN[] = { 2, 3, 4, 6, 8, 10, 12, 14, 16, 20 };
 #define AT_N            (sizeof(AT_KANDIDATEN) / sizeof(AT_KANDIDATEN[0]))
 #define AT_EINSCHWINGEN 4000u    /* Puffer leerlaufen lassen              */
 #define AT_MESSDAUER   15000u    /* danach so lange zaehlen               */
 #define AT_MIN_PAKETE    400u    /* darunter ist die Messung wertlos      */
-#define AT_ZIEL_PROMILLE  10u    /* 0,10 % - erreicht? dann reicht es     */
+#define AT_ZIEL_PROMILLE  10u    /* Hundertstelprozent: 0,10 % - reicht   */
+#define AT_EINBRUCH_MS  6000u    /* ab hier im Schritt auf Einbruch pruefen */
+#define AT_EINBRUCH_PROZ  30u    /* < 30 % der Referenzrate = Einbruch    */
+#define AT_VERLUST_EINBRUCH 0xFFFEu  /* Markierung in s_at_verlust        */
+
+typedef enum { AT_PH_START = 0, AT_PH_AUF, AT_PH_AB } at_phase_t;
 
 static autotune_state_t s_at_state = AT_IDLE;
 static uint8_t   s_at_idx, s_at_ergebnis;
-static uint32_t  s_at_t0, s_at_pkt0, s_at_drop0;
+static uint8_t   s_at_start_idx, s_at_schritte;
+static at_phase_t s_at_phase;
+static uint32_t  s_at_t0, s_at_pkt0, s_at_drop0, s_at_pkt_schritt0;
+static uint32_t  s_at_ref_pps;           /* Pakete/s bei der Startmessung */
 static bool      s_at_messend;
 static uint16_t  s_at_verlust[AT_N];
 static uint8_t   s_at_alt;               /* Wert vor dem Lauf, fuer Abbruch */
 
+/* Index des Kandidaten, der dem aktuellen Wert am naechsten liegt. */
+static uint8_t at_naechster_idx(uint8_t wert) {
+  uint8_t best = 0;
+  for (uint8_t i = 1; i < AT_N; i++) {
+    const int di = abs((int)AT_KANDIDATEN[i] - (int)wert);
+    const int db = abs((int)AT_KANDIDATEN[best] - (int)wert);
+    if (di < db || (di == db && AT_KANDIDATEN[i] > AT_KANDIDATEN[best])) best = i;
+  }
+  return best;
+}
+
+static void at_schritt_starten(uint8_t idx) {
+  s_at_idx = idx;
+  s_eth_tx_retries = AT_KANDIDATEN[idx];
+  s_at_messend = false;
+  s_at_t0 = millis();
+  s_at_pkt_schritt0 = s_pkt_e2w;
+}
+
 bool bridge_autotune_start(void) {
   if (!s_active || s_at_state == AT_LAEUFT) return false;
-  s_at_alt   = s_eth_tx_retries;
-  s_at_idx   = 0;
-  s_at_state = AT_LAEUFT;
-  s_at_messend = false;
-  s_at_t0    = millis();
+  s_at_alt       = s_eth_tx_retries;
+  s_at_start_idx = at_naechster_idx(s_at_alt);
+  s_at_phase     = AT_PH_START;
+  s_at_schritte  = 0;
+  s_at_ref_pps   = 0;
+  s_at_state     = AT_LAEUFT;
   for (size_t i = 0; i < AT_N; i++) s_at_verlust[i] = 0xFFFF;
-  s_eth_tx_retries = AT_KANDIDATEN[0];
-  printf("[AUTO] Start - %u Kandidaten, je %u s\n",
-         (unsigned)AT_N, (unsigned)((AT_EINSCHWINGEN + AT_MESSDAUER) / 1000));
+  at_schritt_starten(s_at_start_idx);
+  printf("[AUTO] Start bei %u Retries (aktuell %u), je Schritt %u s\n",
+         (unsigned)AT_KANDIDATEN[s_at_start_idx], (unsigned)s_at_alt,
+         (unsigned)((AT_EINSCHWINGEN + AT_MESSDAUER) / 1000));
   return true;
 }
+
+uint8_t bridge_autotune_kandidat(void) { return AT_KANDIDATEN[s_at_idx]; }
 
 void bridge_autotune_reset(void) {
   if (s_at_state == AT_LAEUFT)
@@ -1114,17 +1351,126 @@ void bridge_autotune_reset(void) {
 }
 
 autotune_state_t bridge_autotune_state(void)  { return s_at_state; }
-uint8_t bridge_autotune_schritt(void)         { return s_at_idx; }
+uint8_t bridge_autotune_schritt(void)         { return s_at_schritte; }
 uint8_t bridge_autotune_anzahl(void)          { return AT_N; }
 uint8_t bridge_autotune_ergebnis(void)        { return s_at_ergebnis; }
 void bridge_autotune_werte(uint8_t *k, uint16_t *v) {
   for (size_t i = 0; i < AT_N; i++) { k[i] = AT_KANDIDATEN[i]; v[i] = s_at_verlust[i]; }
 }
 
-/* Wird aus bridge_tick() gerufen, also etwa im Sekundentakt. */
+/* Geringster bisher gemessener Verlust (ohne Einbrueche), 0xFFFF = keiner. */
+static uint16_t at_bester_verlust(void) {
+  uint16_t b = 0xFFFF;
+  for (size_t i = 0; i < AT_N; i++)
+    if (s_at_verlust[i] < AT_VERLUST_EINBRUCH && s_at_verlust[i] < b) b = s_at_verlust[i];
+  return b;
+}
+
+/* Was noch als "gut genug" gilt: das Ziel, oder - wenn selbst der beste Wert
+ * es verfehlt - knapp ueber dem besten (Messrauschen). Ohne diesen Puffer
+ * wuerde ein zufaellig minimal besserer hoher Wert stets gewinnen, obwohl er
+ * den Ethernet-Empfang laenger blockiert. */
+static uint16_t at_erlaubt(void) {
+  const uint16_t b = at_bester_verlust();
+  if (b == 0xFFFF) return AT_ZIEL_PROMILLE;
+  const uint32_t puffer = b / 4 > 3 ? b / 4 : 3;
+  const uint32_t e = (uint32_t)b + puffer;
+  return (uint16_t)(e > AT_ZIEL_PROMILLE ? e : AT_ZIEL_PROMILLE);
+}
+
+static void at_abschliessen(void) {
+  /* Kleinster gemessener Kandidat im erlaubten Rahmen. */
+  const uint16_t erlaubt = at_erlaubt();
+  uint8_t gewaehlt = 0;
+  for (size_t i = 0; i < AT_N; i++)
+    if (s_at_verlust[i] <= erlaubt) { gewaehlt = AT_KANDIDATEN[i]; break; }
+  if (!gewaehlt) {                    /* nichts Brauchbares gemessen */
+    s_eth_tx_retries = s_at_alt;
+    s_at_state = AT_ZU_WENIG_VERKEHR;
+    printf("[AUTO] Keine gueltige Messung - bleibe bei %u\n", (unsigned)s_at_alt);
+    return;
+  }
+  s_at_ergebnis = gewaehlt;
+  s_eth_tx_retries = gewaehlt;
+  g_cfg.eth_tx_retries = gewaehlt;
+  cfg_save();
+  s_at_state = AT_FERTIG;
+  printf("[AUTO] Fertig nach %u Messungen - gewaehlt: %u (gespeichert)\n",
+         (unsigned)s_at_schritte, (unsigned)gewaehlt);
+}
+
+/* Naechster Schritt nach einer Messung (oder einem Einbruch) am Index
+ * s_at_idx. Startet entweder den naechsten Schritt oder schliesst ab. */
+static void at_weiter(bool einbruch) {
+  const uint16_t v = s_at_verlust[s_at_idx];
+  const uint16_t erlaubt = at_erlaubt();
+
+  if (s_at_phase == AT_PH_START) {
+    if (!einbruch && v > AT_ZIEL_PROMILLE && s_at_idx + 1 < (int)AT_N) {
+      s_at_phase = AT_PH_AUF;
+      at_schritt_starten(s_at_idx + 1);
+      return;
+    }
+    s_at_phase = AT_PH_AB;
+  } else if (s_at_phase == AT_PH_AUF) {
+    /* Weiter hoch nur, solange es spuerbar besser wird (>= 25 % und mind.
+     * 0,02 Prozentpunkte) und das Ziel noch verfehlt ist. */
+    const uint16_t vorher = s_at_verlust[s_at_idx - 1];
+    const bool besser = !einbruch && vorher < AT_VERLUST_EINBRUCH &&
+                        v + 2 <= vorher && (uint32_t)v * 4 <= (uint32_t)vorher * 3;
+    if (besser && v > AT_ZIEL_PROMILLE && s_at_idx + 1 < (int)AT_N) {
+      at_schritt_starten(s_at_idx + 1);
+      return;
+    }
+    /* Abwaerts lohnt nur, wenn schon der Startwert im Rahmen lag - sonst
+     * werden kleinere Werte nur noch schlechter. */
+    if (s_at_verlust[s_at_start_idx] > erlaubt || s_at_start_idx == 0) {
+      at_abschliessen();
+      return;
+    }
+    s_eth_tx_retries = AT_KANDIDATEN[s_at_start_idx];
+    s_at_phase = AT_PH_AB;
+    at_schritt_starten(s_at_start_idx - 1);
+    return;
+  } else {  /* AT_PH_AB */
+    if (einbruch || v > erlaubt) {
+      at_abschliessen();
+      return;
+    }
+  }
+
+  /* AT_PH_AB: weiter nach unten, falls noch Platz. Beim Wechsel aus der
+   * Startphase geht es direkt unter dem Startwert los. */
+  if (s_at_idx == 0) { at_abschliessen(); return; }
+  if (s_at_phase == AT_PH_AB && s_at_verlust[s_at_idx] <= erlaubt) {
+    at_schritt_starten(s_at_idx - 1);
+    return;
+  }
+  at_abschliessen();
+}
+
+/* Wird aus bridge_tick() gerufen, also mehrmals pro Sekunde. */
 static void autotune_tick(void) {
   if (s_at_state != AT_LAEUFT) return;
   const uint32_t seit = millis() - s_at_t0;
+
+  /* Einbruch-Waechter: ab der Startmessung ist die normale Paketrate
+   * bekannt. Faellt sie in einem Schritt weit darunter, bricht gerade der
+   * Stream zusammen - sofort zurueck auf den sicheren Startwert, nicht erst
+   * nach 19 s. */
+  if (s_at_ref_pps && seit >= AT_EINBRUCH_MS) {
+    const uint32_t pkt = s_pkt_e2w - s_at_pkt_schritt0;
+    const uint32_t soll = (uint32_t)((uint64_t)s_at_ref_pps * seit / 1000);
+    if ((uint64_t)pkt * 100 < (uint64_t)soll * AT_EINBRUCH_PROZ) {
+      printf("[AUTO] Retries %2u -> Einbruch (%u statt ~%u Pakete) - Abbruch des Schritts\n",
+             (unsigned)AT_KANDIDATEN[s_at_idx], (unsigned)pkt, (unsigned)soll);
+      s_at_verlust[s_at_idx] = AT_VERLUST_EINBRUCH;
+      s_at_schritte++;
+      s_eth_tx_retries = AT_KANDIDATEN[s_at_start_idx];
+      at_weiter(true);
+      return;
+    }
+  }
 
   if (!s_at_messend) {
     if (seit < AT_EINSCHWINGEN) return;
@@ -1136,44 +1482,33 @@ static void autotune_tick(void) {
 
   const uint32_t dp = s_pkt_e2w  - s_at_pkt0;
   const uint32_t dd = s_drop_e2w - s_at_drop0;
+  s_at_schritte++;
 
   if (dp + dd < AT_MIN_PAKETE) {
-    /* Ohne nennenswerten Verkehr ist jede Zahl Zufall - lieber ehrlich
-     * abbrechen als ein Ergebnis vortaeuschen. */
-    printf("[AUTO] Abbruch: nur %u Pakete in %u s - zu wenig Verkehr\n",
-           (unsigned)(dp + dd), (unsigned)(AT_MESSDAUER / 1000));
-    s_eth_tx_retries = s_at_alt;
-    s_at_state = AT_ZU_WENIG_VERKEHR;
+    if (s_at_phase == AT_PH_START) {
+      /* Schon beim Startwert kaum Verkehr: jede Zahl waere Zufall - lieber
+       * ehrlich abbrechen als ein Ergebnis vortaeuschen. */
+      printf("[AUTO] Abbruch: nur %u Pakete in %u s - zu wenig Verkehr\n",
+             (unsigned)(dp + dd), (unsigned)(AT_MESSDAUER / 1000));
+      s_eth_tx_retries = s_at_alt;
+      s_at_state = AT_ZU_WENIG_VERKEHR;
+      return;
+    }
+    /* Spaeter: wie ein Einbruch behandeln. */
+    s_at_verlust[s_at_idx] = AT_VERLUST_EINBRUCH;
+    s_eth_tx_retries = AT_KANDIDATEN[s_at_start_idx];
+    at_weiter(true);
     return;
   }
 
   s_at_verlust[s_at_idx] = (uint16_t)((10000ULL * dd) / (dp + dd));
-  printf("[AUTO] Retries %2u -> %u.%02u %% Verlust\n",
+  if (s_at_phase == AT_PH_START)
+    s_at_ref_pps = (dp + dd) * 1000 / AT_MESSDAUER;
+  printf("[AUTO] Retries %2u -> %u.%02u %% Verlust (%u Pakete)\n",
          (unsigned)AT_KANDIDATEN[s_at_idx],
          (unsigned)(s_at_verlust[s_at_idx] / 100),
-         (unsigned)(s_at_verlust[s_at_idx] % 100));
-
-  if (++s_at_idx < AT_N) {
-    s_eth_tx_retries = AT_KANDIDATEN[s_at_idx];
-    s_at_messend = false;
-    s_at_t0 = millis();
-    return;
-  }
-
-  /* Auswertung: kleinster Kandidat, der das Ziel erreicht. Verfehlen alle
-   * das Ziel, nehmen wir den mit dem geringsten Verlust. */
-  uint8_t  gewaehlt = 0;
-  uint16_t bestes   = 0xFFFF;
-  for (size_t i = 0; i < AT_N; i++) {
-    if (s_at_verlust[i] <= AT_ZIEL_PROMILLE) { gewaehlt = AT_KANDIDATEN[i]; break; }
-    if (s_at_verlust[i] < bestes) { bestes = s_at_verlust[i]; gewaehlt = AT_KANDIDATEN[i]; }
-  }
-  s_at_ergebnis = gewaehlt;
-  s_eth_tx_retries = gewaehlt;
-  g_cfg.eth_tx_retries = gewaehlt;
-  cfg_save();
-  s_at_state = AT_FERTIG;
-  printf("[AUTO] Fertig - gewaehlt: %u (gespeichert)\n", (unsigned)gewaehlt);
+         (unsigned)(s_at_verlust[s_at_idx] % 100), (unsigned)(dp + dd));
+  at_weiter(false);
 }
 
 /* ===========================================================================
@@ -1472,6 +1807,7 @@ static void watchdog_tick(void) {
      * WIFI_EVENT_STA_DISCONNECTED automatisch neu (s_active gilt hier immer),
      * ein zusaetzlicher esp_wifi_connect() waere doppelt gemoppelt. */
     printf("[WD  ] Trenne WLAN fuer Neuverbindung\n");
+    disc_mark_own(DISC_SRC_WATCHDOG);
     esp_wifi_disconnect();
     s_wd_reconnects++;
     telemetry_note_watchdog_event("wifi_reconnect", wd_reason_str(grund));
@@ -1578,6 +1914,7 @@ static void roam_tick(void) {
    * neu (s_active gilt hier immer) und waehlt dabei per WIFI_ALL_CHANNEL_SCAN
    * + WIFI_CONNECT_AP_BY_SIGNAL erneut den staerksten sichtbaren AP - kein
    * zusaetzliches esp_wifi_connect() noetig. */
+  disc_mark_own(DISC_SRC_ROAM);
   esp_wifi_disconnect();
 }
 
@@ -1618,6 +1955,25 @@ void bridge_get_stats(BridgeStats *o) {
   o->wd_eth_resets = s_wd_eth_resets;
   o->wd_last_reason = (s_wd_reason_magic == WD_REASON_MAGIC) ? s_wd_reason : 0;
   o->roam_count     = s_roam_count;
+
+  /* Juengster ECHTER Abbruch dieses Boots - nicht der juengste Eintrag, das
+   * ist nach einem Rauswurf meist nur der letzte gescheiterte Versuch
+   * (z.B. NO_AP_FOUND) und verschleiert die Ursache. Direkt im Puffer
+   * suchen statt 48 Eintraege auf den Stack zu kopieren. */
+  portENTER_CRITICAL(&s_dl_mux);
+  dl_ensure_locked();
+  for (size_t i = 0; i < s_dl_used; i++) {
+    const bridge_disc_t *e = &s_dl[(s_dl_head + DISC_LOG_N - 1 - i) % DISC_LOG_N];
+    if (e->boot != s_dl_boot) break;
+    if (!e->was_up) continue;
+    o->disc_last_reason = e->reason;
+    o->disc_last_src    = e->src;
+    o->disc_last_ago_s  = millis() / 1000 - e->t_s;
+    break;
+  }
+  o->wifi_kicks = s_kicks;
+  portEXIT_CRITICAL(&s_dl_mux);
+
   o->eth_link      = s_eth_link;
   o->wifi_up       = s_wifi_up;
   strcpy(o->bssid, s_bssid_str);

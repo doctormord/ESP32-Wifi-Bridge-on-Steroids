@@ -8,6 +8,7 @@ idf_component_register(
         "config.cpp"
         "web.cpp"
         "telemetry.cpp"
+        "crashlog.cpp"
     INCLUDE_DIRS "."
     REQUIRES
         esp_eth              # Ethernet-MAC/PHY
@@ -22,4 +23,6 @@ idf_component_register(
         driver               # GPIO
         esp_hw_support
         lwip                 # ping_sock.h - Standorterkennung per Gateway-Ping
+        espcoredump          # Absturz-Historie (crashlog.cpp), /api/coredump
+        spi_flash            # esp_flash_read - Coredump-Fingerabdruck
 )

@@ -47,6 +47,7 @@
 #include "bridge.h"
 #include "web.h"
 #include "telemetry.h"
+#include "crashlog.h"
 
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -189,6 +190,10 @@ static void bridge_setup(void) {
    * einmalige Magic-Wort verschluckt, ohne je konsumiert worden zu sein. */
   const bool geplanter_neustart = bridge_consume_planned_restart();
 
+  /* Unerwarteten Reset des vorigen Boots protokollieren (Zeitpunkt aus dem
+   * RTC-Herzschlag) - in jedem Modus, auch wenn es gleich ins Portal geht. */
+  crashlog_boot(geplanter_neustart);
+
   if (s_boot_magic != BOOT_MAGIC) {
     s_boot_magic = BOOT_MAGIC;
     s_boot_fehlstarts = 0;
@@ -299,6 +304,15 @@ static void bridge_setup(void) {
   char ip[16];
   format_ipv4(aktiv, ip, sizeof(ip));
   printf("[BOOT] Management-Oberflaeche: http://%s\n", ip);
+
+  /* Uhrzeit fuer Absturz- und Disconnect-Zeitstempel. Gateway vom Netif
+   * erfragen - bei mehreren Profilen ist das die verbindliche Quelle. */
+  esp_netif_ip_info_t ipi = {};
+  if (esp_netif_get_ip_info(bridge_mgmt_netif(), &ipi) == ESP_OK && ipi.gw.addr) {
+    uint8_t gw[4];
+    memcpy(gw, &ipi.gw.addr, 4);
+    crashlog_time_start(gw);
+  }
 
 #ifdef BRIDGE_MINIMAL
   /* Weder Webserver noch MQTT - das ist der Sinn dieser Variante.
