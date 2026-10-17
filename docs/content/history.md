@@ -341,3 +341,23 @@ Auf Hardware verifiziert: Build sauber, OTA erfolgreich, Bridge nach Neustart ge
 - **Watchdog-Eskalation waehlbar.** Neue, angehaengte Config-Felder `wd_actions` (Bitmaske: Ethernet-Reset / WLAN-Reconnect / Neustart, 0 = alle wie bisher) und `wd_bad_windows` (schlechte 20-s-Fenster bis zur naechsten Stufe, 0 = 3). Reihenfolge bleibt Ethernet -> WLAN -> Neustart, abgewaehlte Stufen werden uebersprungen; ist die hoechste erlaubte Stufe erreicht, wird wieder von vorn begonnen (z.B. "nur Ethernet-Reset" wiederholt den Ethernet-Reset). Bestehende Konfigurationen verhalten sich unveraendert. Beides wirkt sofort, ohne Neustart.
 - Nur Build- und statische JS-Pruefung (Flash 28,6 %), noch nicht auf Hardware getestet.
 - **Auf Hardware verifiziert (2026-10-11):** OTA von `197d2f6-dirty` auf `f2a3290`, Bridge nach Neustart gesund (`wifi:1 eth:1`, Kamera-Traffic sofort wieder da, `drop_up:0`), kein Rollback. Per API geprueft: `dynamic_tx_buf` 32->28 ohne Neustart gespeichert -> Formularwert 28, `eff` weiter 32; `wd_actions=1&wd_bad_windows=5` uebernommen, `wd_actions=255&wd_bad_windows=99` auf 7/30 begrenzt; laufende Einmessung durch haendisches Speichern abgebrochen (`at` 1->0, Retries blieben 12). Danach alle Werte auf den Ausgangsstand zurueckgesetzt. Nicht getestet: eine komplette Einmessung (der Uebergang "laeuft" -> "fertig" im Portal) und das tatsaechliche Ausloesen einer begrenzten Eskalation.
+
+---
+
+## 2026-10-17 — Absturz "stack overflow in task IDLE0" aufgeklaert, Disconnect-Protokoll und Absturz-Historie gebaut
+
+### Der Absturz
+
+`/api/coredump` meldete `IDLE0`, *"A stack overflow in task IDLE0 has been detected"*, Backtrace als beschaedigt markiert. Aufgeloest gegen das `firmware.elf` des laufenden Builds `f2a3290`: `_frxt_dispatch -> vTaskSwitchContext -> vApplicationStackOverflowHook -> esp_system_abort -> panic_abort` - also nur die Stelle, an der der Canary-Check den Ueberlauf beim Kontextwechsel bemerkte, nicht der Verursacher. Laut Laufzeit war der Neustart am 2026-10-15 gegen 14:23. Mit `wd_actions=1` kein Watchdog-Neustart, also ein echter Absturz.
+
+Ursache: `sdkconfig.defaults` setzte seit dem ersten Commit unbegruendet `CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=768` - das Kconfig-Minimum, der IDF-Standard ist 1536. Der IDLE-Task raeumt geloeschte Tasks auf (u.a. den Task jeder Ping-Session der Watchdog-Gateway-Sonde) und traegt Interrupt-Frames unter WLAN-/EMAC-Last. Jetzt 1536 (kostet ~1,5 KB RAM).
+
+### Disconnect-Protokoll
+
+`wifi_disc` stand bei 1106 in 44 h, aber WARUM, stand nur im seriellen Log. Jetzt landet jeder `WIFI_EVENT_STA_DISCONNECTED` mit Grund, RSSI, BSSID, Uhrzeit und Dauer bis zur Wiederverbindung in einem 16er-Ringpuffer im RTC-Speicher (ueberlebt Neustarts und Abstuerze). Eigene Trennungen (Verbindungsaufbau, Watchdog, Roaming) sind markiert. `/api/disconnects`, letzter Grund in `/api/status` und Portal, `wifi_disc`/`disc_reason` per MQTT. In 2 + 25 min Beobachtung nach dem Update trat kein einziger Disconnect auf - die 1106 kamen offenbar schubweise. Die Aufzeichnung eines ECHTEN Disconnects ist daher noch nicht auf Hardware gesehen.
+
+### Absturz-Historie mit Zeitstempel
+
+Die Coredump-Partition fasst nur ein Abbild ohne Uhrzeit. Jetzt (`crashlog.cpp`): SNTP (Gateway, ersatzweise `pool.ntp.org`), ein sekuendlicher Herzschlag im RTC-Speicher (Uhrzeit, Laufzeit, Build), und beim ersten Boot nach Panic/Interrupt-WDT/Task-WDT/RTC-WDT/Brownout ein Eintrag im NVS (die letzten 8) mit Zeitpunkt, Art, Task, PC, Backtrace, Panic-Grund, Build und ELF-SHA. Ein unveraendertes altes Abbild (gleiche CRC) wird einem neuen Panic nicht zugeschrieben. Ein beim ersten Start schon vorhandener Coredump wird einmalig als "importiert" uebernommen. `/api/crashes` (GET/DELETE, Admin-Key wie `/api/coredump`), Tabelle im Portal.
+
+**Auf Hardware verifiziert:** OTA `f2a3290 -> 2d64f9e -> 1f9bdec -> 5433c8e`, jeweils gesund, kein Rollback. (Der erste Upload brach nach 246 KB ab - `wifi_disc` stieg dabei um 1 -, der zweite Versuch lief durch.) SNTP stellte die Uhr innerhalb einer Minute korrekt, der IDLE0-Absturz vom 15.10. steht als importierter Eintrag in `/api/crashes`. **Nicht getestet:** ein neuer Absturz mit Zeitstempel (kein Weg, ihn gefahrlos auszuloesen) und ein echter Disconnect im Protokoll.
