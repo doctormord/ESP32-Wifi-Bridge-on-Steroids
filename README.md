@@ -164,7 +164,7 @@ Detects a bridge the driver still reports as "connected" but that has stopped de
 A plain counter does not say *why* the link dropped, and the serial log is not accessible on a deployed board. Every disconnect is recorded in a **48-entry ring buffer in RTC memory** (survives reboots and crashes) with reason, RSSI, AP, time and outage duration.
 
 - **Real drops vs. failed attempts**: the driver reports a failed reconnect attempt with the same event as the loss of an existing connection. After one kick by the AP, a dozen failed attempts often follow; they are counted separately (`fails`) so they do not bury the actual cause (`kicks`).
-- **Trigger attribution**: disconnects caused by the firmware itself (connect timeout, watchdog, roaming) are marked as such and not counted as radio problems.
+- **Trigger attribution**: disconnects caused by the firmware itself (connect timeout, watchdog, roaming, restart) are marked as such and not counted as radio problems.
 - Statistics per reason since boot, and the most recent real drop, in the portal, the API and MQTT.
 
 ### Telemetry and diagnostics
@@ -256,7 +256,7 @@ All endpoints are served on the management IP (or `192.168.4.1` in provisioning 
 | `pkt_*`, `drop_*` | Forwarded and dropped packets since boot, per direction |
 | `wifi_disc` | All disconnect events since boot (incl. failed attempts and own disconnects) |
 | `wifi_kicks` | Real drops of an existing connection, externally caused |
-| `disc_r`, `disc_rs`, `disc_src`, `disc_ago` | Last real drop: reason code and name, trigger (0 external, 1 connect, 2 watchdog, 3 roaming), seconds ago |
+| `disc_r`, `disc_rs`, `disc_src`, `disc_ago` | Last real drop: reason code and name, trigger (0 external, 1 connect, 2 watchdog, 3 roaming, 4 restart), seconds ago |
 | `wd_probe` | Last watchdog gateway probe: 0 not needed/off, 1 ok, 2 failed |
 | `wd_reconnects`, `wd_eth_resets` | Watchdog actions since boot |
 | `wd_last_reason` | Reason of the last watchdog reboot (survives the reboot): 0 none, 1 loss ratio, 2 reconnects, 3 gateway probe, 4 no client traffic |

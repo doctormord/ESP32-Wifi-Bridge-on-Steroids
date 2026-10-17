@@ -588,7 +588,7 @@ async function crErase(){
   checkCrashes();
 }
 /* Who disconnected - anything except 0 is the firmware itself, not a radio problem. */
-const DSRC=['external','connecting','watchdog','roaming'];
+const DSRC=['external','connecting','watchdog','roaming','restart'];
 /* Load and render the Wi-Fi disconnect statistics and log. */
 async function loadDisc(){
   try{

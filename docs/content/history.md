@@ -391,3 +391,9 @@ Neu (`380bf01`): Start beim aktuellen Wert (liefert die Referenz-Paketrate); ver
 
 
 - **README rewritten** to cover every feature with its technical background, a full HTTP API reference and the MQTT/Home Assistant interface. Portal screenshots (desktop + iPhone) added under `images/`, rendered by `scripts/portal_screenshots.mjs` from `PAGE[]` with anonymized sample data (no real SSIDs, addresses or credentials) and reduced to 32-color PNGs (2.8 MB -> 0.7 MB).
+
+## 2026-10-17 (evening)
+
+- **Retry setting back to 12.** After 6.5 h on 8 retries the bridge had lost 0.063 % of LAN->Wi-Fi frames (3,616 of 5.71 M), against 0.012 % over 44 h on 12 retries earlier the same day - despite a higher TX power now. The calibration's 15 s windows could not tell 8 and 12 apart; the long run can. Set via `POST /api/config` (`eth_tx_retries=12`), live, no other field changed.
+- **Restarts no longer show up as external drops.** Every regular restart (portal, OTA) disconnected cleanly from the AP and the disconnect log recorded an external `ASSOC_LEAVE`; the evening log held seven of them, all OTA restarts. A shutdown handler registered after the default STA netif runs before Wi-Fi's own `esp_wifi_stop` handler (IDF calls them in reverse order) and tags that disconnect with the new trigger `DISC_SRC_RESTART` (4). Panics do not run shutdown handlers.
+- **Verified on hardware:** OTA to `e637ae1`; that restart, still performed by the old image, logged `src=0`. A `POST /api/reboot` from the new image logged `ASSOC_LEAVE src=4`. Bridge back with camera traffic, `eth_tx_retries` 12 persisted.

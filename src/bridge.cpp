@@ -215,6 +215,16 @@ static void disc_mark_own(uint8_t src) {
   s_disc_src    = src;
 }
 
+/* Shutdown handler: esp_restart() runs the handlers in reverse registration
+ * order, and Wi-Fi's own handler (esp_wifi_stop, registered when the default
+ * STA netif is created) disconnects cleanly from the AP. Registered after
+ * that, this one runs first, so the resulting disconnect is logged as a
+ * restart instead of an external drop. Panics do not run shutdown handlers,
+ * but they do not disconnect cleanly either. */
+static void disc_on_restart(void) {
+  disc_mark_own(DISC_SRC_RESTART);
+}
+
 /* Validate the RTC ring buffer once per boot: reset it if it holds garbage
  * (power-on, layout change), otherwise increment the boot counter.
  * Only call while holding s_dl_mux. */
@@ -1011,6 +1021,10 @@ bool bridge_wifi_start(void) {
     fb.rx_ba_win = 6;          /* conservative, fits any buffer count */
     ESP_ERROR_CHECK(esp_wifi_init(&fb));
   }
+
+  /* Must come after esp_netif_create_default_wifi_sta() above - see
+   * disc_on_restart(). */
+  esp_register_shutdown_handler(disc_on_restart);
 
   ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
