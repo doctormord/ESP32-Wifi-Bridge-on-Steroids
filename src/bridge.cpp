@@ -14,6 +14,7 @@
 #include "driver/gpio.h"
 #include "config.h"
 #include "telemetry.h"
+#include "crashlog.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -199,7 +200,7 @@ static char s_bssid_str[18] = "-";
  * von Kopf/Fuellstand verwirft das. Geschrieben wird aus dem Event-Task,
  * gelesen aus dem HTTP- und dem Haupttask, daher der Spinlock.
  * ------------------------------------------------------------------------ */
-#define DISC_LOG_MAGIC 0x4449534Cu   /* "DISL" */
+#define DISC_LOG_MAGIC 0x44495332u   /* "DIS2" - bei Layoutaenderung hochzaehlen */
 RTC_NOINIT_ATTR static uint32_t      s_dl_magic;
 RTC_NOINIT_ATTR static uint8_t       s_dl_boot;
 RTC_NOINIT_ATTR static uint8_t       s_dl_head;   /* naechster Schreibplatz */
@@ -245,11 +246,13 @@ static void disc_log_add(const wifi_event_sta_disconnected_t *d) {
   s_disc_src = DISC_SRC_EXTERN;
 
   const uint8_t reason = d ? d->reason : 0;
+  const uint32_t epoch = crashlog_now();
   portENTER_CRITICAL(&s_dl_mux);
   dl_ensure_locked();
   bridge_disc_t *e = &s_dl[s_dl_head];
   memset(e, 0, sizeof(*e));
   e->t_s    = millis() / 1000;
+  e->epoch  = epoch;
   e->down_s = 0xFFFF;
   e->reason = reason;
   e->rssi   = d ? d->rssi : 0;

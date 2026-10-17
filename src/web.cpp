@@ -17,6 +17,7 @@
 #include "esp_heap_caps.h"
 #include "esp_core_dump.h"
 #include "build_info.h"
+#include "crashlog.h"
 
 #define AP_PASSWORD   "bridgesetup"   /* mind. 8 Zeichen, sonst offen */
 
@@ -195,6 +196,11 @@ button.sec{background:#2f3542;color:var(--fg)}
     <b class="bad">Absturz-Abbild vorhanden</b> <span class="hint">letzter unerwarteter Neustart</span>
     <div id="cdtext" class="sub" style="margin:4px 0 8px"></div>
     <button class="sec" onclick="cdErase()" style="margin-top:0">Abbild loeschen</button>
+  </div>
+  <div id="crbox" style="display:none;margin-top:10px">
+    <b>Absturz-Historie</b> <span class="hint" id="crhint"></span>
+    <div style="overflow-x:auto"><table id="crtab" class="sub" style="border-collapse:collapse;width:100%;font-size:12px;margin-top:4px"></table></div>
+    <button class="sec" onclick="crErase()" style="margin-top:6px">Historie loeschen</button>
   </div>
   <details id="dlbox" style="margin-top:10px" ontoggle="if(this.open)loadDisc()">
     <summary class="sub" style="cursor:pointer">WLAN-Abbrueche: Gruende und Verlauf</summary>
@@ -496,6 +502,37 @@ function fmt(k){return k>1000?(k/1000).toFixed(1)+' Mbit/s':k+' kbit/s'}
 function dur(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
   return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m')}
 function sdur(s){return s<60?s+'s':dur(s)}
+/* Unix-Sekunden -> Ortszeit des Browsers; 0 heisst "Uhr war nicht gestellt". */
+function ts(e){return e?new Date(e*1000).toLocaleString('de-DE'):''}
+const TD=(t,h)=>'<'+(h?'th':'td')+' style="text-align:left;padding:2px 6px;border-bottom:1px solid rgba(128,128,128,.25);vertical-align:top">'+t+'</'+(h?'th':'td')+'>';
+/* esp_reset_reason_t -> Klartext. 255 = aus der Zeit vor der Historie importiert. */
+const RST={4:'Absturz (Panic)',5:'Interrupt-Watchdog',6:'Task-Watchdog',7:'Hardware-Watchdog',9:'Brownout (Spannung)',255:'Absturz (importiert)'};
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+async function checkCrashes(){
+  try{
+    const r=await fetch('/api/crashes',{headers:cdHeaders()});
+    if(!r.ok){$('crbox').style.display='none';return}
+    const j=await r.json();
+    if(!j.recs.length){$('crbox').style.display='none';return}
+    $('crbox').style.display='block';
+    $('crhint').textContent=j.recs.length+' Eintrag/Eintraege, neueste zuerst'+(j.now?'':' - Uhr der Bridge noch nicht gestellt');
+    $('crtab').innerHTML='<tr>'+['Wann','Art','Task / Grund','Build'].map(t=>TD(t,1)).join('')+'</tr>'+
+      j.recs.map(c=>{
+        const wann=c.e?ts(c.e):(c.f&4?'unbekannt (vor Einfuehrung)':'unbekannt (Uhr nicht gestellt)');
+        let art=(c.f&2)?'Watchdog-Neustart (gewollt)':(RST[c.rst]||('Reset '+c.rst));
+        const det=(c.f&1)?'<b>'+esc(c.task)+'</b> @ 0x'+c.pc+(c.reason?'<br>'+esc(c.reason):'')+
+            (c.bt.length?'<br><span class="hint">BT: '+c.bt.map(a=>'0x'+a).join(' ')+(c.f&8?' (unvollstaendig)':'')+'</span>':'')
+          :(c.f&16?'<span class="hint">kein neues Abbild geschrieben</span>':'<span class="hint">kein Abbild (Reset ohne Coredump)</span>');
+        return '<tr>'+TD(wann+(c.up>=0?'<br><span class="hint">nach '+sdur(c.up)+' Laufzeit</span>':''))+
+          TD(art)+TD(det)+TD(esc(c.build))+'</tr>';
+      }).join('');
+  }catch(e){}
+}
+async function crErase(){
+  if(!confirm('Absturz-Historie loeschen?'))return;
+  await fetch('/api/crashes',{method:'DELETE',headers:cdHeaders()});
+  checkCrashes();
+}
 /* Wer getrennt hat - alles ausser 0 ist die Firmware selbst, kein Funkproblem. */
 const DSRC=['extern','Verbindungsaufbau','Watchdog','Roaming'];
 async function loadDisc(){
@@ -505,11 +542,13 @@ async function loadDisc(){
       ? 'Seit diesem Start (nur extern): '+j.by_reason.map(x=>'<b>'+x.rs+'</b> ('+x.r+') '+x.n+'&times;').join(', ')+
         (j.rest?', sonstige '+j.rest+'&times;':'')
       : 'Seit diesem Start keine extern verursachten Abbrueche.';
-    const td=(t,h)=>'<'+(h?'th':'td')+' style="text-align:left;padding:2px 6px;border-bottom:1px solid rgba(128,128,128,.25)">'+t+'</'+(h?'th':'td')+'>';
+    const td=TD;
     $('dltab').innerHTML=j.log.length
       ? '<tr>'+['Wann','Grund','Ausloeser','RSSI','AP','Weg'].map(t=>td(t,1)).join('')+'</tr>'+
         j.log.map(e=>'<tr>'+
-          td(e.prev?(e.prev===1?'voriger Start':e.prev+' Starts zurueck')+', bei '+sdur(e.t):'vor '+sdur(e.ago))+
+          td((e.e?ts(e.e)+'<br><span class="hint">':'')+
+             (e.prev?(e.prev===1?'voriger Start':e.prev+' Starts zurueck')+', bei '+sdur(e.t):'vor '+sdur(e.ago))+
+             (e.e?'</span>':''))+
           td('<b>'+e.rs+'</b> ('+e.r+')')+
           td(e.src?'<span class="hint">'+(DSRC[e.src]||e.src)+'</span>':'extern')+
           td(e.rssi+' dBm')+td(e.bssid)+
@@ -688,7 +727,7 @@ function upload(){
   $('omsg').textContent='Starte Upload...';
   x.send(f);
 }
-load();tick();checkCoredump();setInterval(tick,2000);
+load();tick();checkCoredump();checkCrashes();setInterval(tick,2000);
 </script></body></html>)HTML";
 
 /* ===========================================================================
@@ -723,7 +762,7 @@ static esp_err_t h_status(httpd_req_t *r) {
     "\"ssid\":\"%s\",\"bssid\":\"%s\","
     "\"at\":%d,\"at_s\":%u,\"at_n\":%u,\"at_r\":%u,"
     "\"heap\":%lu,\"heap_min\":%lu,\"heap_dma\":%lu,\"heap_blk\":%lu,"
-    "\"txp\":%d,\"bw\":%u,\"build\":\"" GIT_REV "\"}",
+    "\"txp\":%d,\"bw\":%u,\"time\":%lu,\"build\":\"" GIT_REV "\"}",
     s_provisioning ? 1 : 0, st.wifi_up ? 1 : 0, st.eth_link ? 1 : 0,
     (int)st.rssi, (unsigned)st.channel,
     (unsigned long)st.kbps_eth2wifi, (unsigned long)st.kbps_wifi2eth,
@@ -756,7 +795,9 @@ static esp_err_t h_status(httpd_req_t *r) {
     (int)bridge_get_tx_power(),
     /* Ebenso die tatsaechlich ausgehandelte Kanalbreite: der ht40-Schalter
      * sagt nur, was wir anbieten. */
-    (unsigned)bridge_get_bandwidth_mhz());
+    (unsigned)bridge_get_bandwidth_mhz(),
+    /* Uhrzeit UTC, 0 = per SNTP noch nicht gestellt. */
+    (unsigned long)crashlog_now());
 
   httpd_resp_set_type(r, "application/json");
   httpd_resp_set_hdr(r, "Cache-Control", "no-store");
@@ -794,9 +835,9 @@ static esp_err_t h_disconnects(httpd_req_t *r) {
     const bridge_disc_t *e = &log[i];
     const unsigned prev = (uint8_t)(boot - e->boot);
     o += snprintf(buf + o, cap - o,
-      "%s{\"prev\":%u,\"t\":%lu,\"ago\":%ld,\"r\":%u,\"rs\":\"%s\",\"src\":%u,"
+      "%s{\"prev\":%u,\"t\":%lu,\"e\":%lu,\"ago\":%ld,\"r\":%u,\"rs\":\"%s\",\"src\":%u,"
       "\"rssi\":%d,\"bssid\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"down\":%ld}",
-      i ? "," : "", prev, (unsigned long)e->t_s,
+      i ? "," : "", prev, (unsigned long)e->t_s, (unsigned long)e->epoch,
       prev ? -1L : (long)(now_s - e->t_s),
       (unsigned)e->reason, bridge_wifi_reason_str(e->reason), (unsigned)e->src,
       (int)e->rssi, e->bssid[0], e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5],
@@ -1398,6 +1439,71 @@ static esp_err_t h_coredump_delete(httpd_req_t *r) {
 #endif /* CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH && CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF */
 
 /* ===========================================================================
+ * Absturz-Historie (crashlog.h)
+ * ---------------------------------------------------------------------------
+ * Der Coredump oben ist immer nur der LETZTE und traegt keine Uhrzeit. Hier
+ * stehen die letzten CRASHLOG_N unerwarteten Resets mit Zeitpunkt - auch
+ * solche ohne Coredump (Brownout, Hardware-Watchdog). Schutz wie /api/coredump.
+ * "e" = Absturzzeit UTC (0 = unbekannt), "up" = Laufzeit bis dahin (-1 =
+ * unbekannt), "rst" = esp_reset_reason_t (255 = vor Einfuehrung importiert).
+ * ========================================================================= */
+
+static esp_err_t h_crashes_get(httpd_req_t *r) {
+  if (!admin_key_ok(r)) {
+    httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "falscher Schluessel");
+    return ESP_FAIL;
+  }
+  crash_rec_t *recs = (crash_rec_t *)malloc(sizeof(crash_rec_t) * CRASHLOG_N);
+  const size_t cap = 4608;
+  char *buf = (char *)malloc(cap);
+  if (!recs || !buf) {
+    free(recs); free(buf);
+    httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "kein Speicher");
+    return ESP_FAIL;
+  }
+  const size_t n = crashlog_get(recs, CRASHLOG_N);
+
+  size_t o = snprintf(buf, cap, "{\"now\":%lu,\"recs\":[", (unsigned long)crashlog_now());
+  for (size_t i = 0; i < n && o < cap; i++) {
+    const crash_rec_t *c = &recs[i];
+    char task[40], reason[200], build[28];
+    json_escape(c->task, task, sizeof(task));
+    json_escape(c->reason, reason, sizeof(reason));
+    json_escape(c->build, build, sizeof(build));
+    char bt[8 * 13 + 1] = "";
+    size_t b = 0;
+    for (uint8_t k = 0; k < c->bt_n && k < 8; k++)
+      b += snprintf(bt + b, sizeof(bt) - b, "%s\"%08lx\"", k ? "," : "", (unsigned long)c->bt[k]);
+    o += snprintf(buf + o, cap - o,
+      "%s{\"e\":%lu,\"up\":%ld,\"rst\":%u,\"f\":%u,\"build\":\"%s\",\"task\":\"%s\","
+      "\"pc\":\"%08lx\",\"reason\":\"%s\",\"bt\":[%s]}",
+      i ? "," : "", (unsigned long)c->epoch,
+      c->uptime_s == 0xFFFFFFFFu ? -1L : (long)c->uptime_s,
+      (unsigned)c->rst, (unsigned)c->flags, build, task,
+      (unsigned long)c->pc, reason, bt);
+  }
+  if (o < cap) o += snprintf(buf + o, cap - o, "]}");
+  if (o >= cap) o = cap - 1;
+  free(recs);
+
+  httpd_resp_set_type(r, "application/json");
+  httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+  esp_err_t err = httpd_resp_send(r, buf, o);
+  free(buf);
+  return err;
+}
+
+static esp_err_t h_crashes_delete(httpd_req_t *r) {
+  if (!admin_key_ok(r)) {
+    httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "falscher Schluessel");
+    return ESP_FAIL;
+  }
+  crashlog_clear();
+  httpd_resp_set_type(r, "application/json");
+  return httpd_resp_send(r, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+}
+
+/* ===========================================================================
  * Start
  * ========================================================================= */
 
@@ -1406,7 +1512,7 @@ bool web_start(bool provisioning) {
 
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.stack_size       = 6144;
-  cfg.max_uri_handlers = 14;    /* aktuell 12 Routen (uris[] unten) - zu knapp
+  cfg.max_uri_handlers = 16;    /* aktuell 14 Routen (uris[] unten) - zu knapp
                                  * bemessen scheitert die Registrierung still */
   cfg.recv_wait_timeout = 20;   /* OTA-Upload braucht Geduld */
   cfg.lru_purge_enable = true;
@@ -1448,6 +1554,8 @@ bool web_start(bool provisioning) {
     { "/api/coredump",HTTP_GET,    h_coredump_get,    NULL },
     { "/api/coredump",HTTP_DELETE, h_coredump_delete, NULL },
 #endif
+    { "/api/crashes", HTTP_GET,    h_crashes_get,     NULL },
+    { "/api/crashes", HTTP_DELETE, h_crashes_delete,  NULL },
   };
   for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
     httpd_register_uri_handler(s_httpd, &uris[i]);

@@ -206,6 +206,7 @@ uint8_t bridge_get_bandwidth_mhz(void);
 
 typedef struct {
   uint32_t t_s;        /* Laufzeit in s beim Abriss (des Boots in 'boot') */
+  uint32_t epoch;      /* Uhrzeit UTC beim Abriss, 0 = Uhr nicht gestellt */
   uint16_t down_s;     /* Sekunden bis zur Wiederverbindung, 0xFFFF = offen */
   uint8_t  reason;     /* wifi_err_reason_t */
   int8_t   rssi;       /* RSSI beim Abriss, vom Treiber */

@@ -66,6 +66,9 @@ CONFIG_ETH_DMA_TX_BUFFER_NUM=30
 # und traegt Interrupt-Frames unter WLAN-/EMAC-Last - 768 Byte reichen dafuer
 # nur meistens. Kostet ~1,5 KB RAM (zwei Kerne), Heap hat genug Reserve.
 CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=1536
+
+# SNTP fuer Zeitstempel (crashlog.cpp): Gateway + pool.ntp.org als Ersatz.
+CONFIG_LWIP_SNTP_MAX_SERVERS=2
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
 # CPU auf voller Taktrate, kein Powermanagement
