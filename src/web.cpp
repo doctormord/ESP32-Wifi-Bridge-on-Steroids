@@ -164,6 +164,12 @@ input,select{width:100%;padding:9px 10px;border-radius:7px;border:1px solid #2f3
 .row{display:flex;gap:10px}.row>*{flex:1}
 button{margin-top:16px;padding:11px 18px;border:0;border-radius:7px;background:var(--acc);color:#06101c;font-weight:600;font-size:14px;cursor:pointer}
 button.sec{background:#2f3542;color:var(--fg)}
+/* Rueckmeldung fuer ALLE Knoepfe: heller beim Ueberfahren, deutlich dunkler
+   und leicht eingedrueckt beim Druecken. */
+button{transition:background .1s,transform .08s,filter .1s}
+button:hover:not(:disabled){filter:brightness(1.12)}
+button:active:not(:disabled){background:#2a78d0;transform:scale(.97);filter:none}
+button.sec:active:not(:disabled){background:#4a5367}
 .bar{height:6px;background:#232833;border-radius:3px;overflow:hidden;margin-top:6px}
 .bar i{display:block;height:100%;background:var(--acc)}
 .ok{color:var(--ok)}.bad{color:var(--bad)}
@@ -175,7 +181,9 @@ button.sec{background:#2f3542;color:var(--fg)}
 .hint{text-transform:none;letter-spacing:0;color:#6b7383;font-size:11px;margin-left:6px}
 /* Neustart-Knoepfe: beim Druecken rot, ausgeloest erst beim Loslassen. */
 button.hold{transition:background .12s,color .12s,transform .12s;touch-action:manipulation;user-select:none}
-button.hold.armed{background:var(--bad);color:#fff;transform:scale(.97)}
+/* Gleiche Spezifitaet wie button.sec:active:not(:disabled) und weiter unten -
+   damit gewinnt Rot auch bei grauen Neustart-Knoepfen. */
+button.hold.armed,button.hold.armed:active{background:var(--bad);color:#fff;transform:scale(.97)}
 button:disabled{opacity:.6;cursor:default}
 /* Hinweis auf ungespeicherte Aenderungen, unten rechts. */
 #dirty{position:fixed;right:16px;bottom:16px;z-index:10;max-width:calc(100% - 32px);width:340px;
@@ -835,6 +843,9 @@ document.addEventListener('change',dirtyCheck);
 window.addEventListener('beforeunload',e=>{
   if(!REBOOTING&&geaendert().length){e.preventDefault();e.returnValue=''}
 });
+/* iOS Safari zeigt :active (Druck-Feedback) nur, wenn irgendein
+   touchstart-Listener existiert - ein leerer genuegt. */
+document.addEventListener('touchstart',()=>{},{passive:true});
 document.querySelectorAll('button.hold').forEach(b=>
   holdBtn(b,b.dataset.act==='saverb'?()=>save(true):()=>reboot()));
 async function ethReset(){
