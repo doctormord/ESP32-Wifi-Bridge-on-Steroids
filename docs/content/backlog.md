@@ -4,13 +4,16 @@ Open tasks and known issues, current priority first. Mutable — edit freely, re
 
 ## In progress: English-only code base cleanup (started 2026-10-17)
 
-Goal: no German left anywhere in code or UI, every function documented, no history/personal content in comments. Rules are in `CLAUDE.md` → "Language and comment conventions". Roadmap, tick off as done:
+Goal: no German left anywhere in code or UI, every function documented, no history/personal content in comments. Rules are in `CLAUDE.md` → "Language and comment conventions". Roadmap, tick off as done.
+
+**Collision rule:** this touches every source file. Before starting each step, rebase the cleanup branch onto the latest `origin/main`; avoid parallel feature work on `bridge.cpp`/`web.cpp` while steps 4 and 6 are open, or translate after that work is merged.
+
 
 1. [x] Record the rules in `CLAUDE.md`, record this roadmap here.
-2. [ ] `src/compat.h`, `src/config.h`, `src/config.cpp` — translate comments, document every function/field, strip dated "appended on …" / incident narratives from the struct comments (keep the append-only rule itself).
+2. [x] `src/compat.h`, `src/config.h`, `src/config.cpp` — translate comments, document every function/field, strip dated "appended on …" / incident narratives from the struct comments (keep the append-only rule itself).
 3. [ ] `src/main.cpp` — translate comments and serial logs, rename German identifiers, strip incident dates, neutralize personal references (router brand, lab/home).
 4. [ ] `src/bridge.h`, `src/bridge.cpp` — same; biggest file, data path comments must keep the buffer-ownership / IRAM reasoning intact.
-5. [ ] `src/telemetry.h`, `src/telemetry.cpp` — comments, logs, Home Assistant entity names, watchdog reason codes.
+5. [ ] `src/telemetry.h`, `src/telemetry.cpp`, `src/crashlog.h`, `src/crashlog.cpp` — comments, logs, Home Assistant entity names, watchdog reason codes.
 6. [ ] `src/web.h`, `src/web.cpp` — comments, API strings, and the full portal UI (`PAGE[]` HTML/JS) translated to English.
 7. [ ] Build files and scripts: `CMakeLists.txt`, `src/CMakeLists.txt`, `platformio.ini`, `sdkconfig.defaults`, `partitions_*.csv`, `scripts/*`.
 8. [ ] Verify: build passes, a comment-stripped diff of old vs. new sources shows only string-literal and identifier-rename changes, `grep` for umlaut transliterations (`ae/oe/ue`, common German words) comes back clean.
