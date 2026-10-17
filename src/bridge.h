@@ -226,6 +226,7 @@ uint8_t bridge_get_bandwidth_mhz(void);
 #define DISC_SRC_CONNECT  1u   /* connect attempt at boot aborted */
 #define DISC_SRC_WATCHDOG 2u   /* watchdog level "reconnect Wi-Fi" */
 #define DISC_SRC_ROAM     3u   /* active AP switch */
+#define DISC_SRC_RESTART  4u   /* clean disconnect during esp_restart() */
 
 typedef struct {
   uint32_t t_s;        /* uptime in s at the drop (of the boot in 'boot') */
