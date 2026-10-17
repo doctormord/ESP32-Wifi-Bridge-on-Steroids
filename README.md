@@ -1,53 +1,105 @@
 # ESP32 Wi-Fi Bridge on Steroids
 
-A **transparent Layer-2 Wi-Fi ↔ Ethernet bridge** for the WT32-ETH01, with a web portal, MQTT telemetry, over-the-air updates and live performance tuning.
+A **transparent Layer-2 Wi-Fi ↔ Ethernet bridge** for the WT32-ETH01, with a web portal, a JSON API, MQTT telemetry with Home Assistant autodiscovery, over-the-air updates, a self-healing watchdog, crash forensics and live performance tuning.
 
 Plug an IP camera (or any Ethernet device) into the board, and it appears on your Wi-Fi network **as if it were cabled directly to your router** — same MAC, its own DHCP lease, directly reachable, discovery protocols intact. No NAT, no second subnet, no port forwarding.
 
-Written in C++ against plain ESP-IDF. Derived from [owenthewizard/esp32-wifi-bridge](https://github.com/owenthewizard/esp32-wifi-bridge) (Rust), which contributed the core idea and the driver tuning this project started from.
+Written in C++ against plain ESP-IDF (PlatformIO, no Arduino). Derived from [owenthewizard/esp32-wifi-bridge](https://github.com/owenthewizard/esp32-wifi-bridge) (Rust), which contributed the core idea and the driver tuning this project started from.
+
+<p align="center">
+  <img src="images/desktop-status.png" alt="Portal on desktop: status tiles, crash history and Wi-Fi drop log" width="68%">
+  &nbsp;
+  <img src="images/iphone-status.png" alt="Portal on iPhone: status view" width="26%">
+</p>
 
 ---
 
-## The magic, in one paragraph
+## Contents
+
+- [How it works](#how-it-works)
+- [Why not one of the existing solutions?](#why-not-one-of-the-existing-solutions)
+- [Features](#features)
+- [The web portal](#the-web-portal)
+- [HTTP API](#http-api)
+- [MQTT and Home Assistant](#mqtt-and-home-assistant)
+- [Hardware](#hardware)
+- [Building and flashing](#building-and-flashing)
+- [Onboarding](#onboarding)
+- [Performance](#performance)
+- [Troubleshooting](#troubleshooting)
+- [Project layout](#project-layout)
+- [Credits and license](#credits)
+
+---
+
+## How it works
+
+### MAC cloning instead of 4-address mode
 
 An 802.11 station operates in *3-address mode*: the access point delivers frames only to the MAC address that associated with it. A normal bridge would need 4-address mode (WDS), which almost no consumer AP offers. This project sidesteps that entirely — it **sniffs the MAC address of the device on the Ethernet port and clones it onto the Wi-Fi interface**. From the network's point of view there is no bridge at all; there is just your camera, on Wi-Fi.
 
-The second trick is that the bridge stays manageable while doing this. `esp_wifi_internal_reg_rxcb()` has exactly one callback slot, normally owned by lwIP. This firmware takes it over and acts as the doorman itself: frames addressed to a separate static management IP go to the local TCP/IP stack, everything else is forwarded raw between the two interfaces without ever touching lwIP. **One interface, one MAC, two IP addresses** — one for the bridged device, one for the bridge itself.
+### One interface, one MAC, two IP addresses
+
+The bridge stays manageable while doing this. `esp_wifi_internal_reg_rxcb()` has exactly one callback slot, normally owned by lwIP. This firmware takes it over and acts as the doorman itself:
+
+```
+                      ┌──────────────── ESP32 ────────────────┐
+ Ethernet client ───► │ eth_rx_cb ──► esp_wifi_internal_tx ───┼──► Wi-Fi / AP
+ (camera, MAC X)      │     │ dst = mgmt IP?                  │
+                      │     └──► lwIP (portal, API, MQTT)     │
+ Ethernet client ◄─── │ esp_eth_transmit ◄── wifi_rx_cb ◄─────┼─── Wi-Fi / AP
+                      │                          │ dst = mgmt IP?
+                      │      lwIP ◄──────────────┘            │
+                      └───────────────────────────────────────┘
+```
+
+- **Ethernet → Wi-Fi** (`eth_rx_cb`): every frame goes straight to `esp_wifi_internal_tx()` on the STA interface, with a configurable number of retries when the Wi-Fi TX buffer is full.
+- **Wi-Fi → Ethernet** (`wifi_rx_cb`): `is_for_mgmt()` inspects the raw frame — IPv4 destination or ARP target equal to the management IP — and hands only those frames to lwIP via `esp_netif_receive()`. Everything else goes straight to `esp_eth_transmit()`.
+- Broadcast/multicast IPv4 is deliberately *not* treated as management traffic; it only goes to the bridged client. The hot path stays free of special cases.
+- Both callbacks run from IRAM, and each frees its buffer exactly once on every path — the ownership contract that keeps the data path leak- and use-after-free-free. `CONFIG_LWIP_L2_TO_L3_COPY` is required (and enforced with an `#error`) because the Ethernet path frees its buffer right after handing a management frame to lwIP.
+
+The Wi-Fi STA and the management netif share the cloned MAC but have different IPs; ARP resolves both to the same MAC, which switches and APs do not mind at all. **The management IP must be static** — DHCP would hand the same MAC two leases.
+
+### Boot sequence
+
+1. Load the configuration from NVS. Decide the mode: **provisioning** (no credentials, factory-reset pin held, previous bridge start failed, or three unstable boots in a row) or **bridge**.
+2. Bridge mode: start Ethernet, wait for the first frame of the client to learn its MAC (or fall back to the MAC stored from an earlier boot), switch the EMAC to promiscuous mode.
+3. Start Wi-Fi with the cloned MAC; try each configured SSID with several attempts, always picking the strongest AP of that SSID.
+4. Detect the location by pinging each profile's gateway, apply that profile's static IP.
+5. Arm the data path, start the HTTP server, MQTT, SNTP and the NetBIOS responder.
+6. After 30 s of network reachability, confirm the OTA image so it is not rolled back; after 60 s, mark the boot as stable.
 
 ---
 
 ## Why not one of the existing solutions?
 
-This is the question worth answering before you build anything.
-
 ### NAT-based ESP32 "repeaters" / `esp32_nat_router` and friends
 
-By far the most common approach, and the reason people end up disappointed. The wired device lands **behind NAT on its own subnet**. Consequences:
+By far the most common approach, and the reason people end up disappointed. The wired device lands **behind NAT on its own subnet**:
 
 - It is **not reachable from your LAN** unless you set up port forwarding, per port, per device.
 - **mDNS / SSDP / ONVIF WS-Discovery do not cross the NAT boundary.** Your NVR will not find the camera. Frigate, Home Assistant, Synology Surveillance Station — all of them discover cameras by broadcast or multicast.
 - The device gets a fake DHCP lease from the ESP32, not from your router. No DHCP reservations, no name in your router's device list, no consistent addressing.
-- RTSP works only if you forward it manually and hardcode the address everywhere.
 
 This project has **no NAT and no second subnet**. The camera gets a real lease from your real DHCP server and answers ARP on your real LAN.
 
 ### OpenWrt client mode + `relayd`
 
-Works, and is a genuine bridge of sorts — but `relayd` is a proxy-ARP pseudo-bridge, not true L2 forwarding. It handles IPv4 well and everything else poorly (IPv6, non-IP protocols, some multicast). You also need a device running OpenWrt: more cost, more power draw, more to configure, and a second thing that can break.
+Works, but `relayd` is a proxy-ARP pseudo-bridge, not true L2 forwarding. It handles IPv4 well and everything else poorly (IPv6, non-IP protocols, some multicast). You also need a device running OpenWrt: more cost, more power draw, more to configure.
 
 ### WDS / 4-address mode
 
-The technically correct answer, and unavailable in practice. Consumer APs — FritzBox, most mesh systems, ISP routers — do not expose it, or only between units of the same brand.
+The technically correct answer, and unavailable in practice. Consumer APs — FRITZ!Box, most mesh systems, ISP routers — do not expose it, or only between units of the same brand.
 
 ### Commercial Wi-Fi client bridges (Vonets, TP-Link in client mode, …)
 
-These do essentially the same MAC-cloning trick, and they work. What you don't get: any insight into what is happening. No packet counters, no loss rate, no RSSI history, no MQTT, no OTA, closed firmware, and no way to tune the radio when the link misbehaves. When throughput is bad, you are guessing.
+These do essentially the same MAC-cloning trick, and they work. What you don't get: any insight into what is happening. No packet counters, no loss rate, no disconnect reasons, no MQTT, no OTA, closed firmware, and no way to tune the radio when the link misbehaves.
 
 ### The Rust original this project came from
 
-[owenthewizard/esp32-wifi-bridge](https://github.com/owenthewizard/esp32-wifi-bridge) implements the same core idea cleanly and compactly, and its Wi-Fi and Ethernet buffer configuration is the basis for this one. What it deliberately does not have — its own TODO lists *"Add HTTP provisioning webpage"* as the top open item — is everything around the data path: no configuration interface, no telemetry, no updates without a cable, no diagnostics. Credentials are compiled in via environment variables.
+[owenthewizard/esp32-wifi-bridge](https://github.com/owenthewizard/esp32-wifi-bridge) implements the same core idea cleanly and compactly, and its Wi-Fi and Ethernet buffer configuration is the basis for this one. What it deliberately does not have is everything around the data path: no configuration interface, no telemetry, no updates without a cable, no diagnostics. Credentials are compiled in.
 
-**If you want a minimal, elegant bridge and you are comfortable reflashing over USB to change an SSID, use the original.** It is less code and less surface area. This project exists for the case where the board ends up somewhere you cannot easily reach.
+**If you want a minimal, elegant bridge and you are comfortable reflashing over USB to change an SSID, use the original.** This project exists for the case where the board ends up somewhere you cannot easily reach.
 
 ---
 
@@ -56,61 +108,272 @@ These do essentially the same MAC-cloning trick, and they work. What you don't g
 ### Bridging
 
 - **Transparent L2 forwarding** in both directions, raw frames, no IP stack in the path.
-- **MAC cloning** with automatic sniffing of the attached device, plus persistence — a camera only talks when *it* boots, so the learned MAC is stored and reused if the bridge restarts on its own.
+- **MAC cloning** with automatic sniffing of the attached device, plus persistence — a camera only talks when *it* boots, so the learned MAC is stored in NVS and reused if the bridge restarts on its own. A different device plugged in is detected within a 30 s window at boot.
 - **Promiscuous Ethernet mode**, so unicast traffic to the client is forwarded, not just broadcast.
+- **Smart retry strategy** in the Ethernet → Wi-Fi path: the first retries only yield the CPU (`taskYIELD()`) instead of sleeping a full tick, because the Ethernet DMA only buffers a few milliseconds at 100 Mbit/s.
 - Hot-path callbacks in IRAM; no flash cache miss per forwarded packet.
 
 ### Management
 
 - **Static management IP on the same interface**, selectively delivered to lwIP. The bridge is reachable while bridging.
-- **Self-contained web portal** — status, configuration, tuning, firmware upload. Single embedded page, no external assets, no internet required.
-- **Provisioning mode**: with no credentials stored, the board opens an access point and serves the same portal at `192.168.4.1`.
-- **JSON API** (`/api/status`, `/api/config`, `/api/scan`, `/api/reboot`, `/api/update`, `/api/autotune`, `/api/coredump`, `/api/eth_reset`) — everything the portal does is scriptable.
-- **NetBIOS name announcement**, so the bridge shows up by name instead of "unknown" in routers that read NBNS (FritzBox does; OpenWrt-based routers do not).
+- **Self-contained web portal** — status, configuration, tuning, diagnostics, firmware upload. A single embedded page (~40 KB), no external assets, no internet required. Works on desktop and phone.
+- **Provisioning mode**: with no credentials stored, the board opens an access point `<name>-setup-XXXX` (password `bridgesetup`) and serves the same portal at `192.168.4.1`.
+- **JSON API** — everything the portal does is scriptable. See [HTTP API](#http-api).
+- **NetBIOS name announcement** (`WIFIBRIDGE-<last octet of client IP>`), so the bridge shows up by name instead of "unknown" in routers that learn names via NBNS (e.g. FRITZ!Box).
 
 ### Multi-site operation
 
-- **Three network profiles**, each with its own SSID, password, IP, netmask and gateway.
-- **Automatic location detection**: after associating, the bridge pings each configured profile's gateway and adopts the one that answers. This works even when both sites use the *same SSID* — a case where selecting by SSID alone cannot work.
-- **Strongest-AP selection** (`WIFI_ALL_CHANNEL_SCAN` + `WIFI_CONNECT_AP_BY_SIGNAL`). In a mesh with several nodes sharing an SSID, the ESP-IDF default (`WIFI_FAST_SCAN`) picks whichever it finds first and never re-evaluates. Getting this wrong cost 20 dB and two thirds of the throughput in testing.
+- **Three network profiles**, each with its own SSID, password, IP, netmask and gateway. Empty mask/gateway fields fall back to profile 1, so a half-filled profile never leaves the board unreachable.
+- **Automatic location detection**: after associating, the bridge pings each configured profile's gateway and adopts the one that answers. This works even when several sites use the *same SSID* — a case where selecting by SSID alone cannot work.
+- **Strongest-AP selection** (`WIFI_ALL_CHANNEL_SCAN` + `WIFI_CONNECT_AP_BY_SIGNAL`). In a mesh with several nodes sharing an SSID, the ESP-IDF default (`WIFI_FAST_SCAN`) picks whichever it finds first and never re-evaluates.
+- **Connect retries per SSID** (default 3 × 20 s): a quick reboot can find the AP still holding the old session of the cloned MAC, so a single attempt is not enough.
+
+### Active roaming
+
+ESP-IDF picks the strongest AP once and then stays on it forever. With roaming enabled (portal switch, default off), the bridge checks every `roam_check_s` (default 300 s) — **but only while its own RSSI is below the threshold** (default −70 dBm), so a good link never wastes airtime on scans. If another AP of the same SSID is better by at least `roam_margin_db` (default 6 dB), it disconnects and reconnects to the strongest one. The AP it is currently on never counts as a candidate, so measurement noise cannot cause ping-pong.
 
 ### Self-healing watchdog
 
-- **Optional, portal-toggleable** (`wd_enable`, default off) — never a compile-time-only switch, since a deployed board has no other way to reach it.
-- **Escalates by symptom, cheapest fix first.** Ethernet link up but the bridged device has gone silent (checked only once a gateway probe confirms Wi-Fi itself is fine) → reset just the Ethernet driver (`bridge_reset_eth()`, a driver stop/start — no chip reboot, Wi-Fi untouched). Any Wi-Fi-side symptom (drop ratio, reconnect churn, failed gateway probe) → disconnect/reconnect Wi-Fi directly (Ethernet untouched). If the symptom persists, the other lightweight remedy is tried next; only if *that* fails does it reboot.
-- **The final reboot provokes its own core dump** (`abort()`, not `esp_restart()`), so the next boot is diagnosable instead of just "it restarted". `wd_reconnects`, `wd_eth_resets` and `wd_last_reason` (which survives the reboot) are visible in `/api/status`, MQTT, and the portal; each escalation step also publishes an immediate MQTT event (`bridge/<node>/watchdog`) rather than waiting for the next periodic status refresh.
-- Manual "Ethernet neu starten" portal button (`POST /api/eth_reset`), independent of watchdog state.
+Detects a bridge the driver still reports as "connected" but that has stopped delivering — something RSSI and `wifi_up` cannot show.
+
+- **Evaluated in 20 s windows.** With enough traffic (≥ 200 packets) the loss ratio decides (≥ 15 % = bad). With too little traffic, the bridge actively **pings its gateway** through the management netif — the same lwIP/radio path the portal uses. ≥ 4 reconnects in a window are bad regardless.
+- **Escalates by symptom, cheapest fix first**, after `wd_bad_windows` bad windows in a row (default 3):
+  1. Ethernet link up, gateway reachable, but the client has gone silent → **restart only the Ethernet driver** (a real link down/up for the camera, Wi-Fi untouched).
+  2. Any Wi-Fi-side symptom, or the Ethernet reset did not help → **disconnect and reconnect Wi-Fi** (Ethernet untouched).
+  3. Still bad → **reboot via `abort()`**, not `esp_restart()`, so a core dump is written and the next boot is diagnosable.
+- **Selectable escalation levels** (`wd_actions`): e.g. "Ethernet reset only" for a setup where Wi-Fi must never be touched. Disabled levels are skipped; the highest allowed level is repeated if the problem persists.
+- Watchdog reboots **never count as failed boots** for the boot-loop protection.
+- Counters `wd_reconnects`, `wd_eth_resets` and the RTC-persisted `wd_last_reason` are visible in the portal, the API and MQTT; every escalation step also publishes an immediate MQTT event.
+- A manual **Restart Ethernet** button (`POST /api/eth_reset`) works independently of the watchdog.
 
 ### Updates and recovery
 
-- **OTA over HTTP** with automatic rollback. A firmware that does not confirm itself within 30 seconds of *network reachability* is undone by a single power cycle. This has been exercised repeatedly, including after real crashes.
-- **Crash-loop protection**: three starts without 60 seconds of stable operation, and the board falls back to the portal instead of rebooting forever. If it does land there, it now finds its own way back too — see "Portal idle auto-recovery" below.
-- **Portal idle auto-recovery**: while sitting in the provisioning AP with no active portal use (page load, config save, network scan — deliberately *not* the page's own status auto-poll, or a left-open browser tab would block this forever), the board retries a normal boot with whatever Wi-Fi credentials are already stored, once every `ap_idle_reboot_s` (default 15 minutes, portal-configurable). Only if credentials exist at all, so a factory-reset or never-configured board doesn't loop pointlessly.
+- **OTA over HTTP** with automatic rollback. A new image boots as `PENDING_VERIFY` and only confirms itself after **30 s of network reachability** — not merely "it booted". Anything that does not confirm is undone by a single power cycle.
+- **Boot-loop protection**: three starts without 60 s of stable operation, and the board falls back to the portal instead of rebooting forever.
+- **Portal idle auto-recovery**: while in the setup AP with no real portal use (page load, save, scan — deliberately *not* the 2 s status poll), the board retries a normal boot with the stored credentials every `ap_idle_reboot_s` (default 15 min). Only if credentials exist, so a factory-reset board does not loop.
 - **Factory reset** by holding GPIO14 low for two seconds at boot.
-- **Core dumps** to a dedicated flash partition, retrievable over HTTP (`GET /api/coredump`: panic reason, crashing task, program counter, backtrace as JSON; `DELETE` to clear it) — for a board with no serial access once installed. `scripts/ota_flash.sh` archives the matching `firmware.elf` on every flash (`elf_archive/<git-rev>_<timestamp>.elf`) specifically so a later core dump's addresses can still be resolved with `addr2line` against the exact binary that produced it.
+
+### Crash forensics
+
+- **Core dumps** to a dedicated 64 KB flash partition, retrievable over HTTP (`/api/coredump`: panic reason, task, PC, backtrace).
+- **Timestamped crash history** (`/api/crashes`, last 8 entries in NVS): every unexpected reset — panic, interrupt/task/hardware watchdog, brownout — is recorded on the next boot with its **wall-clock time** (SNTP, gateway first, `pool.ntp.org` as fallback), the uptime it crashed at and the build it was running. A heartbeat in RTC memory, updated every second, survives the crash and tells the next boot when it happened. A stale core dump (panic without a new image) is detected by its CRC fingerprint and not attributed to the wrong crash.
+- **Build identification**: every build embeds its git revision (`"build"` in `/api/status`), and `scripts/ota_flash.sh` archives the matching `firmware.elf` so a later core dump can be resolved with `addr2line` against the exact binary.
+
+### Wi-Fi disconnect log
+
+A plain counter does not say *why* the link dropped, and the serial log is not accessible on a deployed board. Every disconnect is recorded in a **48-entry ring buffer in RTC memory** (survives reboots and crashes) with reason, RSSI, AP, time and outage duration.
+
+- **Real drops vs. failed attempts**: the driver reports a failed reconnect attempt with the same event as the loss of an existing connection. After one kick by the AP, a dozen failed attempts often follow; they are counted separately (`fails`) so they do not bury the actual cause (`kicks`).
+- **Trigger attribution**: disconnects caused by the firmware itself (connect timeout, watchdog, roaming) are marked as such and not counted as radio problems.
+- Statistics per reason since boot, and the most recent real drop, in the portal, the API and MQTT.
 
 ### Telemetry and diagnostics
 
-- **MQTT** with Home Assistant autodiscovery: RSSI, channel, throughput both directions, packet and drop counters, uptime, free heap, Ethernet link state, and the bridged client's IP.
-- **Client IP and hostname snooping** — the bridge reads the client's source address from IPv4/ARP frames and its hostname from DHCP option 12. Invaluable when a camera is "missing": you can see immediately whether it has an address, which one, and whether it announces a name at all.
-- **Actual values, not requested ones**: TX power and channel width are read back from the driver, because the PHY quantises TX power to 11 discrete steps and HT40 is only ever a request.
-- **Heap low-water mark, DMA-capable free space and largest free block**, so memory pressure is visible before it becomes a crash.
+- **MQTT** with Home Assistant autodiscovery — see [MQTT and Home Assistant](#mqtt-and-home-assistant).
+- **Client IP and hostname snooping** — the bridge reads the client's source address from IPv4/ARP frames and its hostname from DHCP option 12. Invaluable when a camera is "missing": you see immediately whether it has an address, which one, and whether it announces a name.
+- **Actual values, not requested ones**: TX power and channel width are read back from the driver, because the PHY quantizes TX power to 11 discrete steps and HT40 is only ever a request.
+- **Heap low-water mark, DMA-capable free memory and largest free block**, so memory pressure is visible before it becomes a crash.
 
 ### Tuning
 
-- **Live** (no reboot): TX power, and TX retry counts for both directions.
-- **Reboot required**: Wi-Fi buffer counts, RX block-ack window, HT20/HT40, 802.11b rates, Wi-Fi connect timeout/retry count (how hard the board tries a configured SSID before moving to the next one or giving up), portal idle-reboot delay.
-- **Autotune**: sweeps the retry count, measures the loss rate under real traffic, and picks the *smallest* value that stays under 0.10 % — not the best one, because every retry blocks the Ethernet receive task a little longer. Aborts honestly if there is not enough traffic to measure.
+| Setting | Takes effect | Default |
+|---|---|---|
+| TX power (2–20 dBm, 11 PHY steps) | immediately | PHY maximum |
+| TX retries LAN→Wi-Fi / Wi-Fi→LAN | immediately | 8 / 1 |
+| Watchdog on/off, allowed actions, bad windows | immediately | off, all, 3 |
+| Roaming on/off, interval, threshold, margin | immediately | off, 300 s, −70 dBm, 6 dB |
+| Portal idle reboot delay | immediately | 900 s |
+| Wi-Fi static/dynamic RX, dynamic TX buffers | after reboot | 16 / 32 / 32 |
+| RX block-ack window | after reboot | 32 |
+| HT20 / HT40, 802.11b rates | after reboot | HT20, 11b on |
+| Wi-Fi connect timeout / attempts per SSID | at next connect | 20 s / 3 |
+
+All tuning fields follow one convention: **`0` stored = "use the firmware/sdkconfig default"**, so `sdkconfig.defaults` stays the single source of truth. The portal always shows the value actually in effect.
+
+**Retry calibration (autotune)**: measures the loss rate under real traffic for ~19 s per step, starting at the current value. If that misses the 0.10 % target it goes up while each step brings clearly less loss, then down as long as the loss stays within bounds, and picks the **smallest** value that meets the target — not the best one, because every retry blocks the Ethernet receive task a little longer. A collapse guard aborts a step within seconds if the packet rate drops below 30 % of the reference, and the run aborts honestly if there is not enough traffic to measure.
+
+---
+
+## The web portal
+
+One page, four cards: **Status** (live tiles refreshed every 2 s, client and link details, crash history, Wi-Fi drop log), **Configuration** (device name, three network profiles, MQTT, admin key), **Tuning** (live and reboot-required settings, calibration, watchdog, roaming) and **Firmware update**.
+
+<p align="center">
+  <img src="images/iphone-unsaved.png" alt="Tuning card on iPhone with the unsaved-changes notice" width="30%">
+</p>
+
+- The fields show the values **currently in effect**; *Defaults* fills in the firmware defaults without saving.
+- An **unsaved-changes notice** tracks every edited field, says how many of them need a reboot, and offers *Save* / *Discard*. After saving it offers the reboot if one is needed. Leaving the page with unsaved changes asks first.
+- **Reboot buttons trigger on release**: pressing turns them red ("Release = reboot"), dragging away or scrolling cancels — an accidental tap on a phone reboots nothing. After a reboot the page reloads by itself as soon as the bridge answers again.
+- Password fields are never sent back by the board; leaving one empty means "unchanged".
+- SSIDs from scans are inserted via the DOM, never as HTML, so a neighbor's AP named `<img onerror=…>` cannot run script in the portal.
+
+Full-page screenshots: [desktop](images/desktop-full.png) · [iPhone](images/iphone-full.png)
+
+---
+
+## HTTP API
+
+All endpoints are served on the management IP (or `192.168.4.1` in provisioning mode) over plain HTTP. Responses are JSON with `Cache-Control: no-store`.
+
+**Authentication:** if an admin key is set, the endpoints marked 🔑 require the header `X-Admin-Key: <key>`. Without a key everything is open. Note that `/api/config` (including changing the admin key) and `/api/reboot` are **not** protected — keep the management IP on a trusted network.
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/` | The portal page |
+| GET | `/api/status` | Live counters, link state, calibration progress, heap, build |
+| GET | `/api/config` | Current configuration, defaults and running buffer values (never passwords) |
+| POST | `/api/config` | Save configuration (`application/x-www-form-urlencoded`) |
+| POST | `/api/reboot` | Reboot |
+| POST | `/api/eth_reset` | Restart the Ethernet driver (link down/up for the client) |
+| POST | `/api/autotune` | Start the retry calibration |
+| GET | `/api/scan` | Scan for Wi-Fi networks |
+| GET | `/api/disconnects` | Wi-Fi disconnect statistics and log |
+| POST 🔑 | `/api/update` | Upload firmware (raw `.bin` body) |
+| GET / DELETE 🔑 | `/api/coredump` | Read / erase the stored core dump |
+| GET / DELETE 🔑 | `/api/crashes` | Read / clear the crash history |
+
+### `GET /api/status`
+
+```json
+{"prov":0,"wifi":1,"eth":1,"rssi":-58,"ch":6,
+ "kbps_up":3870,"kbps_down":112,"pkt_up":1843210,"pkt_down":912455,"drop_up":212,"drop_down":3,
+ "wifi_disc":9,"wifi_kicks":2,"disc_r":8,"disc_rs":"ASSOC_LEAVE","disc_src":0,"disc_ago":5420,
+ "wd_probe":1,"wd_reconnects":1,"wd_eth_resets":0,"wd_last_reason":0,"roam_count":1,
+ "uptime":266400,"client_mac":"02:1a:2b:3c:4d:5e","client_ip":"192.168.1.88","client_name":"ipcam",
+ "ssid":"HomeNetwork","bssid":"02:aa:bb:cc:dd:01",
+ "at":0,"at_s":0,"at_n":10,"at_r":0,"at_k":8,
+ "heap":91172,"heap_min":32064,"heap_dma":91172,"heap_blk":53248,
+ "txp":66,"bw":20,"time":1792236053,"build":"b1e6aac"}
+```
+
+| Field | Meaning |
+|---|---|
+| `prov` | 1 = provisioning mode (setup AP), 0 = bridge mode |
+| `wifi`, `eth` | Wi-Fi associated / Ethernet link up |
+| `rssi`, `ch`, `ssid`, `bssid` | Current AP |
+| `kbps_up`, `kbps_down` | Throughput LAN→Wi-Fi / Wi-Fi→LAN in kbit/s (1 s average) |
+| `pkt_*`, `drop_*` | Forwarded and dropped packets since boot, per direction |
+| `wifi_disc` | All disconnect events since boot (incl. failed attempts and own disconnects) |
+| `wifi_kicks` | Real drops of an existing connection, externally caused |
+| `disc_r`, `disc_rs`, `disc_src`, `disc_ago` | Last real drop: reason code and name, trigger (0 external, 1 connect, 2 watchdog, 3 roaming), seconds ago |
+| `wd_probe` | Last watchdog gateway probe: 0 not needed/off, 1 ok, 2 failed |
+| `wd_reconnects`, `wd_eth_resets` | Watchdog actions since boot |
+| `wd_last_reason` | Reason of the last watchdog reboot (survives the reboot): 0 none, 1 loss ratio, 2 reconnects, 3 gateway probe, 4 no client traffic |
+| `roam_count` | Active AP switches since boot |
+| `client_mac`, `client_ip`, `client_name` | Bridged client (IP and DHCP host name snooped from its traffic; `-` = unknown) |
+| `at`, `at_s`, `at_n`, `at_r`, `at_k` | Calibration: state (0 idle, 1 running, 2 done, 3 too little traffic), completed steps, candidate count, result, value under test |
+| `heap`, `heap_min`, `heap_dma`, `heap_blk` | Free heap, minimum since boot, free DMA-capable internal memory, largest free block (bytes) |
+| `txp` | Actual TX power from the driver, in 0.25 dBm units |
+| `bw` | Negotiated channel width in MHz |
+| `time` | UTC Unix time, 0 = not synced via SNTP yet |
+| `build` | Git revision of the running firmware (`-dirty` if built from uncommitted changes) |
+
+### `GET /api/config` / `POST /api/config`
+
+`GET` returns every field below plus `"def"` (firmware defaults, used by the *Defaults* button) and `"eff"` (buffer values currently running, which can differ from saved ones until the next reboot). Passwords are never returned.
+
+`POST` takes a form-urlencoded body. Fields that are missing stay unchanged; **empty password fields mean "unchanged"**; empty IP fields of profiles 2/3 clear them. Values are clamped to safe ranges so a typo cannot make a remote board unusable. `0` means "firmware default" for all tuning fields.
+
+| Field | Range / meaning |
+|---|---|
+| `name` | Device name (MQTT, Home Assistant, setup AP, NetBIOS) |
+| `ssid1..3`, `pass1..3` | Wi-Fi networks, tried in order |
+| `ip`, `mask`, `gw` | Profile 1 static management IP (required) |
+| `ip2..3`, `mask2..3`, `gw2..3` | Profiles 2/3, optional |
+| `mqtt_host`, `mqtt_port`, `mqtt_user`, `mqtt_pass` | Broker (empty host = MQTT off) |
+| `telemetry_s` | MQTT publish interval, 1–3600 s |
+| `admin_pass` | Admin key for the 🔑 endpoints |
+| `tx_power` | 0 or 8–84 (0.25 dBm units) |
+| `eth_tx_retries`, `wifi_tx_retries` | 0–20 |
+| `static_rx_buf` | 0 or 2–32 |
+| `dynamic_rx_buf`, `dynamic_tx_buf` | 0–128 |
+| `rx_ba_win` | 0–32 |
+| `ht40`, `no_11b` | 0/1 |
+| `wifi_connect_timeout_s` | 0 or 3–60 |
+| `wifi_connect_retries` | 0–10 |
+| `wd_enable` | 0/1 |
+| `wd_actions` | Bit mask: 1 Ethernet reset, 2 Wi-Fi reconnect, 4 reboot (0 = all) |
+| `wd_bad_windows` | 0–30 |
+| `ap_idle_reboot_s` | 0 or 60–65535 |
+| `roam_enable` | 0/1 |
+| `roam_check_s` | 0 or 30–65535 |
+| `roam_rssi_threshold` | 0 or −100…−1 dBm |
+| `roam_margin_db` | 0–40 |
+
+Saving applies TX power and retries immediately; watchdog and roaming settings are read live; everything else takes effect after a reboot.
+
+```bash
+# Raise the LAN→Wi-Fi retries to 12 without rebooting
+curl -X POST -d 'eth_tx_retries=12' http://<mgmt-ip>/api/config
+```
+
+### `GET /api/disconnects`
+
+```json
+{"kicks":2,"fails":7,"rest":0,
+ "by_reason":[{"r":8,"rs":"ASSOC_LEAVE","n":1},{"r":200,"rs":"BEACON_TIMEOUT","n":1}],
+ "log":[{"prev":0,"t":260980,"e":1792230633,"ago":5420,"r":8,"rs":"ASSOC_LEAVE",
+         "src":0,"up":1,"rssi":-59,"bssid":"02:aa:bb:cc:dd:01","down":4}]}
+```
+
+`kicks` / `fails`: real drops and failed attempts since this boot (external only); `by_reason`: real drops per `wifi_err_reason_t`; `rest`: drops whose reason did not fit the table. Each log entry: `prev` (boots ago, 0 = current), `t` (uptime at the drop), `e` (UTC time, 0 = unknown), `ago` (seconds ago, current boot only), `r`/`rs` (reason), `src` (trigger, see above), `up` (1 = real drop, 0 = failed attempt), `rssi`, `bssid`, `down` (seconds until reconnected, −1 = not reconnected).
+
+### `POST /api/update` 🔑
+
+Streams the raw body into the inactive OTA slot. The first byte is checked against the ESP image magic before anything is written, so an accidental upload of the wrong file cannot brick the board. Forwarding is paused during the flash write; the management connection stays up.
+
+```bash
+curl -X POST --data-binary @.pio/build/wt32-eth01/firmware.bin \
+     -H 'X-Admin-Key: <key>' http://<mgmt-ip>/api/update
+```
+
+Prefer `scripts/ota_flash.sh <ip> [admin-key]`, which also archives the matching `firmware.elf`.
+
+### `GET /api/coredump` 🔑 · `GET /api/crashes` 🔑
+
+```json
+{"present":true,"readable":true,"corrupted":false,"task":"main","pc":"0x400d3a1c",
+ "reason":"abort() was called at PC 0x400d3a19 on core 0","bt":["0x400d3a19","0x400d6f2e"]}
+```
+
+```json
+{"now":1792236053,"recs":[{"e":1792169553,"up":604800,"rst":4,"f":3,"build":"abb24ce",
+  "task":"main","pc":"400d3a1c","reason":"abort() was called ...","bt":["400d3a19"]}]}
+```
+
+Crash records: `e` crash time (UTC, 0 = unknown), `up` uptime at the crash (−1 = unknown), `rst` `esp_reset_reason_t` (255 = imported from before the history existed), `f` flags (1 core dump data valid, 2 intended watchdog reboot, 4 imported, 8 backtrace incomplete, 16 panic without a new dump). `DELETE` on either endpoint erases it.
+
+### `GET /api/scan`
+
+`[{"ssid":"HomeNetwork","rssi":-58}, …]` — up to 20 networks, hidden ones skipped. Blocks for a few seconds while scanning.
+
+---
+
+## MQTT and Home Assistant
+
+Enabled when a broker host is set. Plain MQTT (no TLS, deliberately — it would cost ~40 KB of flash for a device that talks to a broker on the local network). `<node>` is the last three bytes of the (cloned) STA MAC in hex.
+
+| Topic | Content |
+|---|---|
+| `bridge/<node>/state` | JSON state every `telemetry_s` seconds |
+| `bridge/<node>/availability` | `online` / `offline` (retained, last will) |
+| `bridge/<node>/watchdog` | Immediate event per watchdog action: `{"action":"eth_reset\|wifi_reconnect\|reboot","reason":"loss\|disconnects\|probe\|eth_stall","uptime":…}` |
+| `homeassistant/sensor/bridge_<node>/…/config` | Retained autodiscovery entries |
+
+State payload fields: `rssi`, `ch`, `kbps_up`, `kbps_down`, `pkt_up`, `pkt_down`, `drop_up`, `drop_down`, `wifi_disc`, `wifi_kicks`, `disc_reason`, `wd_reconnects`, `wd_eth_resets`, `roam_count`, `eth`, `uptime`, `heap`, `bssid`, `client_ip`.
+
+Home Assistant creates one device with sensors for signal strength, Wi-Fi channel, throughput both ways, dropped packets both ways, uptime, free heap, client IP, watchdog reconnects and Ethernet resets, active AP switches, Wi-Fi disconnects total, Wi-Fi drops and last drop reason, plus an **Ethernet link** connectivity binary sensor. The watchdog events show up in the history with Home Assistant's own receive timestamp.
 
 ---
 
 ## Hardware
 
-- **WT32-ETH01** (ESP32-D0WD + LAN8720A PHY). No PSRAM, and none is needed — Wi-Fi DMA buffers must live in internal RAM anyway.
-- **8 MB flash** on the board used for development. The partition table (`partitions_8mb_ota.csv`) gives two 3 MB OTA slots plus a 64 KB core dump partition. `partitions_2mb_ota.csv` is kept only for boards that really have 2 MB.
-- **A proper 5 V supply at the 5V pin.** Not USB, and *not a power bank*. Two separate failure modes were traced to power during development, and both look exactly like firmware bugs:
+- **WT32-ETH01** (ESP32-D0WD + LAN8720A PHY, RMII with external 50 MHz clock). No PSRAM, and none is needed — Wi-Fi DMA buffers must live in internal RAM anyway.
+- **8 MB flash** on the board used for development. The partition table (`partitions_8mb_ota.csv`) gives two 3 MB OTA slots plus a 64 KB core dump partition; ~1.8 MB stay unallocated as a reserve because a partition table cannot be changed over the air. The firmware uses ~30 % of a slot.
+- **A proper 5 V supply at the 5V pin.** Not USB, and *not a power bank*. Two failure modes look exactly like firmware bugs:
   - Fed from a USB-serial adapter's 5 V pin, the rail collapses when Wi-Fi starts and takes the adapter down with it. Tell-tale: the *adapter* re-enumerates on USB — a crashing ESP32 cannot do that.
-  - A power bank switches off because the ESP32 in download mode draws less than its idle threshold. Symptom: serial reads work right after a reset, then `esptool` fails with "No serial data received". Looks identical to a broken TX wire.
+  - A power bank switches off because the ESP32 in download mode draws less than its idle threshold. Symptom: `esptool` fails with "No serial data received", identical to a broken TX wire.
 
 ### Wiring for flashing
 
@@ -121,26 +384,27 @@ These do essentially the same MAC-cloning trick, and they work. What you don't g
 | GND | GND |
 | DTR / RTS | IO0 / EN (optional, for automatic reset) |
 
-Use a **3.3 V logic** adapter. Pull **IO0 to GND** to enter download mode; the firmware only runs with it removed. Leave **IO14 unconnected** — it is the factory reset input.
+Use a **3.3 V logic** adapter. Pull **IO0 to GND** to enter download mode; the firmware only runs with it removed. Leave **IO14 unconnected** — it is the factory-reset input. Never open the serial monitor while an OTA is in progress: toggling DTR/RTS resets the board.
 
 ---
 
-## Building
+## Building and flashing
 
-This is a PlatformIO project using `framework = espidf` (no Arduino).
+A PlatformIO project using `framework = espidf` (no Arduino).
 
 ```bash
 git clone https://github.com/doctormord/ESP32-Wifi-Bridge-on-Steroids.git
 cd ESP32-Wifi-Bridge-on-Steroids
-pio run -e wt32-eth01
-pio run -e wt32-eth01 -t upload --upload-port /dev/ttyUSB0
+pio run -e wt32-eth01                                            # build
+pio run -e wt32-eth01 -t upload --upload-port /dev/ttyUSB0       # first flash via serial
+scripts/ota_flash.sh <mgmt-ip> [admin-key]                       # later: build + archive ELF + OTA
 ```
 
-Always pass `--upload-port` explicitly if you have more than one serial adapter attached.
+Always pass `--upload-port` explicitly if more than one serial adapter is attached.
 
 ### PlatformIO needs Python 3.10 – 3.13
 
-The `platform-espressif32` package rejects Python ≥ 3.14 outright. If your system Python is newer (Homebrew's `platformio` pulls `python@3.14` and rebuilds its own venv on every run, so patching that venv does not stick), create a standalone environment:
+The `platform-espressif32` package rejects Python ≥ 3.14. If your system Python is newer (Homebrew's `platformio` uses `python@3.14` and rebuilds its own venv on every run), create a standalone environment:
 
 ```bash
 python3.13 -m venv ~/.pio-py313
@@ -148,11 +412,13 @@ python3.13 -m venv ~/.pio-py313
 ~/.pio-py313/bin/pio run -e wt32-eth01
 ```
 
-`pyyaml` is not a PlatformIO dependency but the platform's `component_manager.py` imports it.
+`pyyaml` is not a PlatformIO dependency, but the platform's `component_manager.py` imports it.
 
-### Flash size is configured in two places
+### Things that bite
 
-`board_build.flash_size` sets what ESP-IDF believes; `board_upload.flash_size` sets the size nibble esptool writes into the image header. Both must match your board. `esp_flash_init_default_chip()` **fails hard** when the detected chip is smaller than the header claims — a too-large header means the board never boots. A too-small one only wastes capacity.
+- **Flash size is configured in two places.** `board_build.flash_size` sets what ESP-IDF believes; `board_upload.flash_size` sets the size nibble esptool writes into the image header. Both must match the board. A header claiming *more* than the chip has makes `esp_flash_init_default_chip()` fail hard — the board never boots.
+- **`sdkconfig.<env>` is a generated cache.** ESP-IDF only fills in options *missing* from it, so a stale value silently wins over a change in `sdkconfig.defaults`. Delete it and let it regenerate rather than hand-editing.
+- **Configuration layout is append-only.** `BridgeConfig` is stored as one magic-prefixed NVS blob; `cfg_load()` accepts shorter blobs from older firmware, so new fields must be **appended only**, and resizing an existing field requires a factory reset.
 
 ---
 
@@ -162,38 +428,32 @@ python3.13 -m venv ~/.pio-py313
 2. **Connect an Ethernet device** — the bridge waits for its first frame to learn the MAC. A laptop is ideal for the first run: it speaks DHCP and ARP on its own, so success is visible in both directions immediately.
 3. With no credentials stored, the board opens **`<name>-setup-XXXX`** (password `bridgesetup`). Join it and open **`http://192.168.4.1`**.
 4. Enter Wi-Fi credentials and a **static management IP**.
-   - It must be **outside your DHCP pool**. The bridge and the client share one MAC, so a DHCP server that hands out that address will collide with the static one.
+   - It must be **outside your DHCP pool**. The bridge and the client share one MAC, so a DHCP server handing out that address would collide with the static one.
    - The **gateway field is your router**, not a second management address.
-5. Save. The board reboots into bridge mode and is reachable at the address you set.
+5. Optionally set an **admin key** to protect firmware updates and crash data.
+6. *Save & reboot*. The board comes up in bridge mode and is reachable at the address you set.
 
-### A consequence worth understanding
+### Consequences worth understanding
 
-Because the bridge and the client share a MAC address, your router shows **one device, not two**. Whatever name or DHCP reservation you attach to that MAC applies to both. Tell them apart by IP, not by MAC.
-
-### The management IP is reachable from the Wi-Fi side only
-
-Ingress from the Ethernet side works, but replies cannot get back: lwIP's egress always goes out over Wi-Fi, and the access point will not relay a frame back to the station it came from. Reach the portal from the LAN, not from a laptop sitting behind the bridge.
+- Because the bridge and the client share a MAC address, your router shows **one device, not two**. Whatever name or DHCP reservation you attach to that MAC applies to both. Tell them apart by IP.
+- **The management IP is reachable from the Wi-Fi side only.** Ingress from the Ethernet side works, but replies cannot get back: lwIP's egress always goes out over Wi-Fi, and the AP will not relay a frame back to the station it came from. Reach the portal from the LAN, not from a laptop behind the bridge.
 
 ---
 
 ## Performance
 
-Measured on the development board, over a mesh access point at −61 dBm, with an IP camera streaming:
+Measured on the development board with an IP camera streaming:
 
 | | |
 |---|---|
-| Peak throughput | **21.2 Mbit/s** |
+| Peak throughput | **21.2 Mbit/s** (over a mesh AP at −61 dBm) |
 | Loss at peak | **0.003 %** |
 | Sustained camera stream (~10 Mbit/s) | **0.005 %** loss over an hour |
-| Latency through the bridge | **4.9 ms** average, better than the host's own Wi-Fi (7.5 ms) |
+| Latency through the bridge | **4.9 ms** average |
 
-The upstream project reports ~50 Mbit/s symmetrical. That figure could not be reproduced here with **either** implementation — in a direct A/B on the same board, at the same spot, at the same time, both landed around 60 Mbit/s *combined* (24/36 and 29/31 respectively). Radio environment dominates: the same firmware delivered 3.3 Mbit/s upstream on a weak mesh node and 35.7 Mbit/s on a good access point, without a single line changed.
-
-**Placement beats tuning.** If throughput disappoints, check which access point you are actually associated with before touching anything else.
+In a direct A/B against the Rust original on the same board and spot, both landed around 60 Mbit/s combined (24/36 and 29/31). Radio environment dominates: the same firmware delivered 3.3 Mbit/s upstream on a weak mesh node and 35.7 Mbit/s on a good access point. **Placement beats tuning.**
 
 ### Retry counts matter more than anything else
-
-The single most important setting, and the one that is counter-intuitive:
 
 | Retries | Loss (UDP camera stream) |
 |---|---|
@@ -202,37 +462,25 @@ The single most important setting, and the one that is counter-intuitive:
 | 8 | 0.059 % |
 | 16 | **0.000 %** |
 
-For **TCP**, dropping fast is better — the protocol retransmits and backs off, and blocking the receive task only causes bursty loss in the Ethernet DMA, which TCP handles worse than isolated drops. For **UDP video**, every dropped packet is a permanent artefact. The default is 8; use the autotune to find the right value for your link.
-
-Note that more is not free: each retry holds the `emac_rx` task a little longer, and what arrives during that time is lost in the DMA where no counter can see it.
+For **TCP**, dropping fast is better — the protocol retransmits and backs off, and blocking the receive task only causes bursty loss in the Ethernet DMA. For **UDP video**, every dropped packet is a permanent artefact. The default is 8; use the calibration to find the right value for your link. More is not free: each retry holds the `emac_rx` task longer, and what arrives meanwhile is lost in the DMA where no counter sees it.
 
 ### More Wi-Fi buffers make things worse
 
-Raising `dynamic_tx_buf` from 32 to 64 dropped free heap from 111 kB to 9 kB and halved the download, because TX and RX buffers compete for the same memory. The defaults (16/32/32, BA window 32) come from the upstream project and are a good place to stay.
-
----
-
-## MQTT
-
-Publishes to `bridge/<mac-suffix>/state` as JSON, with an availability topic and Home Assistant autodiscovery under `homeassistant/sensor/…`. Sensors: RSSI, channel, throughput up/down, packets up/down, drops up/down, uptime, free heap, client IP, watchdog Wi-Fi-reconnect and Ethernet-reset counters, and Ethernet link as a connectivity binary sensor.
-
-Each watchdog escalation step additionally publishes an immediate, non-retained message to `bridge/<mac-suffix>/watchdog` (action, reason, uptime) — this shows up in Home Assistant history with its own receive timestamp, without the board needing to know wall-clock time.
-
-TLS is deliberately not supported — it would cost roughly 40 KB of flash for a device that only ever talks to a broker on the local network.
+Raising `dynamic_tx_buf` from 32 to 64 dropped free heap from 111 kB to 9 kB and halved the download, because TX and RX buffers compete for the same memory. The defaults (16/32/32, BA window 32) come from the upstream project.
 
 ---
 
 ## Troubleshooting
 
-**Board unreachable after a config change.** Power-cycle, or just wait: a firmware that failed to confirm itself is rolled back automatically; a bridge that could not associate restarts into the portal; three unstable starts in a row also land in the portal — and if it does land there with credentials already stored, it retries on its own after `ap_idle_reboot_s` (default 15 minutes) without a manual power cycle.
+**Board unreachable after a config change.** Power-cycle, or wait: an unconfirmed firmware is rolled back; a bridge that could not associate restarts into the portal; three unstable starts also land in the portal — and with credentials stored it retries on its own after `ap_idle_reboot_s`.
 
 **Bridge works, portal does not.** You are probably reaching it from the Ethernet side. Use the Wi-Fi side.
 
-**Portal shows stale values after an update.** Fixed by `Cache-Control: no-store`, but a hard reload (`Ctrl/Cmd+Shift+R`) clears anything cached before that.
+**Frequent Wi-Fi drops.** Open *Wi-Fi drops: reasons and history* in the portal. `BEACON_TIMEOUT` points at the radio link; `ASSOC_LEAVE`, `AUTH_EXPIRE` or `ASSOC_TOOMANY` from an AP that otherwise sees good signal often mean AP-side band steering or load balancing kicking the bridge — check the AP's steering thresholds against the bridge's TX power.
 
-**Throughput poor, RSSI good.** Check the retry count first, then which AP you are on (`/api/scan` shows what the board sees from where it is mounted, which is not what your phone sees from where you are standing).
+**Throughput poor, RSSI good.** Check the retry count first, then which AP you are on (`/api/scan` shows what the board sees from where it is mounted).
 
-**`sdkconfig` changes have no effect.** `sdkconfig.<env>` is a generated cache; ESP-IDF only fills in options *missing* from it. Delete it and let it regenerate from `sdkconfig.defaults` rather than hand-editing.
+**Unexpected reboot.** Check the crash history and `/api/coredump` before reflashing; resolve the backtrace with `xtensa-esp32-elf-addr2line -e elf_archive/<build>_*.elf <addresses>`.
 
 **Board silent, adapter fine.** Power. See the hardware section.
 
@@ -242,24 +490,23 @@ TLS is deliberately not supported — it would cost roughly 40 KB of flash for a
 
 ```
 src/
-  main.cpp        entry point, boot modes, crash-loop protection, NetBIOS
-  bridge.cpp      the data path, Wi-Fi/Ethernet setup, autotune, watchdog
-  web.cpp         portal page and JSON API
-  config.cpp      NVS-backed configuration
-  telemetry.cpp   MQTT and Home Assistant discovery
-  compat.h        millis()/delay() over esp_timer/vTaskDelay
+  main.cpp          entry point, boot modes, boot-loop protection, OTA confirmation, NetBIOS
+  bridge.cpp/.h     data path, Ethernet/Wi-Fi setup, location detection, live tuning,
+                    calibration, watchdog, roaming, disconnect log, statistics
+  web.cpp/.h        portal page (PAGE[]) and JSON API, OTA upload
+  config.cpp/.h     NVS-backed configuration (append-only blob)
+  telemetry.cpp/.h  MQTT and Home Assistant discovery
+  crashlog.cpp/.h   timestamped crash history, RTC heartbeat, SNTP
+  compat.h          millis()/delay() over esp_timer/vTaskDelay
 scripts/
-  ota_flash.sh        build, archive firmware.elf, then OTA-upload — use this
-                      instead of a bare curl/pio upload so a later core dump
-                      stays decodable against the exact binary that produced it
-  gen_build_info.py   PlatformIO pre-build hook, writes the running git rev
-                      into src/build_info.h (exposed as "build" in /api/status)
-elf_archive/      per-build firmware.elf, named <git-rev>_<utc-timestamp>.elf
-                  (gitignored; written by scripts/ota_flash.sh)
-docs/content/     development log, backlog, handoff notes
+  ota_flash.sh        build, archive firmware.elf, OTA-upload
+  gen_build_info.py   pre-build hook, writes the git revision into src/build_info.h
+  portal_screenshots.mjs  renders images/ from PAGE[] with anonymized sample data
+images/             portal screenshots (32-color PNGs)
+partitions_8mb_ota.csv   live partition table (2 × 3 MB OTA + 64 KB core dump)
+sdkconfig.defaults       single source of truth for driver and buffer settings
+docs/content/       development history, backlog, handoff notes
 ```
-
-`BridgeConfig` is stored as a single magic-prefixed NVS blob. `cfg_load()` accepts blobs shorter than the current struct, so new fields must be **appended only** — never inserted. Changing the size of an existing field requires a factory reset.
 
 ---
 
