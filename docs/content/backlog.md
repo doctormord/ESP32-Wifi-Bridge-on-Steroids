@@ -17,7 +17,7 @@ Goal: no German left anywhere in code or UI, every function documented, no histo
 6. [x] `src/web.h`, `src/web.cpp` — comments, API strings, and the full portal UI (`PAGE[]` HTML/JS) translated to English.
 7. [x] Build files and scripts: `CMakeLists.txt`, `src/CMakeLists.txt`, `platformio.ini`, `sdkconfig.defaults`, `partitions_*.csv`, `scripts/*`.
 8. [x] Verify: build passes, a comment-stripped diff of old vs. new sources shows only string-literal and identifier-rename changes, `grep` for umlaut transliterations (`ae/oe/ue`, common German words) comes back clean.
-9. [ ] Flash to the board and check the portal renders and saves correctly (needs hardware — user).
+9. [x] Flash to the board and check the portal renders and saves correctly.
 10. [x] Note for users: MQTT watchdog event reason codes changed `verlust`→`loss`, `sonde`→`probe` (Home Assistant automations matching the old strings need updating). (recorded in `history.md`). `handover.md` quote updated.
 
 ## Next up
