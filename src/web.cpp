@@ -196,6 +196,12 @@ button.sec{background:#2f3542;color:var(--fg)}
     <div id="cdtext" class="sub" style="margin:4px 0 8px"></div>
     <button class="sec" onclick="cdErase()" style="margin-top:0">Abbild loeschen</button>
   </div>
+  <details id="dlbox" style="margin-top:10px" ontoggle="if(this.open)loadDisc()">
+    <summary class="sub" style="cursor:pointer">WLAN-Abbrueche: Gruende und Verlauf</summary>
+    <div id="dlsum" class="sub" style="margin:6px 0"></div>
+    <div style="overflow-x:auto"><table id="dltab" class="sub" style="border-collapse:collapse;width:100%;font-size:12px"></table></div>
+    <button class="sec" onclick="loadDisc()" style="margin-top:6px">Aktualisieren</button>
+  </details>
 </div>
 
 <div class="card">
@@ -489,6 +495,28 @@ let ATPREV=-1;
 function fmt(k){return k>1000?(k/1000).toFixed(1)+' Mbit/s':k+' kbit/s'}
 function dur(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
   return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m')}
+function sdur(s){return s<60?s+'s':dur(s)}
+/* Wer getrennt hat - alles ausser 0 ist die Firmware selbst, kein Funkproblem. */
+const DSRC=['extern','Verbindungsaufbau','Watchdog','Roaming'];
+async function loadDisc(){
+  try{
+    const j=await(await fetch('/api/disconnects')).json();
+    $('dlsum').innerHTML=j.by_reason.length
+      ? 'Seit diesem Start (nur extern): '+j.by_reason.map(x=>'<b>'+x.rs+'</b> ('+x.r+') '+x.n+'&times;').join(', ')+
+        (j.rest?', sonstige '+j.rest+'&times;':'')
+      : 'Seit diesem Start keine extern verursachten Abbrueche.';
+    const td=(t,h)=>'<'+(h?'th':'td')+' style="text-align:left;padding:2px 6px;border-bottom:1px solid rgba(128,128,128,.25)">'+t+'</'+(h?'th':'td')+'>';
+    $('dltab').innerHTML=j.log.length
+      ? '<tr>'+['Wann','Grund','Ausloeser','RSSI','AP','Weg'].map(t=>td(t,1)).join('')+'</tr>'+
+        j.log.map(e=>'<tr>'+
+          td(e.prev?(e.prev===1?'voriger Start':e.prev+' Starts zurueck')+', bei '+sdur(e.t):'vor '+sdur(e.ago))+
+          td('<b>'+e.rs+'</b> ('+e.r+')')+
+          td(e.src?'<span class="hint">'+(DSRC[e.src]||e.src)+'</span>':'extern')+
+          td(e.rssi+' dBm')+td(e.bssid)+
+          td(e.down<0?'-':sdur(e.down))+'</tr>').join('')
+      : '';
+  }catch(e){$('dlsum').textContent='Konnte /api/disconnects nicht laden'}
+}
 async function tick(){
   try{const s=await(await fetch('/api/status')).json();
     PROV=s.prov;
@@ -520,6 +548,8 @@ async function tick(){
       (s.ssid||'-')+'</b> ('+s.bssid+')'+
       ' &middot; Ethernet: <span class="'+(s.eth?'ok':'bad')+'">'+(s.eth?'verbunden':'kein Link')+
       '</span> &middot; Reconnects: <b>'+s.wifi_disc+'</b>'+
+      (s.disc_r ? ' (zuletzt <b>'+s.disc_rs+'</b> vor '+sdur(s.disc_ago)+
+        (s.disc_src?', '+(DSRC[s.disc_src]||s.disc_src):'')+')' : '')+
       (s.wd_probe ? ' &middot; Watchdog-Sonde: <span class="'+(s.wd_probe===1?'ok':'bad')+'">'+
         (s.wd_probe===1?'Gateway erreicht':'Gateway nicht erreicht')+'</span>' : '')+
       (s.wd_reconnects ? ' &middot; Watchdog-WLAN-Reconnects: <b>'+s.wd_reconnects+'</b>' : '')+
@@ -681,11 +711,12 @@ static esp_err_t h_status(httpd_req_t *r) {
   BridgeStats st;
   bridge_get_stats(&st);
 
-  char buf[730];
+  char buf[860];
   snprintf(buf, sizeof(buf),
     "{\"prov\":%d,\"wifi\":%d,\"eth\":%d,\"rssi\":%d,\"ch\":%u,"
     "\"kbps_up\":%lu,\"kbps_down\":%lu,\"pkt_up\":%lu,\"pkt_down\":%lu,"
-    "\"drop_up\":%lu,\"drop_down\":%lu,\"wifi_disc\":%lu,\"wd_probe\":%u,"
+    "\"drop_up\":%lu,\"drop_down\":%lu,\"wifi_disc\":%lu,"
+    "\"disc_r\":%u,\"disc_rs\":\"%s\",\"disc_src\":%u,\"disc_ago\":%lu,\"wd_probe\":%u,"
     "\"wd_reconnects\":%lu,\"wd_eth_resets\":%lu,\"wd_last_reason\":%u,"
     "\"roam_count\":%lu,\"uptime\":%lu,"
     "\"client_mac\":\"%s\",\"client_ip\":\"%s\",\"client_name\":\"%s\","
@@ -698,7 +729,13 @@ static esp_err_t h_status(httpd_req_t *r) {
     (unsigned long)st.kbps_eth2wifi, (unsigned long)st.kbps_wifi2eth,
     (unsigned long)st.pkt_eth2wifi,  (unsigned long)st.pkt_wifi2eth,
     (unsigned long)st.drop_eth2wifi, (unsigned long)st.drop_wifi2eth,
-    (unsigned long)st.wifi_disc_count, (unsigned)st.wd_probe,
+    (unsigned long)st.wifi_disc_count,
+    /* Letzter Abriss in diesem Boot - disc_r 0 = keiner. Die ganze Historie
+     * (auch ueber Neustarts) liefert /api/disconnects. */
+    (unsigned)st.disc_last_reason,
+    st.disc_last_reason ? bridge_wifi_reason_str(st.disc_last_reason) : "",
+    (unsigned)st.disc_last_src, (unsigned long)st.disc_last_ago_s,
+    (unsigned)st.wd_probe,
     (unsigned long)st.wd_reconnects, (unsigned long)st.wd_eth_resets,
     (unsigned)st.wd_last_reason, (unsigned long)st.roam_count,
     (unsigned long)(millis() / 1000), st.client_mac, st.client_ip, st.client_name, st.ssid, st.bssid,
@@ -724,6 +761,55 @@ static esp_err_t h_status(httpd_req_t *r) {
   httpd_resp_set_type(r, "application/json");
   httpd_resp_set_hdr(r, "Cache-Control", "no-store");
   return httpd_resp_send(r, buf, HTTPD_RESP_USE_STRLEN);
+}
+
+/* Disconnect-Protokoll (siehe bridge.h): Haeufigkeit je Grund seit diesem
+ * Boot plus die letzten DISC_LOG_N Abrisse, auch aus frueheren Boots.
+ * "prev" = wie viele Boots zurueck (0 = laufender); "ago" gibt es nur fuer
+ * den laufenden Boot, weil die Laufzeit frueherer Boots unbekannt ist.
+ * "down" = Sekunden bis zur Wiederverbindung, -1 = keine (mehr) erfolgt. */
+static esp_err_t h_disconnects(httpd_req_t *r) {
+  bridge_disc_t log[DISC_LOG_N];
+  uint8_t boot = 0;
+  const size_t n = bridge_get_disc_log(log, DISC_LOG_N, &boot);
+  bridge_disc_count_t cnt[12];
+  uint16_t rest = 0;
+  const size_t nc = bridge_get_disc_counts(cnt, 12, &rest);
+
+  const size_t cap = 3200;
+  char *buf = (char *)malloc(cap);
+  if (!buf) {
+    httpd_resp_send_err(r, HTTPD_500_INTERNAL_SERVER_ERROR, "kein Speicher");
+    return ESP_FAIL;
+  }
+  const uint32_t now_s = millis() / 1000;
+  size_t o = snprintf(buf, cap, "{\"rest\":%u,\"by_reason\":[", (unsigned)rest);
+  for (size_t i = 0; i < nc && o < cap; i++) {
+    o += snprintf(buf + o, cap - o, "%s{\"r\":%u,\"rs\":\"%s\",\"n\":%u}", i ? "," : "",
+                  (unsigned)cnt[i].reason, bridge_wifi_reason_str(cnt[i].reason),
+                  (unsigned)cnt[i].n);
+  }
+  if (o < cap) o += snprintf(buf + o, cap - o, "],\"log\":[");
+  for (size_t i = 0; i < n && o < cap; i++) {
+    const bridge_disc_t *e = &log[i];
+    const unsigned prev = (uint8_t)(boot - e->boot);
+    o += snprintf(buf + o, cap - o,
+      "%s{\"prev\":%u,\"t\":%lu,\"ago\":%ld,\"r\":%u,\"rs\":\"%s\",\"src\":%u,"
+      "\"rssi\":%d,\"bssid\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"down\":%ld}",
+      i ? "," : "", prev, (unsigned long)e->t_s,
+      prev ? -1L : (long)(now_s - e->t_s),
+      (unsigned)e->reason, bridge_wifi_reason_str(e->reason), (unsigned)e->src,
+      (int)e->rssi, e->bssid[0], e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5],
+      e->down_s >= 0xFFFE ? -1L : (long)e->down_s);
+  }
+  if (o < cap) o += snprintf(buf + o, cap - o, "]}");
+  if (o >= cap) o = cap - 1;   /* abgeschnitten - sollte bei 16+12 Eintraegen nie passieren */
+
+  httpd_resp_set_type(r, "application/json");
+  httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+  esp_err_t err = httpd_resp_send(r, buf, o);
+  free(buf);
+  return err;
 }
 
 static esp_err_t h_config_get(httpd_req_t *r) {
@@ -1320,7 +1406,8 @@ bool web_start(bool provisioning) {
 
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.stack_size       = 6144;
-  cfg.max_uri_handlers = 12;
+  cfg.max_uri_handlers = 14;    /* aktuell 12 Routen (uris[] unten) - zu knapp
+                                 * bemessen scheitert die Registrierung still */
   cfg.recv_wait_timeout = 20;   /* OTA-Upload braucht Geduld */
   cfg.lru_purge_enable = true;
 
@@ -1349,6 +1436,7 @@ bool web_start(bool provisioning) {
   const httpd_uri_t uris[] = {
     { "/",            HTTP_GET,  h_root,        NULL },
     { "/api/status",  HTTP_GET,  h_status,      NULL },
+    { "/api/disconnects",HTTP_GET,h_disconnects,NULL },
     { "/api/config",  HTTP_GET,  h_config_get,  NULL },
     { "/api/config",  HTTP_POST, h_config_post, NULL },
     { "/api/reboot",  HTTP_POST, h_reboot,      NULL },

@@ -28,6 +28,10 @@ struct BridgeStats {
                                * Bleibt nach dem Neustart stehen (RTC-Speicher),
                                * damit Portal/MQTT zeigen koennen WARUM.       */
   uint32_t roam_count;        /* Aktive AP-Wechsel seit Boot (roam_tick())    */
+  uint8_t  disc_last_reason;  /* Grund des letzten Abrisses in diesem Boot,
+                               * 0 = keiner (siehe bridge_get_disc_log())    */
+  uint8_t  disc_last_src;     /* DISC_SRC_* dazu                              */
+  uint32_t disc_last_ago_s;   /* wie lange her, in s                          */
   int8_t   rssi;
   uint8_t  channel;
   bool     eth_link;
@@ -179,3 +183,51 @@ int16_t bridge_get_tx_power(void);
  * Anzeige laesst sich nicht unterscheiden, ob HT40 nichts brachte oder gar
  * nicht zustande kam. 0 = nicht ermittelbar. */
 uint8_t bridge_get_bandwidth_mhz(void);
+
+/* ===========================================================================
+ * Disconnect-Protokoll
+ * ---------------------------------------------------------------------------
+ * Bisher gab es nur den Zaehler wifi_disc - WARUM die Verbindung abriss, stand
+ * allein im seriellen Log, und an das kommt man im Einsatz nicht heran. Jeder
+ * WIFI_EVENT_STA_DISCONNECTED landet deshalb mit Grund, RSSI und AP in einem
+ * kleinen Ringpuffer im RTC-Speicher: der ueberlebt Soft-Neustarts, Watchdog-
+ * Neustarts und Abstuerze, nur nicht das Abschalten der Versorgung. So bleibt
+ * sichtbar, was VOR einem Neustart los war.
+ * ========================================================================= */
+
+#define DISC_LOG_N 16
+
+/* Wer die Trennung ausgeloest hat. Alles ausser EXTERN ist eine bewusste
+ * Trennung der Firmware selbst und kein Funkproblem. */
+#define DISC_SRC_EXTERN   0u   /* AP oder Funkstrecke */
+#define DISC_SRC_CONNECT  1u   /* Verbindungsaufbau beim Start abgebrochen */
+#define DISC_SRC_WATCHDOG 2u   /* Watchdog-Stufe "WLAN neu verbinden" */
+#define DISC_SRC_ROAM     3u   /* aktiver AP-Wechsel */
+
+typedef struct {
+  uint32_t t_s;        /* Laufzeit in s beim Abriss (des Boots in 'boot') */
+  uint16_t down_s;     /* Sekunden bis zur Wiederverbindung, 0xFFFF = offen */
+  uint8_t  reason;     /* wifi_err_reason_t */
+  int8_t   rssi;       /* RSSI beim Abriss, vom Treiber */
+  uint8_t  bssid[6];
+  uint8_t  boot;       /* Boot-Zaehler (mod 256) - siehe bridge_get_disc_log() */
+  uint8_t  src;        /* DISC_SRC_* */
+} bridge_disc_t;
+
+typedef struct {
+  uint8_t  reason;
+  uint16_t n;
+} bridge_disc_count_t;
+
+/* Eintraege, neueste zuerst. *boot_now erhaelt den Zaehler des laufenden
+ * Boots; Eintraege mit anderem 'boot' stammen aus frueheren Boots, ihr t_s
+ * bezieht sich dann auf deren Laufzeit. */
+size_t bridge_get_disc_log(bridge_disc_t *out, size_t max, uint8_t *boot_now);
+
+/* Abrisse je Grund seit DIESEM Boot (nur extern ausgeloeste), absteigend
+ * nach Haeufigkeit. *rest = Abrisse, deren Grund nicht mehr in die Tabelle
+ * passte. */
+size_t bridge_get_disc_counts(bridge_disc_count_t *out, size_t max, uint16_t *rest);
+
+/* Kurzname eines wifi_err_reason_t, z.B. "BEACON_TIMEOUT". */
+const char *bridge_wifi_reason_str(uint8_t reason);

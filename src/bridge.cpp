@@ -191,6 +191,165 @@ static volatile uint32_t s_wifi_disc_count = 0;
 
 static char s_bssid_str[18] = "-";
 
+/* ---------------------------------------------------------------------------
+ * Disconnect-Protokoll (siehe bridge.h)
+ *
+ * Ringpuffer im RTC-Speicher, damit er Neustarts ueberlebt. Nach dem
+ * Einschalten steht dort Zufall - die Magic plus Plausibilitaetspruefung
+ * von Kopf/Fuellstand verwirft das. Geschrieben wird aus dem Event-Task,
+ * gelesen aus dem HTTP- und dem Haupttask, daher der Spinlock.
+ * ------------------------------------------------------------------------ */
+#define DISC_LOG_MAGIC 0x4449534Cu   /* "DISL" */
+RTC_NOINIT_ATTR static uint32_t      s_dl_magic;
+RTC_NOINIT_ATTR static uint8_t       s_dl_boot;
+RTC_NOINIT_ATTR static uint8_t       s_dl_head;   /* naechster Schreibplatz */
+RTC_NOINIT_ATTR static uint8_t       s_dl_used;
+RTC_NOINIT_ATTR static bridge_disc_t s_dl[DISC_LOG_N];
+static bool s_dl_ready = false;      /* pro Boot einmal pruefen/hochzaehlen */
+static portMUX_TYPE s_dl_mux = portMUX_INITIALIZER_UNLOCKED;
+
+/* Haeufigkeit je Grund, nur dieser Boot. 12 Plaetze reichen praktisch
+ * immer - es treten erfahrungsgemaess nur eine Handvoll Gruende auf. */
+#define DISC_REASON_SLOTS 12
+static bridge_disc_count_t s_dr[DISC_REASON_SLOTS];
+static uint16_t s_dr_rest = 0;
+
+/* Vor einem eigenen esp_wifi_disconnect() gesetzt, damit der folgende
+ * Disconnect-Event nicht als Funkproblem zaehlt. Mit Zeitstempel: kommt
+ * zu einem eigenen Trennen kein Event (war gar nicht verbunden), darf die
+ * Markierung nicht an einem spaeteren, echten Abriss haengen bleiben. */
+static volatile uint8_t  s_disc_src = DISC_SRC_EXTERN;
+static volatile uint32_t s_disc_src_ms = 0;
+
+static void disc_mark_own(uint8_t src) {
+  s_disc_src_ms = millis();
+  s_disc_src    = src;
+}
+
+/* Nur unter s_dl_mux aufrufen. */
+static void dl_ensure_locked(void) {
+  if (s_dl_ready) return;
+  s_dl_ready = true;
+  if (s_dl_magic != DISC_LOG_MAGIC || s_dl_head >= DISC_LOG_N || s_dl_used > DISC_LOG_N) {
+    memset(s_dl, 0, sizeof(s_dl));
+    s_dl_head = 0; s_dl_used = 0; s_dl_boot = 0;
+    s_dl_magic = DISC_LOG_MAGIC;
+  } else {
+    s_dl_boot++;
+  }
+}
+
+static void disc_log_add(const wifi_event_sta_disconnected_t *d) {
+  uint8_t src = DISC_SRC_EXTERN;
+  if (s_disc_src != DISC_SRC_EXTERN && millis() - s_disc_src_ms < 3000) src = s_disc_src;
+  s_disc_src = DISC_SRC_EXTERN;
+
+  const uint8_t reason = d ? d->reason : 0;
+  portENTER_CRITICAL(&s_dl_mux);
+  dl_ensure_locked();
+  bridge_disc_t *e = &s_dl[s_dl_head];
+  memset(e, 0, sizeof(*e));
+  e->t_s    = millis() / 1000;
+  e->down_s = 0xFFFF;
+  e->reason = reason;
+  e->rssi   = d ? d->rssi : 0;
+  if (d) memcpy(e->bssid, d->bssid, 6);
+  e->boot   = s_dl_boot;
+  e->src    = src;
+  s_dl_head = (uint8_t)((s_dl_head + 1) % DISC_LOG_N);
+  if (s_dl_used < DISC_LOG_N) s_dl_used++;
+
+  if (src == DISC_SRC_EXTERN) {
+    size_t k = 0;
+    while (k < DISC_REASON_SLOTS && s_dr[k].n && s_dr[k].reason != reason) k++;
+    if (k == DISC_REASON_SLOTS) {
+      if (s_dr_rest < 0xFFFF) s_dr_rest++;
+    } else {
+      s_dr[k].reason = reason;
+      if (s_dr[k].n < 0xFFFF) s_dr[k].n++;
+    }
+  }
+  portEXIT_CRITICAL(&s_dl_mux);
+}
+
+/* Beim Wiederverbinden die Ausfalldauer des juengsten Eintrags nachtragen. */
+static void disc_log_reconnected(void) {
+  portENTER_CRITICAL(&s_dl_mux);
+  dl_ensure_locked();
+  if (s_dl_used) {
+    bridge_disc_t *e = &s_dl[(s_dl_head + DISC_LOG_N - 1) % DISC_LOG_N];
+    if (e->boot == s_dl_boot && e->down_s == 0xFFFF) {
+      const uint32_t d = millis() / 1000 - e->t_s;
+      e->down_s = d < 0xFFFE ? (uint16_t)d : 0xFFFE;
+    }
+  }
+  portEXIT_CRITICAL(&s_dl_mux);
+}
+
+size_t bridge_get_disc_log(bridge_disc_t *out, size_t max, uint8_t *boot_now) {
+  portENTER_CRITICAL(&s_dl_mux);
+  dl_ensure_locked();
+  size_t n = s_dl_used < max ? s_dl_used : max;
+  for (size_t i = 0; i < n; i++)
+    out[i] = s_dl[(s_dl_head + DISC_LOG_N - 1 - i) % DISC_LOG_N];
+  if (boot_now) *boot_now = s_dl_boot;
+  portEXIT_CRITICAL(&s_dl_mux);
+  return n;
+}
+
+size_t bridge_get_disc_counts(bridge_disc_count_t *out, size_t max, uint16_t *rest) {
+  bridge_disc_count_t tmp[DISC_REASON_SLOTS];
+  portENTER_CRITICAL(&s_dl_mux);
+  memcpy(tmp, s_dr, sizeof(tmp));
+  if (rest) *rest = s_dr_rest;
+  portEXIT_CRITICAL(&s_dl_mux);
+
+  size_t n = 0;
+  while (n < DISC_REASON_SLOTS && tmp[n].n) n++;
+  /* Absteigend nach Haeufigkeit - bei 12 Eintraegen reicht Insertion Sort. */
+  for (size_t i = 1; i < n; i++)
+    for (size_t j = i; j > 0 && tmp[j].n > tmp[j - 1].n; j--) {
+      bridge_disc_count_t t = tmp[j]; tmp[j] = tmp[j - 1]; tmp[j - 1] = t;
+    }
+  if (n > max) n = max;
+  memcpy(out, tmp, n * sizeof(*out));
+  return n;
+}
+
+const char *bridge_wifi_reason_str(uint8_t r) {
+  switch (r) {
+    case WIFI_REASON_UNSPECIFIED:                   return "UNSPECIFIED";
+    case WIFI_REASON_AUTH_EXPIRE:                   return "AUTH_EXPIRE";
+    case WIFI_REASON_AUTH_LEAVE:                    return "AUTH_LEAVE";
+    case WIFI_REASON_DISASSOC_DUE_TO_INACTIVITY:    return "INACTIVITY";
+    case WIFI_REASON_ASSOC_TOOMANY:                 return "ASSOC_TOOMANY";
+    case WIFI_REASON_CLASS2_FRAME_FROM_NONAUTH_STA: return "CLASS2_FRAME";
+    case WIFI_REASON_CLASS3_FRAME_FROM_NONASSOC_STA:return "CLASS3_FRAME";
+    case WIFI_REASON_ASSOC_LEAVE:                   return "ASSOC_LEAVE";
+    case WIFI_REASON_ASSOC_NOT_AUTHED:              return "ASSOC_NOT_AUTHED";
+    case WIFI_REASON_BSS_TRANSITION_DISASSOC:       return "BSS_TRANSITION";
+    case WIFI_REASON_MIC_FAILURE:                   return "MIC_FAILURE";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:        return "4WAY_HANDSHAKE_TIMEOUT";
+    case WIFI_REASON_GROUP_KEY_UPDATE_TIMEOUT:      return "GROUP_KEY_TIMEOUT";
+    case WIFI_REASON_802_1X_AUTH_FAILED:            return "802_1X_AUTH_FAILED";
+    case WIFI_REASON_MISSING_ACKS:                  return "MISSING_ACKS";
+    case WIFI_REASON_STA_LEAVING:                   return "STA_LEAVING";
+    case WIFI_REASON_TIMEOUT:                       return "TIMEOUT";
+    case WIFI_REASON_PEER_INITIATED:                return "PEER_INITIATED";
+    case WIFI_REASON_AP_INITIATED:                  return "AP_INITIATED";
+    case WIFI_REASON_BEACON_TIMEOUT:                return "BEACON_TIMEOUT";
+    case WIFI_REASON_NO_AP_FOUND:                   return "NO_AP_FOUND";
+    case WIFI_REASON_AUTH_FAIL:                     return "AUTH_FAIL";
+    case WIFI_REASON_ASSOC_FAIL:                    return "ASSOC_FAIL";
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:             return "HANDSHAKE_TIMEOUT";
+    case WIFI_REASON_CONNECTION_FAIL:               return "CONNECTION_FAIL";
+    case WIFI_REASON_AP_TSF_RESET:                  return "AP_TSF_RESET";
+    case WIFI_REASON_ROAMING:                       return "ROAMING";
+    case WIFI_REASON_SA_QUERY_TIMEOUT:              return "SA_QUERY_TIMEOUT";
+    default:                                        return "OTHER";
+  }
+}
+
 /* Sendeleistung, die die PHY nach dem Start von sich aus einstellt.
  * Wird beim ersten bridge_apply_live_tuning() gemerkt, damit ein
  * zurueckgesetztes tx_power (=0) sie WIEDERHERSTELLEN kann. Ohne das blieb
@@ -444,6 +603,7 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
     wifi_event_sta_connected_t *e = (wifi_event_sta_connected_t *)data;
     if (e) mac2str(e->bssid, s_bssid_str);
     printf("[WIFI] Verbunden (AP %s)\n", s_bssid_str);
+    disc_log_reconnected();
 
     /* WICHTIG: erst hier registrieren. esp_netif hat sich beim Attach
      * bereits eingetragen - dieser Aufruf ueberschreibt das gezielt, damit
@@ -458,7 +618,9 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
     strcpy(s_bssid_str, "-");
     s_wifi_disc_count = s_wifi_disc_count + 1;
     wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
-    printf("[WIFI] Getrennt (reason %d)\n", d ? d->reason : -1);
+    printf("[WIFI] Getrennt (reason %d %s, %d dBm)\n", d ? d->reason : -1,
+           bridge_wifi_reason_str(d ? d->reason : 0), d ? d->rssi : 0);
+    disc_log_add(d);
     if (s_active) esp_wifi_connect();     /* im Betrieb dauerhaft nachfassen */
   }
 }
@@ -906,6 +1068,7 @@ bool bridge_wifi_start(void) {
       uint32_t t0 = millis();
       while (!s_wifi_up && (millis() - t0) < connect_timeout_ms) delay(100);
       if (s_wifi_up) break;
+      disc_mark_own(DISC_SRC_CONNECT);
       esp_wifi_disconnect();
     }
     if (s_wifi_up) {
@@ -922,6 +1085,7 @@ bool bridge_wifi_start(void) {
 
     printf("[WIFI] '%s' fehlgeschlagen nach %d Versuchen\n",
            nets[i].ssid, connect_retries);
+    disc_mark_own(DISC_SRC_CONNECT);
     esp_wifi_disconnect();
     esp_wifi_stop();
   }
@@ -1472,6 +1636,7 @@ static void watchdog_tick(void) {
      * WIFI_EVENT_STA_DISCONNECTED automatisch neu (s_active gilt hier immer),
      * ein zusaetzlicher esp_wifi_connect() waere doppelt gemoppelt. */
     printf("[WD  ] Trenne WLAN fuer Neuverbindung\n");
+    disc_mark_own(DISC_SRC_WATCHDOG);
     esp_wifi_disconnect();
     s_wd_reconnects++;
     telemetry_note_watchdog_event("wifi_reconnect", wd_reason_str(grund));
@@ -1578,6 +1743,7 @@ static void roam_tick(void) {
    * neu (s_active gilt hier immer) und waehlt dabei per WIFI_ALL_CHANNEL_SCAN
    * + WIFI_CONNECT_AP_BY_SIGNAL erneut den staerksten sichtbaren AP - kein
    * zusaetzliches esp_wifi_connect() noetig. */
+  disc_mark_own(DISC_SRC_ROAM);
   esp_wifi_disconnect();
 }
 
@@ -1618,6 +1784,14 @@ void bridge_get_stats(BridgeStats *o) {
   o->wd_eth_resets = s_wd_eth_resets;
   o->wd_last_reason = (s_wd_reason_magic == WD_REASON_MAGIC) ? s_wd_reason : 0;
   o->roam_count     = s_roam_count;
+
+  bridge_disc_t last; uint8_t boot;
+  if (bridge_get_disc_log(&last, 1, &boot) && last.boot == boot) {
+    o->disc_last_reason = last.reason;
+    o->disc_last_src    = last.src;
+    o->disc_last_ago_s  = millis() / 1000 - last.t_s;
+  }
+
   o->eth_link      = s_eth_link;
   o->wifi_up       = s_wifi_up;
   strcpy(o->bssid, s_bssid_str);
