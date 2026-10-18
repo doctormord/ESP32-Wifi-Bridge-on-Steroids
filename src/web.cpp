@@ -194,7 +194,7 @@ button:active:not(:disabled){background:#2a78d0;transform:scale(.97);filter:none
 button.sec:active:not(:disabled){background:#4a5367}
 .bar{height:6px;background:#232833;border-radius:3px;overflow:hidden;margin-top:6px}
 .bar i{display:block;height:100%;background:var(--acc)}
-.ok{color:var(--ok)}.bad{color:var(--bad)}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:#f0b429}
 #msg,#tmsg,#omsg{margin-top:12px;font-size:13px}
 .tag{display:inline-block;font-size:11px;text-transform:uppercase;letter-spacing:.05em;
      padding:3px 8px;border-radius:4px;margin:18px 0 2px}
@@ -234,6 +234,8 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
     <div class="m"><div class="k">Uptime</div><div class="v" id="uptime">-</div></div>
     <div class="m"><div class="k">TX power</div><div class="v" id="txp">-</div></div>
     <div class="m"><div class="k">Channel width</div><div class="v" id="bw">-</div></div>
+    <div class="m"><div class="k">TX queue</div><div class="v" id="txq">-</div></div>
+    <div class="m"><div class="k">Lost on air</div><div class="v" id="airf">-</div></div>
   </div>
   <div class="sub" style="margin:12px 0 0" id="detail"></div>
   <div id="cdbox" style="display:none;margin-top:10px;padding:10px;background:rgba(255,107,107,.08);
@@ -370,6 +372,27 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
     </div>
     <button onclick="autotune()" style="margin-top:0">Start calibration</button>
     <div id="atmsg" style="margin-top:10px;font-size:13px"></div>
+    <table id="attab" style="margin-top:6px;font-size:12px;border-collapse:collapse"></table>
+  </div>
+
+  <div style="margin-top:14px;padding:12px;background:#232833;border-radius:8px">
+    <b style="font-size:13px">TX power calibration</b>
+    <div class="sub" style="margin:4px 0 8px">
+      Measures the PHY's power steps from 13 to 20&nbsp;dBm against the live
+      stream, about 19&nbsp;s each: the loss and how long frames wait in the
+      Wi-Fi TX queue (a weak uplink makes the queue drain slowly long before
+      frames get lost - that is what drives ping times up). Starts at the
+      current value, tries every higher step, then lower ones while they keep
+      up. The <b>highest</b> power that is as good as the best one is chosen
+      and saved: power is only reduced where more of it measurably hurts,
+      because link margin is what carries the stream through interference a
+      short measurement never sees. Steps the chip cannot deliver (it may cap
+      below 20&nbsp;dBm, see the Driver column) are measured once.
+      <b>Traffic must be flowing.</b> Takes about 2&ndash;3 minutes.
+    </div>
+    <button onclick="autotune('txp')" style="margin-top:0">Start TX power calibration</button>
+    <div id="ptmsg" style="margin-top:10px;font-size:13px"></div>
+    <table id="pttab" style="margin-top:6px;font-size:12px;border-collapse:collapse"></table>
   </div>
 
   <div style="margin-top:14px;padding:12px;background:#232833;border-radius:8px">
@@ -550,7 +573,7 @@ let PROV=false;
    the TRANSITION to "done". Doing it on every 2 s poll while the board
    reports "done" would make a manually edited value jump back before it
    is saved. */
-let ATPREV=-1;
+let ATPREV=-1, PTPREV=-1, PTRES=0;
 function fmt(k){return k>1000?(k/1000).toFixed(1)+' Mbit/s':k+' kbit/s'}
 function dur(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
   return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m')}
@@ -607,7 +630,7 @@ async function loadDisc(){
           td((e.e?ts(e.e)+'<br><span class="hint">':'')+
              (e.prev?(e.prev===1?'previous boot':e.prev+' boots ago')+', at '+sdur(e.t):sdur(e.ago)+' ago')+
              (e.e?'</span>':''))+
-          td(e.up?'<b class="bad">Drop</b>':'Failed attempt')+
+          td(e.up?(e.src?'Disconnect':'<b class="bad">Drop</b>'):'Failed attempt')+
           td('<b>'+e.rs+'</b> ('+e.r+')')+
           td(e.src?'<span class="hint">'+(DSRC[e.src]||e.src)+'</span>':'external')+
           td(empty(e)?'-':e.rssi+' dBm')+td(empty(e)?'-':e.bssid)+
@@ -646,7 +669,28 @@ async function tick(){
                          if(SNAP){SNAP.eth_tx_retries=String(s.at_r);dirtyCheck()} } }
     else if(s.at===3) $('atmsg').textContent='Aborted: too little traffic during the measurement. '+
                       'Let the camera stream and start again.';
+    /* The tables only change when a measurement finishes - fill them on the
+       first poll, refresh them while a run is active and once on the
+       transition out of it. */
+    if(ATPREV===-1||s.at===1||s.pt===1||(ATPREV===1&&s.at!==1)||(PTPREV===1&&s.pt!==1)) atTables();
     ATPREV=s.at;
+    const dbm=v=>(v/4).toFixed(2).replace(/\.?0+$/,'')+' dBm';
+    if(s.pt===1) $('ptmsg').textContent='TX power calibration running - measurement '+(s.pt_s+1)+
+                 ', testing '+dbm(s.pt_k)+' (about 19 s each)';
+    else if(s.pt===2){ PTRES=s.pt_r; $('ptmsg').textContent='Done - chosen: '+dbm(s.pt_r)+', saved.';
+                       if(PTPREV===1){ $('tx_power').value=s.pt_r;
+                         if(SNAP){SNAP.tx_power=String(s.pt_r);dirtyCheck()} } }
+    else if(s.pt===3) $('ptmsg').textContent='Aborted: too little traffic during the measurement. '+
+                      'Let the camera stream and start again.';
+    PTPREV=s.pt;
+    /* Mean frames waiting in the driver queue and the resulting wait. A few
+       ms is normal; tens to hundreds of ms mean the uplink cannot keep up. */
+    $('txq').textContent=(s.wifi&&s.txq_ms!==undefined)?s.txq_ms+' ms':'-';
+    $('txq').className='v '+(s.txq_ms>=50?'bad':s.txq_ms>=15?'warn':'ok');
+    $('txq').title=(s.txq_x10/10).toFixed(1)+' frames on average, '+s.txq+' now';
+    $('airf').textContent=s.air_fail!==undefined?s.air_fail:'-';
+    $('airf').className='v '+(s.air_fail?'bad':'ok');
+    $('airf').title=s.air_ok+' frames delivered';
     $('detail').innerHTML='Client: <b>'+s.client_mac+'</b> &middot; IP: <b>'+(s.client_ip||'-')+'</b>'+
       ' &middot; Name: <b>'+(s.client_name||'-')+'</b><br>Connected to: <b>'+
       (s.ssid||'-')+'</b> ('+s.bssid+')'+
@@ -745,13 +789,30 @@ function defaults(){
   $('tmsg').textContent='Defaults filled in - save to apply.';
   dirtyCheck();   /* set by script - does not fire an input event */
 }
-async function autotune(){
-  $('atmsg').textContent='Starting...';
+/* Start the retry calibration, or with kind 'txp' the TX power one. */
+async function autotune(kind){
+  const m=$(kind?'ptmsg':'atmsg');
+  m.textContent='Starting...';
   try{
-    const j=await(await fetch('/api/autotune',{method:'POST'})).json();
-    $('atmsg').textContent=j.ok?'Calibration running - please keep traffic flowing.'
-                               :('Not started: '+(j.err||'unknown'));
-  }catch(e){$('atmsg').textContent='Error while starting'}
+    const j=await(await fetch('/api/autotune'+(kind?'?kind='+kind:''),{method:'POST'})).json();
+    m.textContent=j.ok?'Calibration running - please keep traffic flowing.'
+                      :('Not started: '+(j.err||'unknown'));
+  }catch(e){m.textContent='Error while starting'}
+}
+/* Fill both calibration tables from /api/autotune: one row per measured
+   candidate, the chosen one in bold. Called while a run is active and once
+   when it ends. */
+async function atTables(){
+  try{
+    const j=await(await fetch('/api/autotune')).json(), td=TD;
+    const pct=v=>v<0?'<b class="bad">collapse</b>':(v/100).toFixed(2)+' %';
+    const dbm=v=>(v/4).toFixed(2).replace(/\.?0+$/,'')+' dBm';
+    $('attab').innerHTML=j.retries.length?'<tr>'+td('Retries',1)+td('Loss',1)+'</tr>'+
+      j.retries.map(e=>'<tr>'+td(e.k)+td(pct(e.loss))+'</tr>').join(''):'';
+    $('pttab').innerHTML=j.txp.length?'<tr>'+['Power','Driver','Loss','Queue delay'].map(t=>td(t,1)).join('')+'</tr>'+
+      j.txp.map(e=>'<tr'+(e.k===PTRES?' style="font-weight:bold"':'')+'>'+td(dbm(e.k))+td(dbm(e.act))+
+        td(pct(e.loss))+td(e.delay<0?'-':(e.delay/10).toFixed(1)+' ms')+'</tr>').join(''):'';
+  }catch(e){}
 }
 /* Trigger a reboot and reload the page as soon as the board answers again -
    otherwise one faces a dead page without knowing when it comes back. Only
@@ -954,7 +1015,7 @@ static esp_err_t h_status(httpd_req_t *r) {
   BridgeStats st;
   bridge_get_stats(&st);
 
-  char buf[860];
+  char buf[1100];
   snprintf(buf, sizeof(buf),
     "{\"prov\":%d,\"wifi\":%d,\"eth\":%d,\"rssi\":%d,\"ch\":%u,"
     "\"kbps_up\":%lu,\"kbps_down\":%lu,\"pkt_up\":%lu,\"pkt_down\":%lu,"
@@ -966,7 +1027,10 @@ static esp_err_t h_status(httpd_req_t *r) {
     "\"ssid\":\"%s\",\"bssid\":\"%s\","
     "\"at\":%d,\"at_s\":%u,\"at_n\":%u,\"at_r\":%u,\"at_k\":%u,"
     "\"heap\":%lu,\"heap_min\":%lu,\"heap_dma\":%lu,\"heap_blk\":%lu,"
-    "\"txp\":%d,\"bw\":%u,\"time\":%lu,\"build\":\"" GIT_REV "\"}",
+    "\"txp\":%d,\"bw\":%u,\"air_ok\":%lu,\"air_fail\":%lu,\"cc\":\"%s\",\"cc_max\":%d,"
+    "\"txq\":%lu,\"txq_x10\":%lu,\"txq_ms\":%lu,"
+    "\"pt\":%d,\"pt_s\":%u,\"pt_k\":%d,\"pt_r\":%d,"
+    "\"time\":%lu,\"build\":\"" GIT_REV "\"}",
     s_provisioning ? 1 : 0, st.wifi_up ? 1 : 0, st.eth_link ? 1 : 0,
     (int)st.rssi, (unsigned)st.channel,
     (unsigned long)st.kbps_eth2wifi, (unsigned long)st.kbps_wifi2eth,
@@ -1000,6 +1064,16 @@ static esp_err_t h_status(httpd_req_t *r) {
     /* Likewise the channel width actually negotiated: the ht40 switch only
      * says what we offer. */
     (unsigned)bridge_get_bandwidth_mhz(),
+    /* Delivered/abandoned frames as the Wi-Fi MAC reports them, and the
+     * regulatory cap the TX power has to stay under. */
+    (unsigned long)st.air_ok, (unsigned long)st.air_fail,
+    st.country, (int)st.country_max_txp,
+    /* Driver TX queue: frames waiting now, mean over the last second (x10)
+     * and the resulting wait per frame - the bufferbloat indicator. */
+    (unsigned long)st.txq_now, (unsigned long)st.txq_x10, (unsigned long)st.txq_delay_ms,
+    /* TX power autotune, same state codes as "at". */
+    (int)bridge_txp_tune_state(), bridge_txp_tune_step(),
+    (int)bridge_txp_tune_candidate(), (int)bridge_txp_tune_result(),
     /* Time UTC, 0 = not set via SNTP yet. */
     (unsigned long)crashlog_now());
 
@@ -1383,14 +1457,54 @@ static esp_err_t h_config_post(httpd_req_t *r) {
   return httpd_resp_send(r, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
 
-/* POST /api/autotune - start the retry autotune (see bridge.h). */
+/* POST /api/autotune - start the retry autotune, or with ?kind=txp the TX
+ * power autotune (see bridge.h). */
 static esp_err_t h_autotune(httpd_req_t *r) {
-  const bool ok = bridge_autotune_start();
+  char q[32] = "", kind[8] = "";
+  if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK)
+    httpd_query_key_value(q, "kind", kind, sizeof(kind));
+  const bool ok = strcmp(kind, "txp") == 0 ? bridge_txp_tune_start()
+                                           : bridge_autotune_start();
   httpd_resp_set_type(r, "application/json");
   httpd_resp_set_hdr(r, "Cache-Control", "no-store");
   return httpd_resp_send(r, ok ? "{\"ok\":true}"
                               : "{\"ok\":false,\"err\":\"already running or bridge inactive\"}",
                          HTTPD_RESP_USE_STRLEN);
+}
+
+/* GET /api/autotune - per-candidate measurements of both autotunes, so the
+ * portal can show WHY a value was chosen. Unmeasured candidates are omitted;
+ * a collapsed step is reported as loss -1. */
+static esp_err_t h_autotune_get(httpd_req_t *r) {
+  uint8_t  rk[16]; uint16_t rl[16];
+  int8_t   pk[8], pa[8]; uint16_t pl[8], pd[8];
+  const size_t rn = bridge_autotune_count();
+  bridge_autotune_values(rk, rl);
+  const size_t pn = bridge_txp_tune_values(pk, pa, pl, pd);
+
+  char buf[900];
+  int n = snprintf(buf, sizeof(buf), "{\"retries\":[");
+  bool first = true;
+  for (size_t i = 0; i < rn && n < (int)sizeof(buf) - 64; i++) {
+    if (rl[i] == 0xFFFF) continue;
+    n += snprintf(buf + n, sizeof(buf) - n, "%s{\"k\":%u,\"loss\":%d}", first ? "" : ",",
+                  (unsigned)rk[i], rl[i] == 0xFFFE ? -1 : (int)rl[i]);
+    first = false;
+  }
+  n += snprintf(buf + n, sizeof(buf) - n, "],\"txp\":[");
+  first = true;
+  for (size_t i = 0; i < pn && n < (int)sizeof(buf) - 80; i++) {
+    if (pl[i] == 0xFFFF) continue;
+    n += snprintf(buf + n, sizeof(buf) - n,
+                  "%s{\"k\":%d,\"act\":%d,\"loss\":%d,\"delay\":%d}", first ? "" : ",",
+                  (int)pk[i], (int)pa[i], pl[i] == 0xFFFE ? -1 : (int)pl[i],
+                  pl[i] == 0xFFFE ? -1 : (int)pd[i]);
+    first = false;
+  }
+  snprintf(buf + n, sizeof(buf) - n, "]}");
+  httpd_resp_set_type(r, "application/json");
+  httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+  return httpd_resp_send(r, buf, HTTPD_RESP_USE_STRLEN);
 }
 
 /* POST /api/reboot - answer first, then reboot after a short delay so the
@@ -1749,7 +1863,7 @@ bool web_start(bool provisioning) {
 
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.stack_size       = 6144;
-  cfg.max_uri_handlers = 16;    /* currently 14 routes (uris[] below) - if this
+  cfg.max_uri_handlers = 18;    /* currently 15 routes (uris[] below) - if this
                                  * is too small, registration fails silently */
   cfg.recv_wait_timeout = 20;   /* the OTA upload needs patience */
   cfg.lru_purge_enable = true;
@@ -1782,6 +1896,7 @@ bool web_start(bool provisioning) {
     { "/api/reboot",  HTTP_POST, h_reboot,      NULL },
     { "/api/eth_reset",HTTP_POST,h_eth_reset,   NULL },
     { "/api/autotune",HTTP_POST, h_autotune,    NULL },
+    { "/api/autotune",HTTP_GET,  h_autotune_get,NULL },
     { "/api/scan",    HTTP_GET,  h_scan,        NULL },
     { "/api/update",  HTTP_POST, h_update,      NULL },
 #if CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH && CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF

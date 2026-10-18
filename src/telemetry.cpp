@@ -110,6 +110,10 @@ static void announce_all(void) {
    * that follow - this is the meaningful curve. */
   announce_one("wifi_kicks","Wi-Fi drops",NULL, NULL, "total_increasing", "mdi:wifi-alert");
   announce_one("disc_reason","Last drop reason",NULL, NULL, NULL, "mdi:wifi-alert");
+  /* Uplink health: how long frames wait in the driver's TX queue (rises long
+   * before frames get lost) and frames the MAC gave up on, on the air. */
+  announce_one("txq_ms",   "TX queue delay",      "ms",  "duration", "measurement", NULL);
+  announce_one("air_fail", "Frames lost on air",  NULL,  NULL, "total_increasing", "mdi:wifi-strength-alert-outline");
 
   char topic[160], payload[512];
   snprintf(topic, sizeof(topic),
@@ -190,7 +194,7 @@ void telemetry_tick(void) {
     "\"wifi_disc\":%lu,\"wifi_kicks\":%lu,\"disc_reason\":\"%s\","
     "\"wd_reconnects\":%lu,\"wd_eth_resets\":%lu,\"roam_count\":%lu,"
     "\"eth\":%d,\"uptime\":%lu,\"heap\":%lu,\"bssid\":\"%s\","
-    "\"client_ip\":\"%s\"}",
+    "\"client_ip\":\"%s\",\"txq_ms\":%lu,\"air_fail\":%lu}",
     (int)st.rssi, (unsigned)st.channel,
     (unsigned long)st.kbps_eth2wifi, (unsigned long)st.kbps_wifi2eth,
     (unsigned long)st.pkt_eth2wifi,  (unsigned long)st.pkt_wifi2eth,
@@ -199,7 +203,8 @@ void telemetry_tick(void) {
     st.disc_last_reason ? bridge_wifi_reason_str(st.disc_last_reason) : "-",
     (unsigned long)st.wd_reconnects, (unsigned long)st.wd_eth_resets, (unsigned long)st.roam_count,
     st.eth_link ? 1 : 0, (unsigned long)(millis() / 1000),
-    (unsigned long)esp_get_free_heap_size(), st.bssid, st.client_ip);
+    (unsigned long)esp_get_free_heap_size(), st.bssid, st.client_ip,
+    (unsigned long)st.txq_delay_ms, (unsigned long)st.air_fail);
 
   esp_mqtt_client_publish(s_mqtt, s_state, payload, 0, 0, 0);
 }

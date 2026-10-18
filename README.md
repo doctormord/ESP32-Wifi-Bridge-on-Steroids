@@ -192,6 +192,10 @@ All tuning fields follow one convention: **`0` stored = "use the firmware/sdkcon
 
 **Retry calibration (autotune)**: measures the loss rate under real traffic for ~19 s per step, starting at the current value. If that misses the 0.10 % target it goes up while each step brings clearly less loss, then down as long as the loss stays within bounds, and picks the **smallest** value that meets the target — not the best one, because every retry blocks the Ethernet receive task a little longer. A collapse guard aborts a step within seconds if the packet rate drops below 30 % of the reference, and the run aborts honestly if there is not enough traffic to measure.
 
+**TX power calibration**: measures the PHY's power steps from 13 to 20 dBm against the live stream with the same timing and collapse guard. Per step it records the loss (frames without a TX buffer plus frames the MAC abandoned on the air) and the **queue delay** — how long a frame waited in the driver's TX queue, from the TX-done accounting below. It starts at the current value, tries every higher step, then lower ones until one leaves the tolerance, and saves the **highest** power that is as good as the best measurement: power is only reduced where more of it measurably hurts, because link margin is what carries the stream through interference a short measurement never sees. Steps the driver maps to the same actual power are measured once, and the smallest request that reaches it is saved — the ESP32 tested here caps at 14.75 dBm whatever is requested above 15 dBm. Results per step are shown in the portal and at `GET /api/autotune`.
+
+**TX queue and air loss**: a TX-done callback (`esp_wifi_set_tx_done_cb`) reports every frame the Wi-Fi MAC finished, delivered or abandoned after its hardware retries. Frames handed to the driver minus frames finished is the TX queue depth; averaged per completion and divided by the frame rate (Little's law) it gives the time a frame waits for the air. That is the bufferbloat behind high and jittery ping times on a busy channel, and it rises long before frames get lost. The callback reports the encrypted 802.11 frame, so the management stack's few frames cannot be filtered out; the estimate resynchronizes instead whenever it would go negative or the link has been idle for a second.
+
 ---
 
 ## The web portal
@@ -226,7 +230,8 @@ All endpoints are served on the management IP (or `192.168.4.1` in provisioning 
 | POST | `/api/config` | Save configuration (`application/x-www-form-urlencoded`) |
 | POST | `/api/reboot` | Reboot |
 | POST | `/api/eth_reset` | Restart the Ethernet driver (link down/up for the client) |
-| POST | `/api/autotune` | Start the retry calibration |
+| POST | `/api/autotune` | Start the retry calibration; `?kind=txp` starts the TX power calibration |
+| GET | `/api/autotune` | Per-step results of both calibrations: `{"retries":[{"k","loss"}],"txp":[{"k","act","loss","delay"}]}` (loss in 1/100 %, -1 = collapse; delay in 0.1 ms; powers in 0.25 dBm) |
 | GET | `/api/scan` | Scan for Wi-Fi networks |
 | GET | `/api/disconnects` | Wi-Fi disconnect statistics and log |
 | POST 🔑 | `/api/update` | Upload firmware (raw `.bin` body) |
@@ -244,7 +249,9 @@ All endpoints are served on the management IP (or `192.168.4.1` in provisioning 
  "ssid":"HomeNetwork","bssid":"02:aa:bb:cc:dd:01",
  "at":0,"at_s":0,"at_n":10,"at_r":0,"at_k":8,
  "heap":91172,"heap_min":32064,"heap_dma":91172,"heap_blk":53248,
- "txp":66,"bw":20,"time":1792236053,"build":"b1e6aac"}
+ "txp":59,"bw":20,"air_ok":1842977,"air_fail":0,"cc":"01","cc_max":20,
+ "txq":0,"txq_x10":27,"txq_ms":21,"pt":2,"pt_s":3,"pt_k":52,"pt_r":60,
+ "time":1792236053,"build":"b1e6aac"}
 ```
 
 | Field | Meaning |
@@ -266,6 +273,10 @@ All endpoints are served on the management IP (or `192.168.4.1` in provisioning 
 | `heap`, `heap_min`, `heap_dma`, `heap_blk` | Free heap, minimum since boot, free DMA-capable internal memory, largest free block (bytes) |
 | `txp` | Actual TX power from the driver, in 0.25 dBm units |
 | `bw` | Negotiated channel width in MHz |
+| `air_ok`, `air_fail` | Frames the Wi-Fi MAC delivered / abandoned after its hardware retries since boot (lost on the air, unlike `drop_up`) |
+| `cc`, `cc_max` | Regulatory country in effect (adopted from the AP by default) and its TX power cap in dBm |
+| `txq`, `txq_x10`, `txq_ms` | Frames waiting in the driver's TX queue now, their mean over the last second ×10, and the resulting mean wait per frame in ms |
+| `pt`, `pt_s`, `pt_k`, `pt_r` | TX power calibration: state (as `at`), completed measurements, power under test and chosen power (0.25 dBm units) |
 | `time` | UTC Unix time, 0 = not synced via SNTP yet |
 | `build` | Git revision of the running firmware (`-dirty` if built from uncommitted changes) |
 
@@ -361,9 +372,9 @@ Enabled when a broker host is set. Plain MQTT (no TLS, deliberately — it would
 | `bridge/<node>/watchdog` | Immediate event per watchdog action: `{"action":"eth_reset\|wifi_reconnect\|reboot","reason":"loss\|disconnects\|probe\|eth_stall","uptime":…}` |
 | `homeassistant/sensor/bridge_<node>/…/config` | Retained autodiscovery entries |
 
-State payload fields: `rssi`, `ch`, `kbps_up`, `kbps_down`, `pkt_up`, `pkt_down`, `drop_up`, `drop_down`, `wifi_disc`, `wifi_kicks`, `disc_reason`, `wd_reconnects`, `wd_eth_resets`, `roam_count`, `eth`, `uptime`, `heap`, `bssid`, `client_ip`.
+State payload fields: `rssi`, `ch`, `kbps_up`, `kbps_down`, `pkt_up`, `pkt_down`, `drop_up`, `drop_down`, `wifi_disc`, `wifi_kicks`, `disc_reason`, `wd_reconnects`, `wd_eth_resets`, `roam_count`, `eth`, `uptime`, `heap`, `bssid`, `client_ip`, `txq_ms`, `air_fail`.
 
-Home Assistant creates one device with sensors for signal strength, Wi-Fi channel, throughput both ways, dropped packets both ways, uptime, free heap, client IP, watchdog reconnects and Ethernet resets, active AP switches, Wi-Fi disconnects total, Wi-Fi drops and last drop reason, plus an **Ethernet link** connectivity binary sensor. The watchdog events show up in the history with Home Assistant's own receive timestamp.
+Home Assistant creates one device with sensors for signal strength, Wi-Fi channel, throughput both ways, dropped packets both ways, uptime, free heap, client IP, watchdog reconnects and Ethernet resets, active AP switches, Wi-Fi disconnects total, Wi-Fi drops and last drop reason, TX queue delay and frames lost on air, plus an **Ethernet link** connectivity binary sensor. The watchdog events show up in the history with Home Assistant's own receive timestamp.
 
 ---
 

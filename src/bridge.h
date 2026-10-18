@@ -40,6 +40,21 @@ struct BridgeStats {
                                * 0 = none (see bridge_get_disc_log())         */
   uint8_t  disc_last_src;     /* matching DISC_SRC_*                          */
   uint32_t disc_last_ago_s;   /* how long ago, in s                           */
+  uint32_t air_ok;            /* frames the Wi-Fi MAC reported as delivered
+                               * (acknowledged by the AP) since boot          */
+  uint32_t air_fail;          /* frames the MAC gave up on after its own
+                               * hardware retries - lost on the air, unlike
+                               * drop_eth2wifi, which counts frames that never
+                               * got a TX buffer                              */
+  uint32_t txq_now;           /* bridged frames handed to the driver but not
+                               * yet finished on the air, right now           */
+  uint32_t txq_x10;           /* mean of that over the last second, x10       */
+  uint32_t txq_delay_ms;      /* how long a frame waited in that queue on
+                               * average over the last second (Little's law) */
+  char     country[3];        /* regulatory country in effect ("DE", "01"...),
+                               * adopted from the AP's beacon by default      */
+  int8_t   country_max_txp;   /* its TX power cap as esp_wifi_get_country()
+                               * reports it - an upper bound for tx_power     */
   int8_t   rssi;
   uint8_t  channel;
   bool     eth_link;
@@ -191,6 +206,30 @@ uint8_t          bridge_autotune_candidate(void);  /* retry value under test */
 uint8_t          bridge_autotune_result(void);     /* chosen value, 0 = none */
 /* Loss per candidate in hundredths of a percent, 0xFFFF = not measured */
 void             bridge_autotune_values(uint8_t *candidates, uint16_t *loss);
+
+/* ---------------------------------------------------------------------------
+ * TX power autotune
+ *
+ * Measures the PHY's TX power steps from 13 to 20 dBm against live traffic:
+ * loss (no TX buffer + abandoned on the air) and the mean time a frame waits
+ * in the driver's TX queue. Starts at the current value, tries every higher
+ * step, then lower ones until one falls out of tolerance, and saves the
+ * LOWEST power that performs as well as the best one within tolerance.
+ * Same timing, collapse guard and traffic requirement as the retry
+ * autotune; the two never run at the same time. Uses the AT_* states.
+ * ------------------------------------------------------------------------ */
+bool             bridge_txp_tune_start(void);
+/* Abort a run (restoring the configured power) or acknowledge a result. */
+void             bridge_txp_tune_reset(void);
+autotune_state_t bridge_txp_tune_state(void);
+uint8_t          bridge_txp_tune_step(void);       /* completed measurements */
+int8_t           bridge_txp_tune_candidate(void);  /* value under test, 0.25 dBm */
+int8_t           bridge_txp_tune_result(void);     /* chosen value, 0 = none */
+/* Per candidate: requested and driver-reported power (0.25 dBm), loss in
+ * 1/100 % (0xFFFF = not measured, 0xFFFE = collapse) and queue delay in
+ * 0.1 ms. Arrays need room for 8 entries; returns the number filled. */
+size_t           bridge_txp_tune_values(int8_t *candidates, int8_t *actual,
+                                        uint16_t *loss, uint16_t *delay_x10);
 
 /* TX power actually in effect, in 0.25 dBm units, queried from the driver.
  * Usually differs from the configured value because the PHY only knows 11
