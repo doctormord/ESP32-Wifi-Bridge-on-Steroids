@@ -357,6 +357,20 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
     practically always accepts.
   </div>
 
+  <label>TX queue cap LAN&rarr;Wi-Fi
+    <span class="hint">frames, 0 = off</span></label>
+  <input id="txq_cap">
+  <div class="sub" style="margin:6px 0 0">
+    How many frames may wait for the air at most. Without a cap a camera's
+    I-frame fills every Wi-Fi TX buffer, and everything behind it &ndash;
+    pings, this portal, the camera's own TCP &ndash; waits tens of
+    milliseconds (tile <i>TX queue</i>). With a cap, larger frames beyond it
+    are dropped at once instead; small ones (ACKs, ARP, ping) always pass.
+    Lower latency and less heap use, paid for with some loss in bursts
+    &ndash; use the calibration below to find out whether that is free on
+    your link. Dropped frames are counted under <i>Dropped</i> as well.
+  </div>
+
   <div style="margin-top:14px;padding:12px;background:#232833;border-radius:8px">
     <b style="font-size:13px">Automatic calibration</b>
     <div class="sub" style="margin:4px 0 8px">
@@ -393,6 +407,22 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
     <button onclick="autotune('txp')" style="margin-top:0">Start TX power calibration</button>
     <div id="ptmsg" style="margin-top:10px;font-size:13px"></div>
     <table id="pttab" style="margin-top:6px;font-size:12px;border-collapse:collapse"></table>
+  </div>
+
+  <div style="margin-top:14px;padding:12px;background:#232833;border-radius:8px">
+    <b style="font-size:13px">TX queue cap calibration</b>
+    <div class="sub" style="margin:4px 0 8px">
+      Measures without a cap first (the reference), then with caps of 24, 16,
+      12 and 8 frames, about 19&nbsp;s each, and stops at the first one that
+      loses noticeably more than the reference or delivers less than 90&nbsp;%
+      of its throughput. The <b>smallest</b> cap that passed is saved
+      &ndash; or <i>off</i> if none did. The picture may stutter during the
+      smaller caps. <b>Traffic must be flowing.</b> Takes 1&ndash;2 minutes.
+      After applying a cap, keep an eye on <i>Dropped</i> over a few hours.
+    </div>
+    <button onclick="autotune('cap')" style="margin-top:0">Start queue cap calibration</button>
+    <div id="qcmsg" style="margin-top:10px;font-size:13px"></div>
+    <table id="qctab" style="margin-top:6px;font-size:12px;border-collapse:collapse"></table>
   </div>
 
   <div style="margin-top:14px;padding:12px;background:#232833;border-radius:8px">
@@ -573,7 +603,7 @@ let PROV=false;
    the TRANSITION to "done". Doing it on every 2 s poll while the board
    reports "done" would make a manually edited value jump back before it
    is saved. */
-let ATPREV=-1, PTPREV=-1, PTRES=0;
+let ATPREV=-1, PTPREV=-1, PTRES=0, QCPREV=-1, QCRES=-1;
 function fmt(k){return k>1000?(k/1000).toFixed(1)+' Mbit/s':k+' kbit/s'}
 function dur(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
   return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m')}
@@ -672,7 +702,8 @@ async function tick(){
     /* The tables only change when a measurement finishes - fill them on the
        first poll, refresh them while a run is active and once on the
        transition out of it. */
-    if(ATPREV===-1||s.at===1||s.pt===1||(ATPREV===1&&s.at!==1)||(PTPREV===1&&s.pt!==1)) atTables();
+    if(ATPREV===-1||s.at===1||s.pt===1||s.qc===1||(ATPREV===1&&s.at!==1)||
+       (PTPREV===1&&s.pt!==1)||(QCPREV===1&&s.qc!==1)) atTables();
     ATPREV=s.at;
     const dbm=v=>(v/4).toFixed(2).replace(/\.?0+$/,'')+' dBm';
     if(s.pt===1) $('ptmsg').textContent='TX power calibration running - measurement '+(s.pt_s+1)+
@@ -683,6 +714,15 @@ async function tick(){
     else if(s.pt===3) $('ptmsg').textContent='Aborted: too little traffic during the measurement. '+
                       'Let the camera stream and start again.';
     PTPREV=s.pt;
+    if(s.qc===1) $('qcmsg').textContent='Queue cap calibration running - measurement '+(s.qc_s+1)+
+                 ', testing '+(s.qc_k?'cap '+s.qc_k:'without cap')+' (about 19 s each)';
+    else if(s.qc===2){ QCRES=s.qc_r; $('qcmsg').textContent='Done - chosen: '+
+                         (s.qc_r?'cap '+s.qc_r+' frames':'no cap (every cap cost too much)')+', saved.';
+                       if(QCPREV===1){ $('txq_cap').value=s.qc_r;
+                         if(SNAP){SNAP.txq_cap=String(s.qc_r);dirtyCheck()} } }
+    else if(s.qc===3) $('qcmsg').textContent='Aborted: too little traffic during the measurement. '+
+                      'Let the camera stream and start again.';
+    QCPREV=s.qc;
     /* Mean frames waiting in the driver queue and the resulting wait. A few
        ms is normal; tens to hundreds of ms mean the uplink cannot keep up. */
     $('txq').textContent=(s.wifi&&s.txq_ms!==undefined)?s.txq_ms+' ms':'-';
@@ -724,7 +764,7 @@ const CFG=['name','ssid1','ssid2','ssid3','ip','mask','gw','ip2','mask2','gw2','
            'static_rx_buf','dynamic_rx_buf','dynamic_tx_buf','rx_ba_win',
            'ht40','no_11b','wd_enable','wd_actions','wd_bad_windows',
            'wifi_connect_timeout_s','wifi_connect_retries','ap_idle_reboot_s',
-           'roam_enable','roam_check_s','roam_rssi_threshold','roam_margin_db'];
+           'roam_enable','roam_check_s','roam_rssi_threshold','roam_margin_db','txq_cap'];
 /* Fill the form from /api/config and take the unsaved-changes snapshot. */
 async function load(){
   const c=await(await fetch('/api/config')).json();
@@ -786,12 +826,14 @@ function defaults(){
   if(!DEF){$('tmsg').textContent='Defaults not loaded yet';return}
   for(const k in DEF) if($(k)) $(k).value=DEF[k];
   $('tx_power').value='0';
+  $('txq_cap').value='0';
   $('tmsg').textContent='Defaults filled in - save to apply.';
   dirtyCheck();   /* set by script - does not fire an input event */
 }
-/* Start the retry calibration, or with kind 'txp' the TX power one. */
+/* Start the retry calibration, or with kind 'txp' / 'cap' the TX power or
+   queue cap one. */
 async function autotune(kind){
-  const m=$(kind?'ptmsg':'atmsg');
+  const m=$(kind==='txp'?'ptmsg':kind==='cap'?'qcmsg':'atmsg');
   m.textContent='Starting...';
   try{
     const j=await(await fetch('/api/autotune'+(kind?'?kind='+kind:''),{method:'POST'})).json();
@@ -812,6 +854,10 @@ async function atTables(){
     $('pttab').innerHTML=j.txp.length?'<tr>'+['Power','Driver','Loss','Queue delay'].map(t=>td(t,1)).join('')+'</tr>'+
       j.txp.map(e=>'<tr'+(e.k===PTRES?' style="font-weight:bold"':'')+'>'+td(dbm(e.k))+td(dbm(e.act))+
         td(pct(e.loss))+td(e.delay<0?'-':(e.delay/10).toFixed(1)+' ms')+'</tr>').join(''):'';
+    $('qctab').innerHTML=j.cap&&j.cap.length?'<tr>'+['Cap','Loss','Queue delay','Throughput'].map(t=>td(t,1)).join('')+'</tr>'+
+      j.cap.map(e=>'<tr'+(e.k===QCRES?' style="font-weight:bold"':'')+'>'+td(e.k?e.k+' frames':'off')+
+        td(pct(e.loss))+td(e.delay<0?'-':(e.delay/10).toFixed(1)+' ms')+
+        td(e.kbps<0?'-':(e.kbps/1000).toFixed(2)+' Mbit/s')+'</tr>').join(''):'';
   }catch(e){}
 }
 /* Trigger a reboot and reload the page as soon as the board answers again -
@@ -870,7 +916,7 @@ const PW=['pass1','pass2','pass3','mqtt_pass','admin_pass'];
    bridge_apply_live_tuning()). Everything else only after a reboot. */
 const LIVE=['tx_power','eth_tx_retries','wifi_tx_retries','wd_enable','wd_actions','wd_bad_windows',
             'roam_enable','roam_check_s','roam_rssi_threshold','roam_margin_db',
-            'ap_idle_reboot_s','telemetry_s','admin_pass'];
+            'ap_idle_reboot_s','telemetry_s','admin_pass','txq_cap'];
 let SNAP=null;
 function snapshot(){SNAP={};for(const k of CFG)SNAP[k]=$(k).value;dirtyCheck()}
 /* Names of all fields that differ from the baseline. */
@@ -1015,7 +1061,7 @@ static esp_err_t h_status(httpd_req_t *r) {
   BridgeStats st;
   bridge_get_stats(&st);
 
-  char buf[1100];
+  char buf[1250];
   snprintf(buf, sizeof(buf),
     "{\"prov\":%d,\"wifi\":%d,\"eth\":%d,\"rssi\":%d,\"ch\":%u,"
     "\"kbps_up\":%lu,\"kbps_down\":%lu,\"pkt_up\":%lu,\"pkt_down\":%lu,"
@@ -1030,6 +1076,7 @@ static esp_err_t h_status(httpd_req_t *r) {
     "\"txp\":%d,\"bw\":%u,\"air_ok\":%lu,\"air_fail\":%lu,\"cc\":\"%s\",\"cc_max\":%d,"
     "\"txq\":%lu,\"txq_x10\":%lu,\"txq_ms\":%lu,"
     "\"pt\":%d,\"pt_s\":%u,\"pt_k\":%d,\"pt_r\":%d,"
+    "\"drop_cap\":%lu,\"txq_cap\":%u,\"qc\":%d,\"qc_s\":%u,\"qc_k\":%u,\"qc_r\":%d,"
     "\"time\":%lu,\"build\":\"" GIT_REV "\"}",
     s_provisioning ? 1 : 0, st.wifi_up ? 1 : 0, st.eth_link ? 1 : 0,
     (int)st.rssi, (unsigned)st.channel,
@@ -1074,6 +1121,11 @@ static esp_err_t h_status(httpd_req_t *r) {
     /* TX power autotune, same state codes as "at". */
     (int)bridge_txp_tune_state(), bridge_txp_tune_step(),
     (int)bridge_txp_tune_candidate(), (int)bridge_txp_tune_result(),
+    /* TX queue cap: its drops, the cap in effect, and its autotune (qc_r
+     * -1 = no result yet, 0 = off). */
+    (unsigned long)st.drop_cap, (unsigned)st.txq_cap,
+    (int)bridge_cap_tune_state(), bridge_cap_tune_step(), bridge_cap_tune_candidate(),
+    bridge_cap_tune_result() == 0xFF ? -1 : (int)bridge_cap_tune_result(),
     /* Time UTC, 0 = not set via SNTP yet. */
     (unsigned long)crashlog_now());
 
@@ -1208,7 +1260,7 @@ static esp_err_t h_config_get(httpd_req_t *r) {
     "\"wifi_connect_timeout_s\":%u,\"wifi_connect_retries\":%u,"
     "\"ap_idle_reboot_s\":%u,"
     "\"roam_enable\":%u,\"roam_check_s\":%u,\"roam_rssi_threshold\":%d,"
-    "\"roam_margin_db\":%u,"
+    "\"roam_margin_db\":%u,\"txq_cap\":%u,"
     "\"def\":{\"eth_tx_retries\":%u,\"wifi_tx_retries\":%u,"
     "\"static_rx_buf\":%u,\"dynamic_rx_buf\":%u,\"dynamic_tx_buf\":%u,"
     "\"rx_ba_win\":%u,\"wifi_connect_timeout_s\":%u,"
@@ -1237,6 +1289,7 @@ static esp_err_t h_config_get(httpd_req_t *r) {
     eff.wd_actions, eff.wd_bad_windows,
     eff.wifi_connect_timeout_s, eff.wifi_connect_retries, eff.ap_idle_reboot_s,
     g_cfg.roam_enable, eff.roam_check_s, (int)eff.roam_rssi_threshold, eff.roam_margin_db,
+    g_cfg.txq_cap,
     def.eth_retries, def.wifi_retries,
     def.static_rx, def.dyn_rx, def.dyn_tx, def.ba_win,
     def.wifi_connect_timeout_s, def.wifi_connect_retries, def.ap_idle_reboot_s,
@@ -1402,6 +1455,16 @@ static esp_err_t h_config_post(httpd_req_t *r) {
     if (t > 30) t = 30;   /* 30 x 20 s = 10 min - beyond that it's no longer a watchdog */
     g_cfg.wd_bad_windows = (uint8_t)t;
   }
+  /* Also immediate. 0 = off; below 4 frames the cap would drop inside
+   * every ordinary burst, above 64 it can never trigger with any buffer
+   * count the portal allows. */
+  if (form_get(body, "txq_cap", v, sizeof(v))) {
+    int t = atoi(v);
+    if (t < 0)            t = 0;
+    if (t != 0 && t < 4)  t = 4;
+    if (t > 64)           t = 64;
+    g_cfg.txq_cap = (uint8_t)t;
+  }
 
   /* Lower limit 60 s, so a typo (e.g. "5" instead of "500") cannot send the
    * device into a fast reboot loop in portal mode. */
@@ -1457,13 +1520,14 @@ static esp_err_t h_config_post(httpd_req_t *r) {
   return httpd_resp_send(r, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
 
-/* POST /api/autotune - start the retry autotune, or with ?kind=txp the TX
- * power autotune (see bridge.h). */
+/* POST /api/autotune - start the retry autotune, with ?kind=txp the TX power
+ * autotune, with ?kind=cap the TX queue cap autotune (see bridge.h). */
 static esp_err_t h_autotune(httpd_req_t *r) {
   char q[32] = "", kind[8] = "";
   if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK)
     httpd_query_key_value(q, "kind", kind, sizeof(kind));
   const bool ok = strcmp(kind, "txp") == 0 ? bridge_txp_tune_start()
+                : strcmp(kind, "cap") == 0 ? bridge_cap_tune_start()
                                            : bridge_autotune_start();
   httpd_resp_set_type(r, "application/json");
   httpd_resp_set_hdr(r, "Cache-Control", "no-store");
@@ -1481,8 +1545,10 @@ static esp_err_t h_autotune_get(httpd_req_t *r) {
   const size_t rn = bridge_autotune_count();
   bridge_autotune_values(rk, rl);
   const size_t pn = bridge_txp_tune_values(pk, pa, pl, pd);
+  uint8_t  ck[8]; uint16_t cl[8], cd[8], cr[8];
+  const size_t cn = bridge_cap_tune_values(ck, cl, cd, cr);
 
-  char buf[900];
+  char buf[1300];
   int n = snprintf(buf, sizeof(buf), "{\"retries\":[");
   bool first = true;
   for (size_t i = 0; i < rn && n < (int)sizeof(buf) - 64; i++) {
@@ -1499,6 +1565,17 @@ static esp_err_t h_autotune_get(httpd_req_t *r) {
                   "%s{\"k\":%d,\"act\":%d,\"loss\":%d,\"delay\":%d}", first ? "" : ",",
                   (int)pk[i], (int)pa[i], pl[i] == 0xFFFE ? -1 : (int)pl[i],
                   pl[i] == 0xFFFE ? -1 : (int)pd[i]);
+    first = false;
+  }
+  n += snprintf(buf + n, sizeof(buf) - n, "],\"cap\":[");
+  first = true;
+  for (size_t i = 0; i < cn && n < (int)sizeof(buf) - 80; i++) {
+    if (cl[i] == 0xFFFF) continue;
+    const bool col = cl[i] == 0xFFFE;
+    n += snprintf(buf + n, sizeof(buf) - n,
+                  "%s{\"k\":%u,\"loss\":%d,\"delay\":%d,\"kbps\":%d}", first ? "" : ",",
+                  (unsigned)ck[i], col ? -1 : (int)cl[i], col ? -1 : (int)cd[i],
+                  col ? -1 : (int)cr[i]);
     first = false;
   }
   snprintf(buf + n, sizeof(buf) - n, "]}");

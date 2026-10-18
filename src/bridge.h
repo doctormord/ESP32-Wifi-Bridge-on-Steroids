@@ -51,6 +51,9 @@ struct BridgeStats {
   uint32_t txq_x10;           /* mean of that over the last second, x10       */
   uint32_t txq_delay_ms;      /* how long a frame waited in that queue on
                                * average over the last second (Little's law) */
+  uint32_t drop_cap;          /* frames dropped by the TX queue cap since boot
+                               * (a subset of drop_eth2wifi)                  */
+  uint8_t  txq_cap;           /* cap in effect right now, 0 = off             */
   char     country[3];        /* regulatory country in effect ("DE", "01"...),
                                * adopted from the AP's beacon by default      */
   int8_t   country_max_txp;   /* its TX power cap as esp_wifi_get_country()
@@ -230,6 +233,29 @@ int8_t           bridge_txp_tune_result(void);     /* chosen value, 0 = none */
  * 0.1 ms. Arrays need room for 8 entries; returns the number filled. */
 size_t           bridge_txp_tune_values(int8_t *candidates, int8_t *actual,
                                         uint16_t *loss, uint16_t *delay_x10);
+
+/* ---------------------------------------------------------------------------
+ * TX queue cap autotune
+ *
+ * Measures without a cap first (reference), then caps 24, 16, 12, 8 frames,
+ * and stops at the first step that loses noticeably more than the reference
+ * or delivers less than 90 % of its throughput. Saves the smallest cap that
+ * passed, or 0 (off) if none did. Same timing, collapse guard and traffic
+ * requirement as the other autotunes; never runs alongside them.
+ * ------------------------------------------------------------------------ */
+bool             bridge_cap_tune_start(void);
+/* Abort a run (restoring the configured cap) or acknowledge a result. */
+void             bridge_cap_tune_reset(void);
+autotune_state_t bridge_cap_tune_state(void);
+uint8_t          bridge_cap_tune_step(void);       /* completed measurements */
+uint8_t          bridge_cap_tune_candidate(void);  /* cap under test, 0 = off */
+uint8_t          bridge_cap_tune_result(void);     /* chosen cap, 0 = off,
+                                                    * 0xFF = no result yet   */
+/* Per candidate: cap, loss in 1/100 % (0xFFFF = not measured, 0xFFFE =
+ * collapse), queue delay in 0.1 ms and throughput in kbit/s. Arrays need
+ * room for 8 entries; returns the number filled. */
+size_t           bridge_cap_tune_values(uint8_t *candidates, uint16_t *loss,
+                                        uint16_t *delay_x10, uint16_t *kbps);
 
 /* TX power actually in effect, in 0.25 dBm units, queried from the driver.
  * Usually differs from the configured value because the PHY only knows 11

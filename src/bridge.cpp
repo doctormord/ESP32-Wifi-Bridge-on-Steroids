@@ -205,6 +205,17 @@ static volatile uint32_t s_q_idle   = 0;   /* written by bridge_tick() only  */
 static uint32_t s_q_avg_x10  = 0;    /* mean depth over the last second, x10 */
 static uint32_t s_q_delay_ms = 0;    /* matching queue delay                 */
 
+/* TX queue cap in frames, 0 = off (g_cfg.txq_cap, or the value under test
+ * during a cap calibration), and the frames it dropped. Those drops are also
+ * counted in s_drop_e2w, so every loss figure includes them. */
+static volatile uint8_t  s_txq_cap  = 0;
+static volatile uint32_t s_drop_cap = 0;
+
+/* Frames up to this size bypass the cap: TCP ACKs, ARP, ICMP, DNS. They cost
+ * next to no airtime, and dropping a camera's ACKs or the gateway's ARP
+ * would hurt far more than queueing them. */
+#define TXQ_CAP_MIN_LEN 256u
+
 /* Current queue depth estimate (may be negative before a resync). */
 IRAM_ATTR static inline int32_t txq_depth(uint32_t done) {
   return (int32_t)(s_pkt_e2w - done - s_q_base - s_q_idle);
@@ -566,6 +577,23 @@ IRAM_ATTR static esp_err_t eth_rx_cb(esp_eth_handle_t h, uint8_t *buffer,
    * attached client would cut its own TCP connection (bridge_set_paused()
    * promises the opposite). */
   if (s_paused) { free(buffer); return ESP_OK; }   /* paused, not a drop */
+
+  /* Queue cap: with more than s_txq_cap frames already waiting for the air,
+   * drop a large frame NOW rather than letting it occupy a TX buffer. The
+   * point is latency: every queued frame delays everything behind it -
+   * pings, the management portal, the client's own ACK-clocked TCP - and a
+   * camera's I-frame burst otherwise fills all TX buffers (tens of ms of
+   * queue, ~1.7 KB of heap per frame). Deliberately no waiting here: a frame
+   * held back in this task just moves the same backlog into the Ethernet
+   * DMA ring. The retry loop below still handles a genuinely full buffer. */
+  const uint8_t cap = s_txq_cap;
+  if (cap && len > TXQ_CAP_MIN_LEN && s_active && s_wifi_up &&
+      txq_depth(s_air_done) >= (int32_t)cap) {
+    s_drop_cap = s_drop_cap + 1;
+    s_drop_e2w = s_drop_e2w + 1;
+    free(buffer);
+    return ESP_OK;
+  }
 
   esp_err_t err = ESP_FAIL;
   if (s_active && s_wifi_up) {
@@ -1320,6 +1348,8 @@ void bridge_apply_live_tuning(void) {
    * portal does not fill it in again. */
   bridge_autotune_reset();
   bridge_txp_tune_reset();
+  bridge_cap_tune_reset();
+  s_txq_cap = g_cfg.txq_cap;
 
   /* Remember the PHY's initial value on the first call. */
   if (!s_txp_default) {
@@ -1352,8 +1382,8 @@ void bridge_apply_live_tuning(void) {
     }
   }
 
-  printf("[BRDG] Retries eth->wifi=%u wifi->eth=%u\n",
-         (unsigned)s_eth_tx_retries, (unsigned)s_wifi_tx_retries);
+  printf("[BRDG] Retries eth->wifi=%u wifi->eth=%u, TX queue cap %u\n",
+         (unsigned)s_eth_tx_retries, (unsigned)s_wifi_tx_retries, (unsigned)s_txq_cap);
 }
 
 int16_t bridge_get_tx_power(void) {
@@ -1448,7 +1478,8 @@ static void at_start_step(uint8_t idx) {
 
 /* See bridge.h. Starts at the candidate closest to the current value. */
 bool bridge_autotune_start(void) {
-  if (!s_active || s_at_state == AT_RUNNING || bridge_txp_tune_state() == AT_RUNNING)
+  if (!s_active || s_at_state == AT_RUNNING || bridge_txp_tune_state() == AT_RUNNING ||
+      bridge_cap_tune_state() == AT_RUNNING)
     return false;
   s_at_prev      = s_eth_tx_retries;
   s_at_start_idx = at_nearest_idx(s_at_prev);
@@ -1721,7 +1752,8 @@ static void tp_start_step(uint8_t idx) {
 
 /* See bridge.h. */
 bool bridge_txp_tune_start(void) {
-  if (!s_active || s_tp_state == AT_RUNNING || s_at_state == AT_RUNNING) return false;
+  if (!s_active || s_tp_state == AT_RUNNING || s_at_state == AT_RUNNING ||
+      bridge_cap_tune_state() == AT_RUNNING) return false;
   const int8_t cur = g_cfg.tx_power ? g_cfg.tx_power : s_txp_default;
   uint8_t best = 0;
   for (uint8_t i = 1; i < TP_N; i++)
@@ -1880,6 +1912,171 @@ static void txp_tune_tick(void) {
          (unsigned)(s_tp_delay[s_tp_idx] / 10), (unsigned)(s_tp_delay[s_tp_idx] % 10),
          (unsigned)(dp + dd));
   tp_advance(false);
+}
+
+/* ===========================================================================
+ * Autotune of the TX queue cap
+ * ========================================================================= */
+
+/*
+ * The cap trades loss for latency, so the question is how small it can get
+ * before it costs anything measurable. Order: no cap first (the reference
+ * for loss, throughput and packet rate), then ever smaller caps; the first
+ * step that loses more than the tolerance allows (same slack rule as the
+ * other autotunes, relative to the reference) or delivers less than 90 % of
+ * the reference throughput ends the run. A camera's encoder produces a fixed
+ * bitrate, so a TCP stream that backs off under the drops shows up as lost
+ * throughput. The smallest cap that passed is saved - or "off" if none did.
+ *
+ * 15 s windows see the immediate effect on loss and rate, not how a
+ * recorder copes with the retransmissions over hours - worth a look at the
+ * long-run drop counter after applying a result.
+ */
+static const uint8_t QC_CANDIDATES[] = { 0, 24, 16, 12, 8 };   /* 0 = no cap */
+#define QC_N          (sizeof(QC_CANDIDATES) / sizeof(QC_CANDIDATES[0]))
+#define QC_RATE_PCT   90u    /* minimum throughput vs. the reference */
+#define QC_NONE       0xFFu  /* "no result" marker for s_qc_result    */
+
+static autotune_state_t s_qc_state = AT_IDLE;
+static uint8_t   s_qc_idx, s_qc_steps, s_qc_result = QC_NONE;
+static bool      s_qc_measuring;
+static uint32_t  s_qc_t0, s_qc_pkt_step0, s_qc_ref_pps;
+static uint32_t  s_qc_pkt0, s_qc_drop0, s_qc_fail0, s_qc_qs0, s_qc_dn0;
+static uint64_t  s_qc_by0;
+static uint16_t  s_qc_loss[QC_N]  = { 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF };  /* 1/100 % */
+static uint16_t  s_qc_delay[QC_N] = { 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF };  /* 0.1 ms  */
+static uint16_t  s_qc_kbps[QC_N];
+static_assert(QC_N == 5, "update the s_qc_* initializers");
+
+/* Begin measuring candidate `idx`. */
+static void qc_start_step(uint8_t idx) {
+  s_qc_idx = idx;
+  s_txq_cap = QC_CANDIDATES[idx];
+  s_qc_measuring = false;
+  s_qc_t0 = millis();
+  s_qc_pkt_step0 = s_pkt_e2w;
+}
+
+/* See bridge.h. */
+bool bridge_cap_tune_start(void) {
+  if (!s_active || s_qc_state == AT_RUNNING || s_at_state == AT_RUNNING ||
+      s_tp_state == AT_RUNNING) return false;
+  for (size_t i = 0; i < QC_N; i++) { s_qc_loss[i] = 0xFFFF; s_qc_delay[i] = 0xFFFF; s_qc_kbps[i] = 0; }
+  s_qc_steps = 0;
+  s_qc_ref_pps = 0;
+  s_qc_result = QC_NONE;
+  s_qc_state = AT_RUNNING;
+  qc_start_step(0);
+  printf("[QCAP] Start (configured cap %u), %u s per step\n",
+         (unsigned)g_cfg.txq_cap, (unsigned)((AT_SETTLE_MS + AT_MEASURE_MS) / 1000));
+  return true;
+}
+
+/* See bridge.h. Restores the configured cap if a run is aborted. */
+void bridge_cap_tune_reset(void) {
+  if (s_qc_state == AT_RUNNING) {
+    printf("[QCAP] Aborted - value was saved manually\n");
+    s_txq_cap = g_cfg.txq_cap;
+  }
+  s_qc_state = AT_IDLE;
+}
+
+autotune_state_t bridge_cap_tune_state(void) { return s_qc_state; }
+uint8_t bridge_cap_tune_step(void)           { return s_qc_steps; }
+uint8_t bridge_cap_tune_candidate(void)      { return QC_CANDIDATES[s_qc_idx]; }
+uint8_t bridge_cap_tune_result(void)         { return s_qc_result; }
+size_t  bridge_cap_tune_values(uint8_t *k, uint16_t *loss, uint16_t *delay_x10, uint16_t *kbps) {
+  for (size_t i = 0; i < QC_N; i++) {
+    k[i] = QC_CANDIDATES[i]; loss[i] = s_qc_loss[i];
+    delay_x10[i] = s_qc_delay[i]; kbps[i] = s_qc_kbps[i];
+  }
+  return QC_N;
+}
+
+/* Does step i keep up with the reference (step 0)? */
+static bool qc_passes(size_t i) {
+  if (s_qc_loss[i] >= AT_LOSS_COLLAPSED) return false;
+  const uint32_t ref = s_qc_loss[0];
+  const uint32_t slack = ref / 4 > 3 ? ref / 4 : 3;
+  uint32_t allowed = ref + slack;
+  if (allowed < AT_TARGET_LOSS) allowed = AT_TARGET_LOSS;
+  return s_qc_loss[i] <= allowed &&
+         (uint32_t)s_qc_kbps[i] * 100 >= (uint32_t)s_qc_kbps[0] * QC_RATE_PCT;
+}
+
+/* End the run with the smallest passing cap (index `last_ok`), save it. */
+static void qc_finish(uint8_t last_ok) {
+  s_qc_result = QC_CANDIDATES[last_ok];
+  s_txq_cap = s_qc_result;
+  g_cfg.txq_cap = s_qc_result;
+  cfg_save();
+  s_qc_state = AT_DONE;
+  printf("[QCAP] Done after %u measurements - chosen: %s%u (saved)\n",
+         (unsigned)s_qc_steps, s_qc_result ? "cap " : "no cap ", (unsigned)s_qc_result);
+}
+
+/* TX queue cap autotune state machine, driven from bridge_tick() with the
+ * same settle/measure timing and collapse guard as the other autotunes. */
+static void cap_tune_tick(void) {
+  if (s_qc_state != AT_RUNNING) return;
+  const uint32_t elapsed = millis() - s_qc_t0;
+
+  if (s_qc_ref_pps && elapsed >= AT_COLLAPSE_MS) {
+    const uint32_t pkt = s_pkt_e2w - s_qc_pkt_step0;
+    const uint32_t expected = (uint32_t)((uint64_t)s_qc_ref_pps * elapsed / 1000);
+    if ((uint64_t)pkt * 100 < (uint64_t)expected * AT_COLLAPSE_PCT) {
+      printf("[QCAP] Cap %u -> collapse (%u instead of ~%u packets) - stopping\n",
+             (unsigned)QC_CANDIDATES[s_qc_idx], (unsigned)pkt, (unsigned)expected);
+      s_qc_loss[s_qc_idx] = AT_LOSS_COLLAPSED;
+      s_qc_steps++;
+      qc_finish(s_qc_idx - 1);
+      return;
+    }
+  }
+
+  if (!s_qc_measuring) {
+    if (elapsed < AT_SETTLE_MS) return;
+    s_qc_pkt0 = s_pkt_e2w; s_qc_drop0 = s_drop_e2w; s_qc_fail0 = s_air_fail;
+    s_qc_qs0 = s_q_sum;    s_qc_dn0 = s_air_done; s_qc_by0 = s_by_e2w;
+    s_qc_measuring = true;
+    return;
+  }
+  if (elapsed < AT_SETTLE_MS + AT_MEASURE_MS) return;
+
+  const uint32_t dp = s_pkt_e2w - s_qc_pkt0;
+  const uint32_t dd = (s_drop_e2w - s_qc_drop0) + (s_air_fail - s_qc_fail0);
+  const uint32_t dsum = s_q_sum - s_qc_qs0, ddone = s_air_done - s_qc_dn0;
+  const uint64_t dby = s_by_e2w - s_qc_by0;
+  s_qc_steps++;
+
+  if (dp + dd < AT_MIN_PACKETS || !ddone) {
+    if (s_qc_idx == 0) {
+      printf("[QCAP] Aborted: only %u packets in %u s - too little traffic\n",
+             (unsigned)(dp + dd), (unsigned)(AT_MEASURE_MS / 1000));
+      s_txq_cap = g_cfg.txq_cap;
+      s_qc_state = AT_TOO_LITTLE_TRAFFIC;
+      return;
+    }
+    s_qc_loss[s_qc_idx] = AT_LOSS_COLLAPSED;
+    qc_finish(s_qc_idx - 1);
+    return;
+  }
+
+  s_qc_loss[s_qc_idx] = (uint16_t)((10000ULL * dd) / (dp + dd));
+  const uint64_t d10 = (10ULL * dsum * AT_MEASURE_MS) / ((uint64_t)ddone * ddone);
+  s_qc_delay[s_qc_idx] = (uint16_t)(d10 < 0xFFFE ? d10 : 0xFFFE);
+  const uint64_t kb = dby * 8 / AT_MEASURE_MS;
+  s_qc_kbps[s_qc_idx] = (uint16_t)(kb < 0xFFFF ? kb : 0xFFFF);
+  if (s_qc_idx == 0) s_qc_ref_pps = (dp + dd) * 1000 / AT_MEASURE_MS;
+  printf("[QCAP] Cap %2u -> %u.%02u %% loss, queue %u.%u ms, %u kbit/s (%u packets)\n",
+         (unsigned)QC_CANDIDATES[s_qc_idx],
+         (unsigned)(s_qc_loss[s_qc_idx] / 100), (unsigned)(s_qc_loss[s_qc_idx] % 100),
+         (unsigned)(s_qc_delay[s_qc_idx] / 10), (unsigned)(s_qc_delay[s_qc_idx] % 10),
+         (unsigned)s_qc_kbps[s_qc_idx], (unsigned)(dp + dd));
+
+  if (s_qc_idx > 0 && !qc_passes(s_qc_idx)) { qc_finish(s_qc_idx - 1); return; }
+  if (s_qc_idx + 1 < (int)QC_N) { qc_start_step(s_qc_idx + 1); return; }
+  qc_finish(s_qc_idx);
 }
 
 /* ===========================================================================
@@ -2296,6 +2493,7 @@ static void roam_tick(void) {
 void bridge_tick(void) {
   autotune_tick();
   txp_tune_tick();
+  cap_tune_tick();
   watchdog_tick();
   roam_tick();
 
@@ -2373,6 +2571,8 @@ void bridge_get_stats(BridgeStats *o) {
   o->txq_delay_ms = s_q_delay_ms;
   const int32_t depth = txq_depth(s_air_done);
   o->txq_now = depth > 0 ? (uint32_t)depth : 0;
+  o->drop_cap = s_drop_cap;
+  o->txq_cap  = s_txq_cap;
   wifi_country_t cc;
   if (esp_wifi_get_country(&cc) == ESP_OK) {
     o->country[0] = cc.cc[0] >= ' ' ? cc.cc[0] : '?';

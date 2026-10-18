@@ -161,6 +161,15 @@ struct BridgeConfig {
   uint8_t  wd_actions;           /* bit mask of WD_ACT_*, 0 = all           */
   uint8_t  wd_bad_windows;       /* consecutive bad measurement windows
                                    * before the next action, 0 = default (3) */
+
+  /* --- TX queue cap (live) ------------------------------------------------
+   * Maximum number of LAN->Wi-Fi frames allowed to wait in the driver's TX
+   * queue; a larger frame arriving beyond that is dropped at once instead of
+   * occupying one of the dynamic TX buffers. Bounds the queue delay (and the
+   * heap the queue eats) at the cost of some loss in bursts - see
+   * bridge.cpp: eth_rx_cb(). 0 = off, i.e. the queue is only limited by the
+   * TX buffer count. */
+  uint8_t  txq_cap;
 };
 
 extern BridgeConfig g_cfg;
