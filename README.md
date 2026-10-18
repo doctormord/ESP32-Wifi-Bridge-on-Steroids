@@ -64,10 +64,10 @@ The Wi-Fi STA and the management netif share the cloned MAC but have different I
 
 1. Load the configuration from NVS. Decide the mode: **provisioning** (no credentials, factory-reset pin held, previous bridge start failed, or three unstable boots in a row) or **bridge**.
 2. Bridge mode: start Ethernet, wait for the first frame of the client to learn its MAC (or fall back to the MAC stored from an earlier boot), switch the EMAC to promiscuous mode.
-3. Start Wi-Fi with the cloned MAC; try each configured SSID with several attempts, always picking the strongest AP of that SSID.
+3. Start Wi-Fi with the cloned MAC and scan once: try the configured SSIDs that are actually visible in their configured priority first, then the unseen ones (a hidden SSID does not show up in a scan), each with several attempts, always picking the strongest AP of that SSID. An absent network 1 therefore costs no timeouts at boot, and the priority order stays meaningful when it returns.
 4. Detect the location by pinging each profile's gateway, apply that profile's static IP.
 5. Arm the data path, start the HTTP server, MQTT, SNTP and the NetBIOS responder.
-6. After 30 s of network reachability, confirm the OTA image so it is not rolled back; after 60 s, mark the boot as stable.
+6. After 30 s of network reachability, confirm the OTA image so it is not rolled back; after 60 s, mark the boot as stable. In portal mode with stored credentials a new image is *not* confirmed — the portal then means the new firmware could not get onto the network, and the portal idle reboot rolls back to the previous one.
 
 ---
 
@@ -124,6 +124,7 @@ These do essentially the same MAC-cloning trick, and they work. What you don't g
 ### Multi-site operation
 
 - **Three network profiles**, each with its own SSID, password, IP, netmask and gateway. Empty mask/gateway fields fall back to profile 1, so a half-filled profile never leaves the board unreachable.
+- **Network failover and failback**: if the connected network disappears at runtime, the bridge switches to the next configured network after the same time a boot spends on one network (connect timeout × attempts, default 60 s), round-robin. While on a lower-priority network it checks every 5 min with a targeted scan whether a higher-priority one is back (≥ −80 dBm) and returns to it; a failback that does not connect doubles that interval (up to 1 h). Every switch is logged with the trigger `failover` and re-runs the location detection.
 - **Automatic location detection**: after associating, the bridge pings each configured profile's gateway and adopts the one that answers. This works even when several sites use the *same SSID* — a case where selecting by SSID alone cannot work.
 - **Strongest-AP selection** (`WIFI_ALL_CHANNEL_SCAN` + `WIFI_CONNECT_AP_BY_SIGNAL`). In a mesh with several nodes sharing an SSID, the ESP-IDF default (`WIFI_FAST_SCAN`) picks whichever it finds first and never re-evaluates.
 - **Connect retries per SSID** (default 3 × 20 s): a quick reboot can find the AP still holding the old session of the cloned MAC, so a single attempt is not enough.
@@ -272,7 +273,8 @@ All endpoints are served on the management IP (or `192.168.4.1` in provisioning 
 | `pkt_*`, `drop_*` | Forwarded and dropped packets since boot, per direction |
 | `wifi_disc` | All disconnect events since boot (incl. failed attempts and own disconnects) |
 | `wifi_kicks` | Real drops of an existing connection, externally caused |
-| `disc_r`, `disc_rs`, `disc_src`, `disc_ago` | Last real drop: reason code and name, trigger (0 external, 1 connect, 2 watchdog, 3 roaming, 4 restart), seconds ago |
+| `disc_r`, `disc_rs`, `disc_src`, `disc_ago` | Last real drop: reason code and name, trigger (0 external, 1 connect, 2 watchdog, 3 roaming, 4 restart, 5 failover), seconds ago |
+| `net`, `fo` | Configured network slot in use (1–3), network switches (failover/failback) since boot |
 | `wd_probe` | Last watchdog gateway probe: 0 not needed/off, 1 ok, 2 failed |
 | `wd_reconnects`, `wd_eth_resets` | Watchdog actions since boot |
 | `wd_last_reason` | Reason of the last watchdog reboot (survives the reboot): 0 none, 1 loss ratio, 2 reconnects, 3 gateway probe, 4 no client traffic |

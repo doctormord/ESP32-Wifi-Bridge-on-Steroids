@@ -336,6 +336,10 @@ static void disc_log_add(const wifi_event_sta_disconnected_t *d, bool was_up) {
   uint8_t src = DISC_SRC_EXTERN;
   if (s_restarting) src = DISC_SRC_RESTART;
   else if (s_disc_src != DISC_SRC_EXTERN && now_ms - s_disc_src_ms < 3000) src = s_disc_src;
+  /* Before the bridge is active, every event belongs to the boot-time
+   * connect sequence - e.g. NO_AP_FOUND for a configured network that is
+   * not there. Not a radio problem of a running link. */
+  else if (!s_active && !was_up) src = DISC_SRC_CONNECT;
   s_disc_src = DISC_SRC_EXTERN;
 
   dl_ensure_locked();
@@ -1017,6 +1021,53 @@ static void detect_location(size_t preferred) {
 }
 #endif
 
+/* --- Configured networks ------------------------------------------------- */
+
+/* Index (0..2) of the network slot the STA is configured for right now. */
+static volatile uint8_t s_cur_net = 0;
+
+static const char *net_ssid(size_t i) { return i==2 ? g_cfg.ssid3 : i==1 ? g_cfg.ssid2 : g_cfg.ssid1; }
+static const char *net_pass(size_t i) { return i==2 ? g_cfg.pass3 : i==1 ? g_cfg.pass2 : g_cfg.pass1; }
+static bool        net_in_use(size_t i) { return net_ssid(i)[0] != '\0'; }
+
+/* Point the STA at network slot i (driver may be started; a running
+ * association is dropped by IDF). Takes the STRONGEST AP of that SSID, not
+ * the first one found: the default WIFI_FAST_SCAN connects to the first
+ * match, which in a mesh with several nodes under one SSID is a lottery -
+ * and the ESP32 does not switch on its own afterwards. ALL_CHANNEL_SCAN
+ * costs a few seconds per connect. */
+static void sta_set_net(size_t i) {
+  wifi_config_t wc = {};
+  strncpy((char *)wc.sta.ssid,     net_ssid(i), sizeof(wc.sta.ssid) - 1);
+  strncpy((char *)wc.sta.password, net_pass(i), sizeof(wc.sta.password) - 1);
+  wc.sta.pmf_cfg.capable = true;
+  wc.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+  wc.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+  esp_err_t e = esp_wifi_set_config(WIFI_IF_STA, &wc);
+  if (e != ESP_OK) printf("[WIFI] set_config('%s'): %s\n", net_ssid(i), esp_err_to_name(e));
+  s_cur_net = (uint8_t)i;
+}
+
+/* One blocking scan of all channels; vis[i] = network slot i was seen.
+ * Returns false if the scan itself failed (vis is then meaningless). Only
+ * call while no connect attempt is running - IDF refuses to scan then. */
+static bool scan_visible_nets(bool vis[3]) {
+  wifi_scan_config_t sc = {};
+  if (esp_wifi_scan_start(&sc, true) != ESP_OK) return false;
+  uint16_t n = 0;
+  esp_wifi_scan_get_ap_num(&n);
+  if (n > 32) n = 32;
+  wifi_ap_record_t *recs = n ? (wifi_ap_record_t *)malloc(sizeof(wifi_ap_record_t) * n) : NULL;
+  if (n && !recs) { esp_wifi_clear_ap_list(); return false; }
+  if (n) esp_wifi_scan_get_ap_records(&n, recs);
+  esp_wifi_clear_ap_list();    /* frees what did not fit into recs */
+  for (uint16_t k = 0; k < n; k++)
+    for (size_t i = 0; i < 3; i++)
+      if (net_in_use(i) && strcmp((const char *)recs[k].ssid, net_ssid(i)) == 0) vis[i] = true;
+  free(recs);
+  return true;
+}
+
 /* Bring up Wi-Fi in STA mode with the cloned client MAC (see bridge.h).
  *
  * Steps: create the management netif with a static IP, initialize the Wi-Fi
@@ -1156,14 +1207,9 @@ bool bridge_wifi_start(void) {
   esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
                                       &wifi_evt, NULL, NULL);
 
-  struct { const char *ssid; const char *pass; } nets[] = {
-    { g_cfg.ssid1, g_cfg.pass1 },
-    { g_cfg.ssid2, g_cfg.pass2 },
-    { g_cfg.ssid3, g_cfg.pass3 },
-  };
-
   /* Portal overrides, 0 = firmware default - same convention as the other
-   * tuning values (config.h). Remembered for display. */
+   * tuning values (config.h). Remembered for display, and they also set how
+   * long the runtime failover waits (see failover_tick()). */
   const uint32_t connect_timeout_ms = g_cfg.wifi_connect_timeout_s
       ? (uint32_t)g_cfg.wifi_connect_timeout_s * 1000u : WIFI_CONNECT_TIMEOUT_MS_DEF;
   const int connect_retries = g_cfg.wifi_connect_retries
@@ -1171,51 +1217,53 @@ bool bridge_wifi_start(void) {
   s_eff_wifi_connect_timeout_s = (uint16_t)(connect_timeout_ms / 1000);
   s_eff_wifi_connect_retries   = (uint8_t)connect_retries;
 
-  for (size_t i = 0; i < 3; i++) {
-    if (nets[i].ssid[0] == '\0') continue;
-    printf("[WIFI] Connecting to '%s'...\n", nets[i].ssid);
+  size_t first = 3;
+  for (size_t i = 0; i < 3 && first == 3; i++) if (net_in_use(i)) first = i;
+  if (first == 3) return false;
 
-    wifi_config_t wc = {};
-    strncpy((char *)wc.sta.ssid,     nets[i].ssid, sizeof(wc.sta.ssid) - 1);
-    strncpy((char *)wc.sta.password, nets[i].pass, sizeof(wc.sta.password) - 1);
-    wc.sta.pmf_cfg.capable = true;
+  /* The MAC is the same for every network, so the driver is started once:
+   * set_config, THEN set_mac, THEN start. Switching networks afterwards only
+   * needs a new config (sta_set_net()). */
+  sta_set_net(first);
+  esp_err_t err = esp_wifi_set_mac(WIFI_IF_STA, s_client_mac);
+  if (err != ESP_OK) {
+    printf("[WIFI] set_mac: %s\n", esp_err_to_name(err));
+    return false;
+  }
+  ESP_ERROR_CHECK(esp_wifi_start());
 
-    /* Take the STRONGEST access point of this SSID, not the first one found.
-     *
-     * The default is WIFI_FAST_SCAN: IDF connects to the first matching AP it
-     * finds and stops searching. In a mesh with several nodes under the same
-     * SSID that is a lottery - and an ESP32 does not switch on its own
-     * afterwards. A weak node (e.g. -82 dBm instead of -63 dBm on another)
-     * means heavy packet loss and a fraction of the throughput.
-     *
-     * ALL_CHANNEL_SCAN costs a few extra seconds at connect time because all
-     * channels are really scanned. That happens once per boot. */
-    wc.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
-    wc.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+  /* Needs a started driver, like the TX power below. Purely diagnostic, so
+   * a failure is only logged. */
+  esp_err_t td = esp_wifi_set_tx_done_cb(wifi_tx_done);
+  if (td != ESP_OK) printf("[WIFI] tx_done_cb: %s\n", esp_err_to_name(td));
 
-    /* Order: set_config, THEN set_mac, THEN start. */
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
-    esp_err_t err = esp_wifi_set_mac(WIFI_IF_STA, s_client_mac);
-    if (err != ESP_OK) {
-      printf("[WIFI] set_mac: %s\n", esp_err_to_name(err));
-      return false;
-    }
+  /* TX power only AFTER esp_wifi_start() - before that the API returns
+   * ESP_ERR_WIFI_NOT_STARTED. */
+  bridge_apply_live_tuning();
 
-    ESP_ERROR_CHECK(esp_wifi_start());
+  /* Connect order: the configured networks that one scan actually sees, in
+   * the configured priority, then the unseen ones (a hidden SSID does not
+   * show up in a scan but may still connect). Without the scan, an absent
+   * network 1 would cost its full timeout x attempts on every boot before
+   * network 2 is even tried. If the scan fails, the plain priority order is
+   * used. */
+  bool vis[3] = { false, false, false };
+  const bool scanned = scan_visible_nets(vis);
+  size_t order[3]; size_t n = 0;
+  for (size_t i = 0; i < 3; i++) if (net_in_use(i) && (!scanned || vis[i])) order[n++] = i;
+  for (size_t i = 0; i < 3; i++) if (net_in_use(i) && scanned && !vis[i]) order[n++] = i;
 
-    /* Needs a started driver, like the TX power below. Purely diagnostic, so
-     * a failure is only logged. */
-    esp_err_t td = esp_wifi_set_tx_done_cb(wifi_tx_done);
-    if (td != ESP_OK) printf("[WIFI] tx_done_cb: %s\n", esp_err_to_name(td));
-
-    /* TX power only AFTER esp_wifi_start() - before that the API returns
-     * ESP_ERR_WIFI_NOT_STARTED. That is why the call sits inside the loop and
-     * not further up with the other settings. */
-    bridge_apply_live_tuning();
+  for (size_t j = 0; j < n; j++) {
+    const size_t i = order[j];
+    /* The driver was started with the first slot in use, but the scan may
+     * have put another one first - always point it at this one. */
+    if (i != s_cur_net) sta_set_net(i);
+    printf("[WIFI] Connecting to '%s'%s...\n", net_ssid(i),
+           scanned ? (vis[i] ? " (seen in scan)" : " (not seen in scan)") : "");
 
     for (int attempt = 0; attempt < connect_retries; attempt++) {
       if (attempt > 0) {
-        printf("[WIFI] '%s' attempt %d/%d...\n", nets[i].ssid,
+        printf("[WIFI] '%s' attempt %d/%d...\n", net_ssid(i),
                attempt + 1, connect_retries);
         delay(WIFI_CONNECT_RETRY_DELAY_MS);
       }
@@ -1228,6 +1276,7 @@ bool bridge_wifi_start(void) {
       esp_wifi_disconnect();
     }
     if (s_wifi_up) {
+      s_cur_net = (uint8_t)i;
       /* Connected - but at WHICH site? The SSID slot does not tell when
        * several sites share the same SSID. So try the profiles in use and
        * ping their gateways, starting with the profile of the connected slot
@@ -1238,12 +1287,11 @@ bool bridge_wifi_start(void) {
       return true;
     }
 
-    printf("[WIFI] '%s' failed after %d attempts\n",
-           nets[i].ssid, connect_retries);
+    printf("[WIFI] '%s' failed after %d attempts\n", net_ssid(i), connect_retries);
     disc_mark_own(DISC_SRC_CONNECT);
     esp_wifi_disconnect();
-    esp_wifi_stop();
   }
+  esp_wifi_stop();
   return false;
 }
 
@@ -2731,6 +2779,130 @@ static void roam_tick(void) {
 }
 
 /* ===========================================================================
+ * Network failover / failback
+ * ---------------------------------------------------------------------------
+ * The boot sequence tries the configured networks in turn, but once running,
+ * wifi_evt() only ever reconnects to the SSID it is configured for. If that
+ * network disappears (AP off, SSID disabled), the bridge would retry it
+ * forever while network 2 is right there.
+ *
+ * Failover: after the same time a boot spends on one network (connect
+ * timeout x attempts) without a connection, switch to the next configured
+ * network, round-robin. wifi_evt()'s reconnect loop then simply continues
+ * with the new SSID.
+ *
+ * Failback: while on a lower-priority network, check every few minutes with
+ * a targeted scan whether a higher-priority one is visible again (>= -80 dBm)
+ * and switch back - otherwise the bridge would stay on the fallback until
+ * the next reboot. A failback that does not connect ends in a failover back
+ * to the working network and doubles the check interval (up to 1 h), so a
+ * network that is visible but broken does not cause an outage every 5 min.
+ *
+ * After every switch the location detection runs again, so the management
+ * IP follows the profile of the network actually joined.
+ * ========================================================================= */
+
+#define FAILBACK_MS_MIN    300000u   /* 5 min  */
+#define FAILBACK_MS_MAX   3600000u   /* 1 h    */
+#define FAILBACK_MIN_RSSI     (-80)
+
+static uint32_t s_fo_down_t0  = 0;      /* when the link went down, 0 = up   */
+static bool     s_fo_locate   = false;  /* re-run location detection once up */
+static uint32_t s_fo_count    = 0;      /* network switches since boot       */
+static uint32_t s_fb_t0       = 0;
+static uint32_t s_fb_interval = FAILBACK_MS_MIN;
+static bool     s_fb_trying   = false;  /* a failback switch is under way    */
+static uint8_t  s_fb_target   = 0;
+
+/* Switch the STA to network slot i. */
+static void fo_switch(size_t i, const char *why) {
+  printf("[FAIL] %s - switching from '%s' to '%s'\n", why, net_ssid(s_cur_net), net_ssid(i));
+  s_fo_count++;
+  disc_mark_own(DISC_SRC_FAILOVER);
+  esp_wifi_disconnect();
+  sta_set_net(i);
+  s_fo_locate = true;
+  esp_wifi_connect();
+}
+
+/* Is network slot i visible with at least FAILBACK_MIN_RSSI? Blocking,
+ * targeted scan (only that SSID), so it costs about as much airtime as a
+ * roaming check. */
+static bool net_visible(size_t i) {
+  wifi_scan_config_t sc = {};
+  sc.ssid = (uint8_t *)net_ssid(i);
+  if (esp_wifi_scan_start(&sc, true) != ESP_OK) return false;
+  uint16_t n = 0;
+  esp_wifi_scan_get_ap_num(&n);
+  if (n > 8) n = 8;
+  wifi_ap_record_t recs[8];
+  if (n) esp_wifi_scan_get_ap_records(&n, recs);
+  esp_wifi_clear_ap_list();
+  for (uint16_t k = 0; k < n; k++) if (recs[k].rssi >= FAILBACK_MIN_RSSI) return true;
+  return false;
+}
+
+/* Failover/failback state machine; called from bridge_tick() (main task, so
+ * the blocking scan and the gateway pings of detect_location() never run in
+ * the event handler). */
+static void failover_tick(void) {
+  if (!s_active || s_paused || s_restarting) return;
+  const uint32_t now = millis();
+
+  if (!s_wifi_up) {
+    if (!s_fo_down_t0) { s_fo_down_t0 = now ? now : 1; return; }
+    const uint32_t wait = (uint32_t)s_eff_wifi_connect_timeout_s * 1000u * s_eff_wifi_connect_retries;
+    if (now - s_fo_down_t0 < wait) return;
+    s_fo_down_t0 = now;                       /* next network gets the same time */
+    size_t next = s_cur_net;
+    for (size_t k = 1; k <= 3; k++) {
+      const size_t c = (s_cur_net + k) % 3;
+      if (net_in_use(c)) { next = c; break; }
+    }
+    if (next == s_cur_net) return;            /* only one network configured */
+    if (s_fb_trying) {                        /* the failback did not work out */
+      s_fb_trying = false;
+      s_fb_interval = s_fb_interval * 2 > FAILBACK_MS_MAX ? FAILBACK_MS_MAX : s_fb_interval * 2;
+      printf("[FAIL] Failback to '%s' failed - next check in %lu min\n",
+             net_ssid(s_fb_target), (unsigned long)(s_fb_interval / 60000));
+    }
+    fo_switch(next, "No connection");
+    return;
+  }
+
+  s_fo_down_t0 = 0;
+  if (s_fo_locate) {
+    s_fo_locate = false;
+#ifndef BRIDGE_MINIMAL
+    detect_location(s_cur_net);
+#endif
+  }
+  if (s_fb_trying && s_cur_net == s_fb_target) {   /* failback succeeded */
+    s_fb_trying = false;
+    s_fb_interval = FAILBACK_MS_MIN;
+  }
+
+  /* Failback: only while on a lower-priority network. */
+  size_t pref = 0;
+  while (pref < 3 && !net_in_use(pref)) pref++;
+  if (pref >= 3 || s_cur_net <= pref) { s_fb_t0 = 0; return; }
+  if (!s_fb_t0) { s_fb_t0 = now; return; }
+  if (now - s_fb_t0 < s_fb_interval) return;
+  s_fb_t0 = now;
+  for (size_t i = pref; i < s_cur_net; i++) {
+    if (!net_in_use(i) || !net_visible(i)) continue;
+    s_fb_trying = true;
+    s_fb_target = (uint8_t)i;
+    fo_switch(i, "Higher-priority network visible again");
+    return;
+  }
+}
+
+/* See bridge.h. */
+uint8_t  bridge_get_net(void)       { return s_cur_net; }
+uint32_t bridge_get_failovers(void) { return s_fo_count; }
+
+/* ===========================================================================
  * Statistics
  * ========================================================================= */
 
@@ -2745,6 +2917,7 @@ void bridge_tick(void) {
   tune_all_tick();
   watchdog_tick();
   roam_tick();
+  failover_tick();
 
   static uint32_t last = 0;
   static uint64_t le = 0, lw = 0;

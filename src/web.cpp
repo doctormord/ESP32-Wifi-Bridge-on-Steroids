@@ -698,7 +698,7 @@ async function crErase(){
   checkCrashes();
 }
 /* Who disconnected - anything except 0 is the firmware itself, not a radio problem. */
-const DSRC=['external','connecting','watchdog','roaming','restart'];
+const DSRC=['external','connecting','watchdog','roaming','restart','failover'];
 /* Load and render the Wi-Fi disconnect statistics and log. */
 async function loadDisc(){
   try{
@@ -811,6 +811,10 @@ async function tick(){
     $('detail').innerHTML='Client: <b>'+s.client_mac+'</b> &middot; IP: <b>'+(s.client_ip||'-')+'</b>'+
       ' &middot; Name: <b>'+(s.client_name||'-')+'</b><br>Connected to: <b>'+
       (s.ssid||'-')+'</b> ('+s.bssid+')'+
+      /* Which network slot, flagged when it is not the first one - e.g.
+         after a failover - and how often the bridge switched. */
+      (s.net?' &middot; network <b class="'+(s.net>1?'warn':'')+'">'+s.net+'</b>':'')+
+      (s.fo?' <span class="hint">('+s.fo+' switch'+(s.fo>1?'es':'')+')</span>':'')+
       ' &middot; Ethernet: <span class="'+(s.eth?'ok':'bad')+'">'+(s.eth?'connected':'no link')+
       '</span> &middot; Wi-Fi drops: <b>'+(s.wifi_kicks!==undefined?s.wifi_kicks:s.wifi_disc)+'</b>'+
       (s.wifi_kicks!==undefined&&s.wifi_disc>s.wifi_kicks?' <span class="hint">(+'+(s.wifi_disc-s.wifi_kicks)+' failed attempts/own disconnects)</span>':'')+
@@ -1158,7 +1162,7 @@ static esp_err_t h_status(httpd_req_t *r) {
     "\"wd_reconnects\":%lu,\"wd_eth_resets\":%lu,\"wd_last_reason\":%u,"
     "\"roam_count\":%lu,\"uptime\":%lu,"
     "\"client_mac\":\"%s\",\"client_ip\":\"%s\",\"client_name\":\"%s\","
-    "\"ssid\":\"%s\",\"bssid\":\"%s\","
+    "\"ssid\":\"%s\",\"bssid\":\"%s\",\"net\":%u,\"fo\":%lu,"
     "\"at\":%d,\"at_s\":%u,\"at_n\":%u,\"at_r\":%u,\"at_k\":%u,"
     "\"heap\":%lu,\"heap_min\":%lu,\"heap_dma\":%lu,\"heap_blk\":%lu,"
     "\"txp\":%d,\"bw\":%u,\"air_ok\":%lu,\"air_fail\":%lu,\"cc\":\"%s\",\"cc_max\":%d,"
@@ -1182,6 +1186,8 @@ static esp_err_t h_status(httpd_req_t *r) {
     (unsigned long)st.wd_reconnects, (unsigned long)st.wd_eth_resets,
     (unsigned)st.wd_last_reason, (unsigned long)st.roam_count,
     (unsigned long)(millis() / 1000), st.client_mac, st.client_ip, st.client_name, st.ssid, st.bssid,
+    /* Configured network slot (1-3) and network switches since boot. */
+    (unsigned)(bridge_get_net() + 1), (unsigned long)bridge_get_failovers(),
     (int)bridge_autotune_state(), bridge_autotune_step(),
     bridge_autotune_count(), bridge_autotune_result(), bridge_autotune_candidate(),
     (unsigned long)esp_get_free_heap_size(),
