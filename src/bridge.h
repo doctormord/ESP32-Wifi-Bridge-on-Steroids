@@ -40,6 +40,24 @@ struct BridgeStats {
                                * 0 = none (see bridge_get_disc_log())         */
   uint8_t  disc_last_src;     /* matching DISC_SRC_*                          */
   uint32_t disc_last_ago_s;   /* how long ago, in s                           */
+  uint32_t air_ok;            /* frames the Wi-Fi MAC reported as delivered
+                               * (acknowledged by the AP) since boot          */
+  uint32_t air_fail;          /* frames the MAC gave up on after its own
+                               * hardware retries - lost on the air, unlike
+                               * drop_eth2wifi, which counts frames that never
+                               * got a TX buffer                              */
+  uint32_t txq_now;           /* bridged frames handed to the driver but not
+                               * yet finished on the air, right now           */
+  uint32_t txq_x10;           /* mean of that over the last second, x10       */
+  uint32_t txq_delay_ms;      /* how long a frame waited in that queue on
+                               * average over the last second (Little's law) */
+  uint32_t drop_cap;          /* frames dropped by the TX queue cap since boot
+                               * (a subset of drop_eth2wifi)                  */
+  uint8_t  txq_cap;           /* cap in effect right now, 0 = off             */
+  char     country[3];        /* regulatory country in effect ("DE", "01"...),
+                               * adopted from the AP's beacon by default      */
+  int8_t   country_max_txp;   /* its TX power cap as esp_wifi_get_country()
+                               * reports it - an upper bound for tx_power     */
   int8_t   rssi;
   uint8_t  channel;
   bool     eth_link;
@@ -191,6 +209,92 @@ uint8_t          bridge_autotune_candidate(void);  /* retry value under test */
 uint8_t          bridge_autotune_result(void);     /* chosen value, 0 = none */
 /* Loss per candidate in hundredths of a percent, 0xFFFF = not measured */
 void             bridge_autotune_values(uint8_t *candidates, uint16_t *loss);
+
+/* ---------------------------------------------------------------------------
+ * TX power autotune
+ *
+ * Measures the PHY's TX power steps from 13 to 20 dBm against live traffic:
+ * loss (no TX buffer + abandoned on the air) and the mean time a frame waits
+ * in the driver's TX queue. Starts at the current value, tries every higher
+ * step, then lower ones until one falls out of tolerance, and saves the
+ * LOWEST power that performs as well as the best one within tolerance.
+ * Same timing, collapse guard and traffic requirement as the retry
+ * autotune; the two never run at the same time. Uses the AT_* states.
+ * ------------------------------------------------------------------------ */
+bool             bridge_txp_tune_start(void);
+/* Abort a run (restoring the configured power) or acknowledge a result. */
+void             bridge_txp_tune_reset(void);
+autotune_state_t bridge_txp_tune_state(void);
+uint8_t          bridge_txp_tune_step(void);       /* completed measurements */
+int8_t           bridge_txp_tune_candidate(void);  /* value under test, 0.25 dBm */
+int8_t           bridge_txp_tune_result(void);     /* chosen value, 0 = none */
+/* Per candidate: requested and driver-reported power (0.25 dBm), loss in
+ * 1/100 % (0xFFFF = not measured, 0xFFFE = collapse) and queue delay in
+ * 0.1 ms. Arrays need room for 8 entries; returns the number filled. */
+size_t           bridge_txp_tune_values(int8_t *candidates, int8_t *actual,
+                                        uint16_t *loss, uint16_t *delay_x10);
+
+/* ---------------------------------------------------------------------------
+ * TX queue cap autotune
+ *
+ * Measures without a cap first (reference), then caps 24, 16, 12, 8 frames,
+ * and stops at the first step that loses noticeably more than the reference
+ * or delivers less than 90 % of its throughput. Saves the smallest cap that
+ * passed, or 0 (off) if none did. Same timing, collapse guard and traffic
+ * requirement as the other autotunes; never runs alongside them.
+ * ------------------------------------------------------------------------ */
+bool             bridge_cap_tune_start(void);
+/* Abort a run (restoring the configured cap) or acknowledge a result. */
+void             bridge_cap_tune_reset(void);
+autotune_state_t bridge_cap_tune_state(void);
+uint8_t          bridge_cap_tune_step(void);       /* completed measurements */
+uint8_t          bridge_cap_tune_candidate(void);  /* cap under test, 0 = off */
+uint8_t          bridge_cap_tune_result(void);     /* chosen cap, 0 = off,
+                                                    * 0xFF = no result yet   */
+/* Per candidate: cap, loss in 1/100 % (0xFFFF = not measured, 0xFFFE =
+ * collapse), queue delay in 0.1 ms and throughput in kbit/s. Arrays need
+ * room for 8 entries; returns the number filled. */
+size_t           bridge_cap_tune_values(uint8_t *candidates, uint16_t *loss,
+                                        uint16_t *delay_x10, uint16_t *kbps);
+
+/* ---------------------------------------------------------------------------
+ * "Calibrate all": retry, TX power and queue cap autotune in sequence, each
+ * measuring with the previous results applied. Stops when a stage ends
+ * without a result or is aborted by a manual save. The individual results
+ * are reported by the three autotunes as usual.
+ * ------------------------------------------------------------------------ */
+typedef enum { ALL_IDLE = 0, ALL_RETRIES, ALL_TXP, ALL_CAP, ALL_LONG,
+               ALL_DONE, ALL_STOPPED } all_stage_t;
+
+/* Start the chain; long_hours > 0 appends the long-run retry check with
+ * that duration. Returns false if it or any single autotune is running, or
+ * the bridge is inactive. */
+bool        bridge_tune_all_start(uint8_t long_hours);
+all_stage_t bridge_tune_all_stage(void);
+/* Abort every running calibration (and the chain) and restore the saved
+ * values they were varying. */
+void        bridge_tune_stop(void);
+
+/* ---------------------------------------------------------------------------
+ * Long-run check of the TX retries
+ *
+ * The 15 s retry autotune cannot separate values that both stay below 0.10 %
+ * loss; hours of operation can. This rotates one step below the current
+ * value, the value itself and two steps above in 5-minute blocks for the
+ * given number of hours (1-48), then saves the smallest value whose loss
+ * rate is at most 1.5x the best one (+50 ppm). Candidates losing > 1 % leave
+ * the rotation at once. Runs alone; a reboot ends it without a result.
+ * ------------------------------------------------------------------------ */
+bool             bridge_long_tune_start(uint8_t hours);
+void             bridge_long_tune_reset(void);
+autotune_state_t bridge_long_tune_state(void);
+uint8_t          bridge_long_tune_candidate(void);  /* retries in the running block */
+uint8_t          bridge_long_tune_result(void);     /* chosen retries, 0 = none */
+void             bridge_long_tune_progress(uint32_t *elapsed_min, uint32_t *total_min);
+/* Per candidate: retries, counted packets and drops, out of the rotation.
+ * Arrays need room for 4 entries; returns the number filled. */
+size_t           bridge_long_tune_values(uint8_t *candidates, uint32_t *pkts,
+                                         uint32_t *drops, bool *bad);
 
 /* TX power actually in effect, in 0.25 dBm units, queried from the driver.
  * Usually differs from the configured value because the PHY only knows 11

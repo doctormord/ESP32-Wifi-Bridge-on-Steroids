@@ -194,7 +194,7 @@ button:active:not(:disabled){background:#2a78d0;transform:scale(.97);filter:none
 button.sec:active:not(:disabled){background:#4a5367}
 .bar{height:6px;background:#232833;border-radius:3px;overflow:hidden;margin-top:6px}
 .bar i{display:block;height:100%;background:var(--acc)}
-.ok{color:var(--ok)}.bad{color:var(--bad)}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:#f0b429}
 #msg,#tmsg,#omsg{margin-top:12px;font-size:13px}
 .tag{display:inline-block;font-size:11px;text-transform:uppercase;letter-spacing:.05em;
      padding:3px 8px;border-radius:4px;margin:18px 0 2px}
@@ -234,6 +234,8 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
     <div class="m"><div class="k">Uptime</div><div class="v" id="uptime">-</div></div>
     <div class="m"><div class="k">TX power</div><div class="v" id="txp">-</div></div>
     <div class="m"><div class="k">Channel width</div><div class="v" id="bw">-</div></div>
+    <div class="m"><div class="k">TX queue</div><div class="v" id="txq">-</div></div>
+    <div class="m"><div class="k">Lost on air</div><div class="v" id="airf">-</div></div>
   </div>
   <div class="sub" style="margin:12px 0 0" id="detail"></div>
   <div id="cdbox" style="display:none;margin-top:10px;padding:10px;background:rgba(255,107,107,.08);
@@ -355,6 +357,54 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
     practically always accepts.
   </div>
 
+  <label>TX queue cap LAN&rarr;Wi-Fi
+    <span class="hint">frames, 0 = off</span></label>
+  <input id="txq_cap">
+  <div class="sub" style="margin:6px 0 0">
+    How many frames may wait for the air at most. Without a cap a camera's
+    I-frame fills every Wi-Fi TX buffer, and everything behind it &ndash;
+    pings, this portal, the camera's own TCP &ndash; waits tens of
+    milliseconds (tile <i>TX queue</i>). With a cap, larger frames beyond it
+    are dropped at once instead; small ones (ACKs, ARP, ping) always pass.
+    Lower latency and less heap use, paid for with some loss in bursts
+    &ndash; use the calibration below to find out whether that is free on
+    your link. Dropped frames are counted under <i>Dropped</i> as well.
+  </div>
+
+  <div style="margin-top:14px;padding:12px;background:#232833;border-radius:8px">
+    <b style="font-size:13px">Calibrate all</b>
+    <div class="sub" style="margin:4px 0 8px">
+      Runs the three calibrations below one after another &ndash; retries,
+      then TX power, then queue cap &ndash; each measuring with the results
+      of the previous ones applied. About 5&nbsp;minutes; every result is
+      saved as it is found and shown in its own section below.
+      <br>All calibrations measure the <b>LAN&rarr;Wi-Fi</b> direction under
+      <b>the traffic that is flowing right now</b>, so run them while the
+      client does what it will normally do: a camera streaming to its
+      recorder, a PC during its real workload. A synthetic load (e.g.
+      <code>iperf3</code>) tunes for bulk transfer, not for a game or a call.
+      Without traffic the run stops with &ldquo;too little traffic&rdquo;.
+      <br>The 15-second retry step cannot tell apart values that both stay
+      below 0.10&nbsp;% loss &ndash; on a real camera link 8 and 12 retries
+      both passed, while hours of operation showed 8 losing five times more.
+      So by default the run ends with the <b>long-run check</b> of the
+      retries (see below), which settles exactly that.
+    </div>
+    <label>Then long-run check of the retries</label>
+    <select id="allh">
+      <option value="6" selected>6 hours (recommended)</option>
+      <option value="12">12 hours</option>
+      <option value="24">24 hours</option>
+      <option value="2">2 hours (quick, less certain)</option>
+      <option value="0">skip</option>
+    </select>
+    <div class="row" style="margin-top:8px">
+      <button onclick="autotune('all',$('allh').value)" style="margin-top:0">Calibrate all</button>
+      <button class="sec" onclick="autotune('stop')" style="margin-top:0">Stop running calibration</button>
+    </div>
+    <div id="allmsg" style="margin-top:10px;font-size:13px"></div>
+  </div>
+
   <div style="margin-top:14px;padding:12px;background:#232833;border-radius:8px">
     <b style="font-size:13px">Automatic calibration</b>
     <div class="sub" style="margin:4px 0 8px">
@@ -370,6 +420,66 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
     </div>
     <button onclick="autotune()" style="margin-top:0">Start calibration</button>
     <div id="atmsg" style="margin-top:10px;font-size:13px"></div>
+    <table id="attab" style="margin-top:6px;font-size:12px;border-collapse:collapse"></table>
+
+    <b style="font-size:13px;display:block;margin-top:14px">Long-run check</b>
+    <div class="sub" style="margin:4px 0 8px">
+      Compares one step below the current value, the value itself and two
+      steps above under real operation: they take turns in 5-minute blocks,
+      so each sees the same mix of busy and quiet hours. At the end the
+      <b>smallest</b> value whose loss is at most 1.5&times; the best one is
+      saved. A value losing more than 1&nbsp;% is dropped from the rotation
+      at once. Use the bridge normally meanwhile; a reboot ends the check
+      without a result. Run it after the short calibration &ndash; that one
+      cannot separate values below 0.10&nbsp;% loss.
+    </div>
+    <div class="row">
+      <select id="lrh">
+        <option value="6" selected>6 hours (recommended)</option>
+        <option value="12">12 hours</option>
+        <option value="24">24 hours</option>
+        <option value="2">2 hours (quick, less certain)</option>
+      </select>
+      <button onclick="autotune('long',$('lrh').value)" style="margin-top:0">Start long-run check</button>
+    </div>
+    <div id="lrmsg" style="margin-top:10px;font-size:13px"></div>
+    <table id="lrtab" style="margin-top:6px;font-size:12px;border-collapse:collapse"></table>
+  </div>
+
+  <div style="margin-top:14px;padding:12px;background:#232833;border-radius:8px">
+    <b style="font-size:13px">TX power calibration</b>
+    <div class="sub" style="margin:4px 0 8px">
+      Measures the PHY's power steps from 13 to 20&nbsp;dBm against the live
+      stream, about 19&nbsp;s each: the loss and how long frames wait in the
+      Wi-Fi TX queue (a weak uplink makes the queue drain slowly long before
+      frames get lost - that is what drives ping times up). Starts at the
+      current value, tries every higher step, then lower ones while they keep
+      up. The <b>highest</b> power that is as good as the best one is chosen
+      and saved: power is only reduced where more of it measurably hurts,
+      because link margin is what carries the stream through interference a
+      short measurement never sees. Steps the chip cannot deliver (it may cap
+      below 20&nbsp;dBm, see the Driver column) are measured once.
+      <b>Traffic must be flowing.</b> Takes about 2&ndash;3 minutes.
+    </div>
+    <button onclick="autotune('txp')" style="margin-top:0">Start TX power calibration</button>
+    <div id="ptmsg" style="margin-top:10px;font-size:13px"></div>
+    <table id="pttab" style="margin-top:6px;font-size:12px;border-collapse:collapse"></table>
+  </div>
+
+  <div style="margin-top:14px;padding:12px;background:#232833;border-radius:8px">
+    <b style="font-size:13px">TX queue cap calibration</b>
+    <div class="sub" style="margin:4px 0 8px">
+      Measures without a cap first (the reference), then with caps of 24, 16,
+      12 and 8 frames, about 19&nbsp;s each, and stops at the first one that
+      loses noticeably more than the reference or delivers less than 90&nbsp;%
+      of its throughput. The <b>smallest</b> cap that passed is saved
+      &ndash; or <i>off</i> if none did. The picture may stutter during the
+      smaller caps. <b>Traffic must be flowing.</b> Takes 1&ndash;2 minutes.
+      After applying a cap, keep an eye on <i>Dropped</i> over a few hours.
+    </div>
+    <button onclick="autotune('cap')" style="margin-top:0">Start queue cap calibration</button>
+    <div id="qcmsg" style="margin-top:10px;font-size:13px"></div>
+    <table id="qctab" style="margin-top:6px;font-size:12px;border-collapse:collapse"></table>
   </div>
 
   <div style="margin-top:14px;padding:12px;background:#232833;border-radius:8px">
@@ -550,7 +660,7 @@ let PROV=false;
    the TRANSITION to "done". Doing it on every 2 s poll while the board
    reports "done" would make a manually edited value jump back before it
    is saved. */
-let ATPREV=-1;
+let ATPREV=-1, PTPREV=-1, PTRES=0, QCPREV=-1, QCRES=-1, LRPREV=-1, LRRES=0, LRPOLL=0;
 function fmt(k){return k>1000?(k/1000).toFixed(1)+' Mbit/s':k+' kbit/s'}
 function dur(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
   return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m')}
@@ -607,7 +717,7 @@ async function loadDisc(){
           td((e.e?ts(e.e)+'<br><span class="hint">':'')+
              (e.prev?(e.prev===1?'previous boot':e.prev+' boots ago')+', at '+sdur(e.t):sdur(e.ago)+' ago')+
              (e.e?'</span>':''))+
-          td(e.up?'<b class="bad">Drop</b>':'Failed attempt')+
+          td(e.up?(e.src?'Disconnect':'<b class="bad">Drop</b>'):'Failed attempt')+
           td('<b>'+e.rs+'</b> ('+e.r+')')+
           td(e.src?'<span class="hint">'+(DSRC[e.src]||e.src)+'</span>':'external')+
           td(empty(e)?'-':e.rssi+' dBm')+td(empty(e)?'-':e.bssid)+
@@ -646,7 +756,58 @@ async function tick(){
                          if(SNAP){SNAP.eth_tx_retries=String(s.at_r);dirtyCheck()} } }
     else if(s.at===3) $('atmsg').textContent='Aborted: too little traffic during the measurement. '+
                       'Let the camera stream and start again.';
+    /* The tables only change when a measurement finishes - fill them on the
+       first poll, refresh them while a run is active and once on the
+       transition out of it. */
+    /* A long-run check only changes its table every few minutes - poll it
+       every 15th status tick (30 s), not every 2 s for hours. */
+    const lrTick=s.lr===1&&(++LRPOLL%15===0);
+    if(ATPREV===-1||s.at===1||s.pt===1||s.qc===1||lrTick||(ATPREV===1&&s.at!==1)||
+       (PTPREV===1&&s.pt!==1)||(QCPREV===1&&s.qc!==1)||(LRPREV===1&&s.lr!==1)) atTables();
     ATPREV=s.at;
+    const dbm=v=>(v/4).toFixed(2).replace(/\.?0+$/,'')+' dBm';
+    if(s.pt===1) $('ptmsg').textContent='TX power calibration running - measurement '+(s.pt_s+1)+
+                 ', testing '+dbm(s.pt_k)+' (about 19 s each)';
+    else if(s.pt===2){ PTRES=s.pt_r; $('ptmsg').textContent='Done - chosen: '+dbm(s.pt_r)+', saved.';
+                       if(PTPREV===1){ $('tx_power').value=s.pt_r;
+                         if(SNAP){SNAP.tx_power=String(s.pt_r);dirtyCheck()} } }
+    else if(s.pt===3) $('ptmsg').textContent='Aborted: too little traffic during the measurement. '+
+                      'Let the camera stream and start again.';
+    PTPREV=s.pt;
+    if(s.qc===1) $('qcmsg').textContent='Queue cap calibration running - measurement '+(s.qc_s+1)+
+                 ', testing '+(s.qc_k?'cap '+s.qc_k:'without cap')+' (about 19 s each)';
+    else if(s.qc===2){ QCRES=s.qc_r; $('qcmsg').textContent='Done - chosen: '+
+                         (s.qc_r?'cap '+s.qc_r+' frames':'no cap (every cap cost too much)')+', saved.';
+                       if(QCPREV===1){ $('txq_cap').value=s.qc_r;
+                         if(SNAP){SNAP.txq_cap=String(s.qc_r);dirtyCheck()} } }
+    else if(s.qc===3) $('qcmsg').textContent='Aborted: too little traffic during the measurement. '+
+                      'Let the camera stream and start again.';
+    QCPREV=s.qc;
+    /* Long-run check: progress, result. */
+    const hm=m=>Math.floor(m/60)+' h '+String(m%60).padStart(2,'0')+' min';
+    if(s.lr===1) $('lrmsg').textContent='Long-run check running - '+hm(s.lr_el)+' of '+hm(s.lr_tot)+
+                 ', now testing '+s.lr_k+' retries (blocks of 5 min)';
+    else if(s.lr===2){ LRRES=s.lr_r; $('lrmsg').textContent='Done - chosen: '+s.lr_r+' retries, saved.';
+                       if(LRPREV===1){ $('eth_tx_retries').value=s.lr_r;
+                         if(SNAP){SNAP.eth_tx_retries=String(s.lr_r);dirtyCheck()} } }
+    else if(s.lr===3) $('lrmsg').textContent='No result: not enough traffic, or every value lost more '+
+                      'than 1 %. The previous value is active again.';
+    LRPREV=s.lr;
+    /* "Calibrate all": 1-4 = running stage, 5 done, 6 stopped. */
+    if(s.all>=1&&s.all<=4) $('allmsg').textContent='Running - '+
+                 ['retries','TX power','queue cap','long-run check of the retries'][s.all-1]+
+                 ' (details in its section below)';
+    else if(s.all===5) $('allmsg').textContent='Done - all results saved (see below).';
+    else if(s.all===6) $('allmsg').textContent='Stopped - a step had too little traffic or was '+
+                 'stopped / overridden by a manual save. Results found up to then are kept.';
+    /* Mean frames waiting in the driver queue and the resulting wait. A few
+       ms is normal; tens to hundreds of ms mean the uplink cannot keep up. */
+    $('txq').textContent=(s.wifi&&s.txq_ms!==undefined)?s.txq_ms+' ms':'-';
+    $('txq').className='v '+(s.txq_ms>=50?'bad':s.txq_ms>=15?'warn':'ok');
+    $('txq').title=(s.txq_x10/10).toFixed(1)+' frames on average, '+s.txq+' now';
+    $('airf').textContent=s.air_fail!==undefined?s.air_fail:'-';
+    $('airf').className='v '+(s.air_fail?'bad':'ok');
+    $('airf').title=s.air_ok+' frames delivered';
     $('detail').innerHTML='Client: <b>'+s.client_mac+'</b> &middot; IP: <b>'+(s.client_ip||'-')+'</b>'+
       ' &middot; Name: <b>'+(s.client_name||'-')+'</b><br>Connected to: <b>'+
       (s.ssid||'-')+'</b> ('+s.bssid+')'+
@@ -680,7 +841,7 @@ const CFG=['name','ssid1','ssid2','ssid3','ip','mask','gw','ip2','mask2','gw2','
            'static_rx_buf','dynamic_rx_buf','dynamic_tx_buf','rx_ba_win',
            'ht40','no_11b','wd_enable','wd_actions','wd_bad_windows',
            'wifi_connect_timeout_s','wifi_connect_retries','ap_idle_reboot_s',
-           'roam_enable','roam_check_s','roam_rssi_threshold','roam_margin_db'];
+           'roam_enable','roam_check_s','roam_rssi_threshold','roam_margin_db','txq_cap'];
 /* Fill the form from /api/config and take the unsaved-changes snapshot. */
 async function load(){
   const c=await(await fetch('/api/config')).json();
@@ -742,16 +903,48 @@ function defaults(){
   if(!DEF){$('tmsg').textContent='Defaults not loaded yet';return}
   for(const k in DEF) if($(k)) $(k).value=DEF[k];
   $('tx_power').value='0';
+  $('txq_cap').value='0';
   $('tmsg').textContent='Defaults filled in - save to apply.';
   dirtyCheck();   /* set by script - does not fire an input event */
 }
-async function autotune(){
-  $('atmsg').textContent='Starting...';
+/* Start the retry calibration, with kind 'txp' / 'cap' the TX power or
+   queue cap one, 'long' the long-run retry check, 'all' the chain (h =
+   hours of the long-run check, 0 = none); 'stop' aborts whatever runs. */
+async function autotune(kind,h){
+  const m=$({txp:'ptmsg',cap:'qcmsg',all:'allmsg',stop:'allmsg',long:'lrmsg'}[kind]||'atmsg');
+  m.textContent=kind==='stop'?'Stopping...':'Starting...';
   try{
-    const j=await(await fetch('/api/autotune',{method:'POST'})).json();
-    $('atmsg').textContent=j.ok?'Calibration running - please keep traffic flowing.'
-                               :('Not started: '+(j.err||'unknown'));
-  }catch(e){$('atmsg').textContent='Error while starting'}
+    const j=await(await fetch('/api/autotune'+(kind?'?kind='+kind+(h!==undefined?'&h='+h:''):''),
+                              {method:'POST'})).json();
+    m.textContent=kind==='stop'?'Stopped - the saved values are active again.'
+                 :j.ok?'Calibration running - please keep traffic flowing.'
+                      :('Not started: '+(j.err||'unknown'));
+  }catch(e){m.textContent='Error while starting'}
+}
+/* Fill both calibration tables from /api/autotune: one row per measured
+   candidate, the chosen one in bold. Called while a run is active and once
+   when it ends. */
+async function atTables(){
+  try{
+    const j=await(await fetch('/api/autotune')).json(), td=TD;
+    const pct=v=>v<0?'<b class="bad">collapse</b>':(v/100).toFixed(2)+' %';
+    const dbm=v=>(v/4).toFixed(2).replace(/\.?0+$/,'')+' dBm';
+    $('attab').innerHTML=j.retries.length?'<tr>'+td('Retries',1)+td('Loss',1)+'</tr>'+
+      j.retries.map(e=>'<tr>'+td(e.k)+td(pct(e.loss))+'</tr>').join(''):'';
+    $('pttab').innerHTML=j.txp.length?'<tr>'+['Power','Driver','Loss','Queue delay'].map(t=>td(t,1)).join('')+'</tr>'+
+      j.txp.map(e=>'<tr'+(e.k===PTRES?' style="font-weight:bold"':'')+'>'+td(dbm(e.k))+td(dbm(e.act))+
+        td(pct(e.loss))+td(e.delay<0?'-':(e.delay/10).toFixed(1)+' ms')+'</tr>').join(''):'';
+    $('qctab').innerHTML=j.cap&&j.cap.length?'<tr>'+['Cap','Loss','Queue delay','Throughput'].map(t=>td(t,1)).join('')+'</tr>'+
+      j.cap.map(e=>'<tr'+(e.k===QCRES?' style="font-weight:bold"':'')+'>'+td(e.k?e.k+' frames':'off')+
+        td(pct(e.loss))+td(e.delay<0?'-':(e.delay/10).toFixed(1)+' ms')+
+        td(e.kbps<0?'-':(e.kbps/1000).toFixed(2)+' Mbit/s')+'</tr>').join(''):'';
+    /* Loss in ppm-accurate percent: long runs separate values far below
+       0.01 %, so three decimals. */
+    $('lrtab').innerHTML=j.long&&j.long.length?'<tr>'+['Retries','Packets','Lost','Loss'].map(t=>td(t,1)).join('')+'</tr>'+
+      j.long.map(e=>{const a=e.pkts+e.drops;return '<tr'+(e.k===LRRES?' style="font-weight:bold"':'')+'>'+
+        td(e.k)+td(e.pkts.toLocaleString())+td(e.drops.toLocaleString())+
+        td(e.bad?'<b class="bad">&gt; 1 % - dropped</b>':a?(100*e.drops/a).toFixed(3)+' %':'-')+'</tr>'}).join(''):'';
+  }catch(e){}
 }
 /* Trigger a reboot and reload the page as soon as the board answers again -
    otherwise one faces a dead page without knowing when it comes back. Only
@@ -809,7 +1002,7 @@ const PW=['pass1','pass2','pass3','mqtt_pass','admin_pass'];
    bridge_apply_live_tuning()). Everything else only after a reboot. */
 const LIVE=['tx_power','eth_tx_retries','wifi_tx_retries','wd_enable','wd_actions','wd_bad_windows',
             'roam_enable','roam_check_s','roam_rssi_threshold','roam_margin_db',
-            'ap_idle_reboot_s','telemetry_s','admin_pass'];
+            'ap_idle_reboot_s','telemetry_s','admin_pass','txq_cap'];
 let SNAP=null;
 function snapshot(){SNAP={};for(const k of CFG)SNAP[k]=$(k).value;dirtyCheck()}
 /* Names of all fields that differ from the baseline. */
@@ -953,8 +1146,10 @@ static esp_err_t h_root(httpd_req_t *r) {
 static esp_err_t h_status(httpd_req_t *r) {
   BridgeStats st;
   bridge_get_stats(&st);
+  uint32_t lr_el, lr_tot;
+  bridge_long_tune_progress(&lr_el, &lr_tot);
 
-  char buf[860];
+  char buf[1350];
   snprintf(buf, sizeof(buf),
     "{\"prov\":%d,\"wifi\":%d,\"eth\":%d,\"rssi\":%d,\"ch\":%u,"
     "\"kbps_up\":%lu,\"kbps_down\":%lu,\"pkt_up\":%lu,\"pkt_down\":%lu,"
@@ -966,7 +1161,12 @@ static esp_err_t h_status(httpd_req_t *r) {
     "\"ssid\":\"%s\",\"bssid\":\"%s\","
     "\"at\":%d,\"at_s\":%u,\"at_n\":%u,\"at_r\":%u,\"at_k\":%u,"
     "\"heap\":%lu,\"heap_min\":%lu,\"heap_dma\":%lu,\"heap_blk\":%lu,"
-    "\"txp\":%d,\"bw\":%u,\"time\":%lu,\"build\":\"" GIT_REV "\"}",
+    "\"txp\":%d,\"bw\":%u,\"air_ok\":%lu,\"air_fail\":%lu,\"cc\":\"%s\",\"cc_max\":%d,"
+    "\"txq\":%lu,\"txq_x10\":%lu,\"txq_ms\":%lu,"
+    "\"pt\":%d,\"pt_s\":%u,\"pt_k\":%d,\"pt_r\":%d,"
+    "\"drop_cap\":%lu,\"txq_cap\":%u,\"qc\":%d,\"qc_s\":%u,\"qc_k\":%u,\"qc_r\":%d,\"all\":%d,"
+    "\"lr\":%d,\"lr_k\":%u,\"lr_el\":%lu,\"lr_tot\":%lu,\"lr_r\":%u,"
+    "\"time\":%lu,\"build\":\"" GIT_REV "\"}",
     s_provisioning ? 1 : 0, st.wifi_up ? 1 : 0, st.eth_link ? 1 : 0,
     (int)st.rssi, (unsigned)st.channel,
     (unsigned long)st.kbps_eth2wifi, (unsigned long)st.kbps_wifi2eth,
@@ -1000,6 +1200,27 @@ static esp_err_t h_status(httpd_req_t *r) {
     /* Likewise the channel width actually negotiated: the ht40 switch only
      * says what we offer. */
     (unsigned)bridge_get_bandwidth_mhz(),
+    /* Delivered/abandoned frames as the Wi-Fi MAC reports them, and the
+     * regulatory cap the TX power has to stay under. */
+    (unsigned long)st.air_ok, (unsigned long)st.air_fail,
+    st.country, (int)st.country_max_txp,
+    /* Driver TX queue: frames waiting now, mean over the last second (x10)
+     * and the resulting wait per frame - the bufferbloat indicator. */
+    (unsigned long)st.txq_now, (unsigned long)st.txq_x10, (unsigned long)st.txq_delay_ms,
+    /* TX power autotune, same state codes as "at". */
+    (int)bridge_txp_tune_state(), bridge_txp_tune_step(),
+    (int)bridge_txp_tune_candidate(), (int)bridge_txp_tune_result(),
+    /* TX queue cap: its drops, the cap in effect, and its autotune (qc_r
+     * -1 = no result yet, 0 = off). */
+    (unsigned long)st.drop_cap, (unsigned)st.txq_cap,
+    (int)bridge_cap_tune_state(), bridge_cap_tune_step(), bridge_cap_tune_candidate(),
+    bridge_cap_tune_result() == 0xFF ? -1 : (int)bridge_cap_tune_result(),
+    /* "Calibrate all": 0 idle, 1-4 running stage, 5 done, 6 stopped. */
+    (int)bridge_tune_all_stage(),
+    /* Long-run retry check: state, retries in the running block, minutes
+     * elapsed / total, chosen retries. */
+    (int)bridge_long_tune_state(), bridge_long_tune_candidate(),
+    (unsigned long)lr_el, (unsigned long)lr_tot, bridge_long_tune_result(),
     /* Time UTC, 0 = not set via SNTP yet. */
     (unsigned long)crashlog_now());
 
@@ -1134,7 +1355,7 @@ static esp_err_t h_config_get(httpd_req_t *r) {
     "\"wifi_connect_timeout_s\":%u,\"wifi_connect_retries\":%u,"
     "\"ap_idle_reboot_s\":%u,"
     "\"roam_enable\":%u,\"roam_check_s\":%u,\"roam_rssi_threshold\":%d,"
-    "\"roam_margin_db\":%u,"
+    "\"roam_margin_db\":%u,\"txq_cap\":%u,"
     "\"def\":{\"eth_tx_retries\":%u,\"wifi_tx_retries\":%u,"
     "\"static_rx_buf\":%u,\"dynamic_rx_buf\":%u,\"dynamic_tx_buf\":%u,"
     "\"rx_ba_win\":%u,\"wifi_connect_timeout_s\":%u,"
@@ -1163,6 +1384,7 @@ static esp_err_t h_config_get(httpd_req_t *r) {
     eff.wd_actions, eff.wd_bad_windows,
     eff.wifi_connect_timeout_s, eff.wifi_connect_retries, eff.ap_idle_reboot_s,
     g_cfg.roam_enable, eff.roam_check_s, (int)eff.roam_rssi_threshold, eff.roam_margin_db,
+    g_cfg.txq_cap,
     def.eth_retries, def.wifi_retries,
     def.static_rx, def.dyn_rx, def.dyn_tx, def.ba_win,
     def.wifi_connect_timeout_s, def.wifi_connect_retries, def.ap_idle_reboot_s,
@@ -1328,6 +1550,16 @@ static esp_err_t h_config_post(httpd_req_t *r) {
     if (t > 30) t = 30;   /* 30 x 20 s = 10 min - beyond that it's no longer a watchdog */
     g_cfg.wd_bad_windows = (uint8_t)t;
   }
+  /* Also immediate. 0 = off; below 4 frames the cap would drop inside
+   * every ordinary burst, above 64 it can never trigger with any buffer
+   * count the portal allows. */
+  if (form_get(body, "txq_cap", v, sizeof(v))) {
+    int t = atoi(v);
+    if (t < 0)            t = 0;
+    if (t != 0 && t < 4)  t = 4;
+    if (t > 64)           t = 64;
+    g_cfg.txq_cap = (uint8_t)t;
+  }
 
   /* Lower limit 60 s, so a typo (e.g. "5" instead of "500") cannot send the
    * device into a fast reboot loop in portal mode. */
@@ -1383,14 +1615,87 @@ static esp_err_t h_config_post(httpd_req_t *r) {
   return httpd_resp_send(r, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
 
-/* POST /api/autotune - start the retry autotune (see bridge.h). */
+/* POST /api/autotune - start the retry autotune, with ?kind=txp the TX power
+ * autotune, with ?kind=cap the TX queue cap autotune, with ?kind=long&h=N
+ * the N-hour long-run retry check (default 6), with ?kind=all all three in
+ * sequence (&h=N appends the long-run check). ?kind=stop aborts whatever
+ * runs and restores the saved values (see bridge.h). */
 static esp_err_t h_autotune(httpd_req_t *r) {
-  const bool ok = bridge_autotune_start();
+  char q[48] = "", kind[8] = "", hs[4] = "";
+  if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK) {
+    httpd_query_key_value(q, "kind", kind, sizeof(kind));
+    httpd_query_key_value(q, "h", hs, sizeof(hs));
+  }
+  int h = atoi(hs);
+  if (h < 0)  h = 0;
+  if (h > 48) h = 48;
+  bool ok = true;
+  if (strcmp(kind, "stop") == 0) bridge_tune_stop();
+  else ok = strcmp(kind, "txp")  == 0 ? bridge_txp_tune_start()
+          : strcmp(kind, "cap")  == 0 ? bridge_cap_tune_start()
+          : strcmp(kind, "long") == 0 ? bridge_long_tune_start((uint8_t)(h ? h : 6))
+          : strcmp(kind, "all")  == 0 ? bridge_tune_all_start((uint8_t)h)
+                                      : bridge_autotune_start();
   httpd_resp_set_type(r, "application/json");
   httpd_resp_set_hdr(r, "Cache-Control", "no-store");
   return httpd_resp_send(r, ok ? "{\"ok\":true}"
                               : "{\"ok\":false,\"err\":\"already running or bridge inactive\"}",
                          HTTPD_RESP_USE_STRLEN);
+}
+
+/* GET /api/autotune - per-candidate measurements of both autotunes, so the
+ * portal can show WHY a value was chosen. Unmeasured candidates are omitted;
+ * a collapsed step is reported as loss -1. */
+static esp_err_t h_autotune_get(httpd_req_t *r) {
+  uint8_t  rk[16]; uint16_t rl[16];
+  int8_t   pk[8], pa[8]; uint16_t pl[8], pd[8];
+  const size_t rn = bridge_autotune_count();
+  bridge_autotune_values(rk, rl);
+  const size_t pn = bridge_txp_tune_values(pk, pa, pl, pd);
+  uint8_t  ck[8]; uint16_t cl[8], cd[8], cr[8];
+  const size_t cn = bridge_cap_tune_values(ck, cl, cd, cr);
+  uint8_t  lk[4]; uint32_t lp[4], ld[4]; bool lb[4];
+  const size_t ln = bridge_long_tune_values(lk, lp, ld, lb);
+
+  char buf[1600];
+  int n = snprintf(buf, sizeof(buf), "{\"retries\":[");
+  bool first = true;
+  for (size_t i = 0; i < rn && n < (int)sizeof(buf) - 64; i++) {
+    if (rl[i] == 0xFFFF) continue;
+    n += snprintf(buf + n, sizeof(buf) - n, "%s{\"k\":%u,\"loss\":%d}", first ? "" : ",",
+                  (unsigned)rk[i], rl[i] == 0xFFFE ? -1 : (int)rl[i]);
+    first = false;
+  }
+  n += snprintf(buf + n, sizeof(buf) - n, "],\"txp\":[");
+  first = true;
+  for (size_t i = 0; i < pn && n < (int)sizeof(buf) - 80; i++) {
+    if (pl[i] == 0xFFFF) continue;
+    n += snprintf(buf + n, sizeof(buf) - n,
+                  "%s{\"k\":%d,\"act\":%d,\"loss\":%d,\"delay\":%d}", first ? "" : ",",
+                  (int)pk[i], (int)pa[i], pl[i] == 0xFFFE ? -1 : (int)pl[i],
+                  pl[i] == 0xFFFE ? -1 : (int)pd[i]);
+    first = false;
+  }
+  n += snprintf(buf + n, sizeof(buf) - n, "],\"cap\":[");
+  first = true;
+  for (size_t i = 0; i < cn && n < (int)sizeof(buf) - 80; i++) {
+    if (cl[i] == 0xFFFF) continue;
+    const bool col = cl[i] == 0xFFFE;
+    n += snprintf(buf + n, sizeof(buf) - n,
+                  "%s{\"k\":%u,\"loss\":%d,\"delay\":%d,\"kbps\":%d}", first ? "" : ",",
+                  (unsigned)ck[i], col ? -1 : (int)cl[i], col ? -1 : (int)cd[i],
+                  col ? -1 : (int)cr[i]);
+    first = false;
+  }
+  n += snprintf(buf + n, sizeof(buf) - n, "],\"long\":[");
+  for (size_t i = 0; i < ln && n < (int)sizeof(buf) - 80; i++)
+    n += snprintf(buf + n, sizeof(buf) - n, "%s{\"k\":%u,\"pkts\":%lu,\"drops\":%lu,\"bad\":%d}",
+                  i ? "," : "", (unsigned)lk[i], (unsigned long)lp[i],
+                  (unsigned long)ld[i], lb[i] ? 1 : 0);
+  snprintf(buf + n, sizeof(buf) - n, "]}");
+  httpd_resp_set_type(r, "application/json");
+  httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+  return httpd_resp_send(r, buf, HTTPD_RESP_USE_STRLEN);
 }
 
 /* POST /api/reboot - answer first, then reboot after a short delay so the
@@ -1749,7 +2054,7 @@ bool web_start(bool provisioning) {
 
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.stack_size       = 6144;
-  cfg.max_uri_handlers = 16;    /* currently 14 routes (uris[] below) - if this
+  cfg.max_uri_handlers = 18;    /* currently 15 routes (uris[] below) - if this
                                  * is too small, registration fails silently */
   cfg.recv_wait_timeout = 20;   /* the OTA upload needs patience */
   cfg.lru_purge_enable = true;
@@ -1782,6 +2087,7 @@ bool web_start(bool provisioning) {
     { "/api/reboot",  HTTP_POST, h_reboot,      NULL },
     { "/api/eth_reset",HTTP_POST,h_eth_reset,   NULL },
     { "/api/autotune",HTTP_POST, h_autotune,    NULL },
+    { "/api/autotune",HTTP_GET,  h_autotune_get,NULL },
     { "/api/scan",    HTTP_GET,  h_scan,        NULL },
     { "/api/update",  HTTP_POST, h_update,      NULL },
 #if CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH && CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF

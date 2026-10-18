@@ -53,6 +53,12 @@ void      esp_wifi_internal_free_rx_buffer(void *buffer);
 }
 #endif
 
+/* Declared in esp_private/wifi.h, which is not part of the public include
+ * path on every IDF version. Redeclaring an identical prototype is harmless
+ * where the header is visible. */
+extern "C" esp_err_t esp_wifi_set_tx_done_cb(
+    void (*cb)(uint8_t ifidx, uint8_t *data, uint16_t *data_len, bool ok));
+
 /* eth_rx_cb() hands management frames to lwIP via esp_netif_receive() and
  * frees the buffer right afterwards. That is ONLY allowed as long as
  * wlanif_input() copies the payload instead of referencing it - which is
@@ -170,6 +176,66 @@ static volatile uint32_t s_drop_e2w = 0, s_drop_w2e = 0;
 static volatile uint64_t s_by_e2w = 0, s_by_w2e = 0;
 static uint32_t s_kbps_e2w = 0, s_kbps_w2e = 0;
 
+/* Outcome of every frame the Wi-Fi MAC finished, as reported by the TX-done
+ * callback: delivered (ACK from the AP) or abandoned after the hardware
+ * retries. Includes the management stack's frames, which are a tiny
+ * fraction. This is the only view of losses ON THE AIR - drop_e2w only sees
+ * frames that never got a TX buffer. */
+static volatile uint32_t s_air_ok   = 0;
+static volatile uint32_t s_air_fail = 0;
+
+/* TX queue accounting. Depth = frames the bridge handed to the driver
+ * (s_pkt_e2w) minus frames the MAC finished (s_air_done), i.e. frames
+ * waiting for the air. Every completion adds that depth to s_q_sum; the mean
+ * depth over a window is dSum/dDone, and by Little's law depth / rate is the
+ * time a frame waits in the queue - the bufferbloat that turns a weak link
+ * into seconds of ping.
+ *
+ * The callback reports the finished 802.11 frame with an encrypted payload,
+ * so the management stack's own frames (a few per second, not counted in
+ * s_pkt_e2w) cannot be filtered out. Instead the estimate resynchronizes:
+ * whenever it would go negative, the wifi task moves s_q_base; whenever a
+ * full second passes without submissions or completions, the queue is
+ * empty by definition and bridge_tick() moves s_q_idle. Each base has a
+ * single writer. Unsigned differences make the wrap-around harmless. */
+static volatile uint32_t s_air_done = 0;
+static volatile uint32_t s_q_sum    = 0;
+static volatile uint32_t s_q_base   = 0;   /* written by the wifi task only  */
+static volatile uint32_t s_q_idle   = 0;   /* written by bridge_tick() only  */
+static uint32_t s_q_avg_x10  = 0;    /* mean depth over the last second, x10 */
+static uint32_t s_q_delay_ms = 0;    /* matching queue delay                 */
+
+/* TX queue cap in frames, 0 = off (g_cfg.txq_cap, or the value under test
+ * during a cap calibration), and the frames it dropped. Those drops are also
+ * counted in s_drop_e2w, so every loss figure includes them. */
+static volatile uint8_t  s_txq_cap  = 0;
+static volatile uint32_t s_drop_cap = 0;
+
+/* Frames up to this size bypass the cap: TCP ACKs, ARP, ICMP, DNS. They cost
+ * next to no airtime, and dropping a camera's ACKs or the gateway's ARP
+ * would hurt far more than queueing them. */
+#define TXQ_CAP_MIN_LEN 256u
+
+/* Current queue depth estimate (may be negative before a resync). */
+IRAM_ATTR static inline int32_t txq_depth(uint32_t done) {
+  return (int32_t)(s_pkt_e2w - done - s_q_base - s_q_idle);
+}
+
+/* TX-done callback, runs in the Wi-Fi task for every finished frame - so it
+ * only updates counters. */
+IRAM_ATTR static void wifi_tx_done(uint8_t ifidx, uint8_t *data,
+                                   uint16_t *data_len, bool ok) {
+  (void)data; (void)data_len;
+  if (ifidx != WIFI_IF_STA) return;
+  if (ok) s_air_ok = s_air_ok + 1;
+  else    s_air_fail = s_air_fail + 1;
+  const uint32_t done = s_air_done + 1;
+  s_air_done = done;
+  const int32_t depth = txq_depth(done);
+  if (depth < 0) s_q_base = s_q_base + (uint32_t)depth;   /* resync to 0 */
+  else           s_q_sum  = s_q_sum + (uint32_t)depth;
+}
+
 /* For the watchdog (see below) and for diagnosis in the portal: how often the
  * STA lost its association since boot. The reassociation rate shows something
  * the drop counters alone do not - whether the radio channel tears down the
@@ -211,18 +277,28 @@ static volatile uint32_t s_disc_src_ms = 0;
 
 /* Mark the next disconnect event (within 3 s) as caused by `src`. */
 static void disc_mark_own(uint8_t src) {
+  portENTER_CRITICAL(&s_dl_mux);
   s_disc_src_ms = millis();
   s_disc_src    = src;
+  portEXIT_CRITICAL(&s_dl_mux);
 }
 
-/* Shutdown handler: esp_restart() runs the handlers in reverse registration
- * order, and Wi-Fi's own handler (esp_wifi_stop, registered when the default
- * STA netif is created) disconnects cleanly from the AP. Registered after
- * that, this one runs first, so the resulting disconnect is logged as a
- * restart instead of an external drop. Panics do not run shutdown handlers,
- * but they do not disconnect cleanly either. */
+/* Set by disc_on_restart(): the system is going down, so wifi_evt() must not
+ * start another connect attempt while the driver is being stopped. */
+static volatile bool s_restarting = false;
+
+/* Shutdown handler for esp_restart(). Marks the restart and disconnects
+ * itself, so the clean ASSOC_LEAVE is logged as a restart instead of an
+ * external drop. Disconnecting here instead of relying on Wi-Fi's own
+ * esp_wifi_stop handler makes the result independent of the handler order
+ * (which depends on free slots in IDF's handler table) and of whether that
+ * handler exists at all (it does not in the BRIDGE_MINIMAL build). Panics do
+ * not run shutdown handlers, but they do not disconnect cleanly either. */
 static void disc_on_restart(void) {
+  s_restarting = true;
+  if (!s_wifi_up) return;
   disc_mark_own(DISC_SRC_RESTART);
+  esp_wifi_disconnect();
 }
 
 /* Validate the RTC ring buffer once per boot: reset it if it holds garbage
@@ -249,13 +325,19 @@ static void dl_ensure_locked(void) {
  * would bury the actual cause in the statistics. Only external drops of an
  * existing connection count as "kicks". */
 static void disc_log_add(const wifi_event_sta_disconnected_t *d, bool was_up) {
-  uint8_t src = DISC_SRC_EXTERN;
-  if (s_disc_src != DISC_SRC_EXTERN && millis() - s_disc_src_ms < 3000) src = s_disc_src;
-  s_disc_src = DISC_SRC_EXTERN;
-
   const uint8_t reason = d ? d->reason : 0;
   const uint32_t epoch = crashlog_now();
+  const uint32_t now_ms = millis();
   portENTER_CRITICAL(&s_dl_mux);
+  /* Read and clear the marker under the same lock disc_mark_own() takes, so
+   * a mark set concurrently (e.g. by the restarting task) is neither lost nor
+   * attributed to the wrong event. Once a restart is under way, every
+   * disconnect belongs to it - esp_wifi_stop can post a second one. */
+  uint8_t src = DISC_SRC_EXTERN;
+  if (s_restarting) src = DISC_SRC_RESTART;
+  else if (s_disc_src != DISC_SRC_EXTERN && now_ms - s_disc_src_ms < 3000) src = s_disc_src;
+  s_disc_src = DISC_SRC_EXTERN;
+
   dl_ensure_locked();
   bridge_disc_t *e = &s_dl[s_dl_head];
   memset(e, 0, sizeof(*e));
@@ -496,6 +578,23 @@ IRAM_ATTR static esp_err_t eth_rx_cb(esp_eth_handle_t h, uint8_t *buffer,
    * promises the opposite). */
   if (s_paused) { free(buffer); return ESP_OK; }   /* paused, not a drop */
 
+  /* Queue cap: with more than s_txq_cap frames already waiting for the air,
+   * drop a large frame NOW rather than letting it occupy a TX buffer. The
+   * point is latency: every queued frame delays everything behind it -
+   * pings, the management portal, the client's own ACK-clocked TCP - and a
+   * camera's I-frame burst otherwise fills all TX buffers (tens of ms of
+   * queue, ~1.7 KB of heap per frame). Deliberately no waiting here: a frame
+   * held back in this task just moves the same backlog into the Ethernet
+   * DMA ring. The retry loop below still handles a genuinely full buffer. */
+  const uint8_t cap = s_txq_cap;
+  if (cap && len > TXQ_CAP_MIN_LEN && s_active && s_wifi_up &&
+      txq_depth(s_air_done) >= (int32_t)cap) {
+    s_drop_cap = s_drop_cap + 1;
+    s_drop_e2w = s_drop_e2w + 1;
+    free(buffer);
+    return ESP_OK;
+  }
+
   esp_err_t err = ESP_FAIL;
   if (s_active && s_wifi_up) {
     const uint8_t retries = s_eth_tx_retries;
@@ -661,7 +760,9 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
     printf("[WIFI] Disconnected (reason %d %s, %d dBm)\n", d ? d->reason : -1,
            bridge_wifi_reason_str(d ? d->reason : 0), d ? d->rssi : 0);
     disc_log_add(d, was_up);
-    if (s_active) esp_wifi_connect();     /* in operation, keep reconnecting */
+    /* In operation, keep reconnecting - but not while esp_restart() is
+     * stopping the driver, where a connect would race the shutdown. */
+    if (s_active && !s_restarting) esp_wifi_connect();
   }
 }
 
@@ -995,12 +1096,6 @@ bool bridge_wifi_start(void) {
    * completely - and every stage says in the log that it kicked in. A silent
    * fallback would be particularly treacherous here, because it looks like a
    * setting that has no effect. */
-  /* Remember for display what actually went into the driver. */
-  s_eff_static_rx = wcfg.static_rx_buf_num;
-  s_eff_dyn_rx    = wcfg.dynamic_rx_buf_num;
-  s_eff_dyn_tx    = wcfg.dynamic_tx_buf_num;
-  s_eff_ba_win    = wcfg.rx_ba_win;
-
   esp_err_t werr = esp_wifi_init(&wcfg);
   if (werr != ESP_OK) {
     printf("[WIFI] init with rx_ba_win=%d failed (%s) - reducing\n",
@@ -1020,11 +1115,21 @@ bool bridge_wifi_start(void) {
     wifi_init_config_t fb = WIFI_INIT_CONFIG_DEFAULT();
     fb.rx_ba_win = 6;          /* conservative, fits any buffer count */
     ESP_ERROR_CHECK(esp_wifi_init(&fb));
+    wcfg = fb;
   }
 
-  /* Must come after esp_netif_create_default_wifi_sta() above - see
-   * disc_on_restart(). */
-  esp_register_shutdown_handler(disc_on_restart);
+  /* Remember for display what actually went into the driver - recorded only
+   * after the stage that succeeded, so a fallback shows up in the portal as
+   * a difference between saved and effective values. */
+  s_eff_static_rx = wcfg.static_rx_buf_num;
+  s_eff_dyn_rx    = wcfg.dynamic_rx_buf_num;
+  s_eff_dyn_tx    = wcfg.dynamic_tx_buf_num;
+  s_eff_ba_win    = wcfg.rx_ba_win;
+
+  /* disc_on_restart() disconnects on its own, so it does not depend on
+   * running before Wi-Fi's own esp_wifi_stop handler. */
+  esp_err_t sh = esp_register_shutdown_handler(disc_on_restart);
+  if (sh != ESP_OK) printf("[WIFI] shutdown handler: %s\n", esp_err_to_name(sh));
 
   ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
@@ -1097,6 +1202,11 @@ bool bridge_wifi_start(void) {
     }
 
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    /* Needs a started driver, like the TX power below. Purely diagnostic, so
+     * a failure is only logged. */
+    esp_err_t td = esp_wifi_set_tx_done_cb(wifi_tx_done);
+    if (td != ESP_OK) printf("[WIFI] tx_done_cb: %s\n", esp_err_to_name(td));
 
     /* TX power only AFTER esp_wifi_start() - before that the API returns
      * ESP_ERR_WIFI_NOT_STARTED. That is why the call sits inside the loop and
@@ -1237,6 +1347,10 @@ void bridge_apply_live_tuning(void) {
    * or with its result. A finished result is acknowledged as well, so the
    * portal does not fill it in again. */
   bridge_autotune_reset();
+  bridge_txp_tune_reset();
+  bridge_cap_tune_reset();
+  bridge_long_tune_reset();
+  s_txq_cap = g_cfg.txq_cap;
 
   /* Remember the PHY's initial value on the first call. */
   if (!s_txp_default) {
@@ -1269,8 +1383,8 @@ void bridge_apply_live_tuning(void) {
     }
   }
 
-  printf("[BRDG] Retries eth->wifi=%u wifi->eth=%u\n",
-         (unsigned)s_eth_tx_retries, (unsigned)s_wifi_tx_retries);
+  printf("[BRDG] Retries eth->wifi=%u wifi->eth=%u, TX queue cap %u\n",
+         (unsigned)s_eth_tx_retries, (unsigned)s_wifi_tx_retries, (unsigned)s_txq_cap);
 }
 
 int16_t bridge_get_tx_power(void) {
@@ -1335,7 +1449,11 @@ static at_phase_t s_at_phase;
 static uint32_t  s_at_t0, s_at_pkt0, s_at_drop0, s_at_pkt_step0;
 static uint32_t  s_at_ref_pps;           /* packets/s in the start measurement */
 static bool      s_at_measuring;
-static uint16_t  s_at_loss[AT_N];
+/* 0xFFFF = not measured - also before the first run, so /api/autotune does
+ * not report a perfect 0 % for values that were never tried. */
+static uint16_t  s_at_loss[AT_N] = { 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+                                     0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF };
+static_assert(AT_N == 10, "update the s_at_loss initializer");
 static uint8_t   s_at_prev;              /* value before the run, for aborts */
 
 /* Index of the candidate closest to `value` (ties go to the larger one). */
@@ -1361,7 +1479,9 @@ static void at_start_step(uint8_t idx) {
 
 /* See bridge.h. Starts at the candidate closest to the current value. */
 bool bridge_autotune_start(void) {
-  if (!s_active || s_at_state == AT_RUNNING) return false;
+  if (!s_active || s_at_state == AT_RUNNING || bridge_txp_tune_state() == AT_RUNNING ||
+      bridge_cap_tune_state() == AT_RUNNING || bridge_long_tune_state() == AT_RUNNING)
+    return false;
   s_at_prev      = s_eth_tx_retries;
   s_at_start_idx = at_nearest_idx(s_at_prev);
   s_at_phase     = AT_PH_START;
@@ -1548,6 +1668,662 @@ static void autotune_tick(void) {
          (unsigned)(s_at_loss[s_at_idx] / 100),
          (unsigned)(s_at_loss[s_at_idx] % 100), (unsigned)(dp + dd));
   at_advance(false);
+}
+
+/* ===========================================================================
+ * Autotune of the TX power
+ * ========================================================================= */
+
+/*
+ * The uplink (client -> AP) is the direction an IP camera depends on, and
+ * the ESP32's own TX power is the only RF lever the bridge has for it. More
+ * power is not automatically better: the PHY's error vector magnitude grows
+ * at the top of its range, so high-rate frames can need more retries. So it
+ * is measured, not assumed.
+ *
+ * Metric per step (settle 4 s, measure 15 s, live traffic):
+ *   - loss: frames without a TX buffer plus frames the MAC abandoned on the
+ *     air, relative to all frames;
+ *   - queue delay: how long a bridged frame waited in the driver queue
+ *     (Little's law over the TX-done accounting). A weak uplink shows up
+ *     here long before it shows up as loss - lower rates and hardware
+ *     retries make the queue drain slowly, which is also what drives ping
+ *     times and heap use up.
+ *
+ * Order: the current value first (reference packet rate for the collapse
+ * guard), then every higher step, then lower steps until one leaves the
+ * tolerance. Steps the driver maps to the same actual power as the previous
+ * one are not measured again - the chip may cap well below 20 dBm.
+ *
+ * The HIGHEST power within tolerance of the best measurement wins, i.e.
+ * power is only reduced where more of it measurably hurts. A few minutes
+ * of measuring cannot see the bad moments (interference bursts, a
+ * neighbouring AP switching channel) in which link margin decides whether
+ * the stream survives - so equal results are no reason to give it up.
+ */
+static const int8_t TP_CANDIDATES[] = { 52, 56, 60, 66, 72, 80 };  /* 13..20 dBm */
+#define TP_N               (sizeof(TP_CANDIDATES) / sizeof(TP_CANDIDATES[0]))
+#define TP_DELAY_SLACK_X10 10u   /* +1 ms absolute tolerance on the delay */
+
+typedef enum { TP_PH_START = 0, TP_PH_UP, TP_PH_DOWN } tp_phase_t;
+
+static autotune_state_t s_tp_state = AT_IDLE;
+static tp_phase_t s_tp_phase;
+static uint8_t   s_tp_idx, s_tp_start_idx, s_tp_steps;
+static int8_t    s_tp_result;
+static bool      s_tp_measuring;
+static uint32_t  s_tp_t0, s_tp_pkt_step0, s_tp_ref_pps;
+static uint32_t  s_tp_pkt0, s_tp_drop0, s_tp_fail0, s_tp_qs0, s_tp_dn0;
+/* 1/100 %, see AT_LOSS_COLLAPSED; 0xFFFF = not measured (also before the
+ * first run). */
+static uint16_t  s_tp_loss[TP_N]  = { 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF };
+static uint16_t  s_tp_delay[TP_N] = { 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF };  /* 0.1 ms */
+static_assert(TP_N == 6, "update the s_tp_loss/s_tp_delay initializers");
+static int8_t    s_tp_actual[TP_N];      /* what the driver made of it      */
+
+/* Apply a TX power value (0.25 dBm units; 0 = PHY default). */
+static void tp_apply(int8_t p) {
+  esp_wifi_set_max_tx_power(p ? p : s_txp_default);
+}
+
+static void tp_advance(bool collapsed);
+
+/* Begin measuring candidate `idx`. If the driver maps it to the same actual
+ * power as an already measured neighbour, there is nothing new to learn:
+ * take over that result and move on right away. */
+static void tp_start_step(uint8_t idx) {
+  s_tp_idx = idx;
+  tp_apply(TP_CANDIDATES[idx]);
+  int8_t a = 0;
+  s_tp_actual[idx] = esp_wifi_get_max_tx_power(&a) == ESP_OK ? a : 0;
+  for (int n = (int)idx - 1; n <= (int)idx + 1; n += 2) {
+    if (n < 0 || n >= (int)TP_N || s_tp_loss[n] == 0xFFFF) continue;
+    if (s_tp_actual[n] != s_tp_actual[idx]) continue;
+    s_tp_loss[idx]  = s_tp_loss[n];
+    s_tp_delay[idx] = s_tp_delay[n];
+    printf("[TXP ] %d -> driver %d, same as %d - not measured again\n",
+           (int)TP_CANDIDATES[idx], (int)a, (int)TP_CANDIDATES[n]);
+    tp_advance(s_tp_loss[idx] == AT_LOSS_COLLAPSED);
+    return;
+  }
+  s_tp_measuring = false;
+  s_tp_t0 = millis();
+  s_tp_pkt_step0 = s_pkt_e2w;
+}
+
+/* See bridge.h. */
+bool bridge_txp_tune_start(void) {
+  if (!s_active || s_tp_state == AT_RUNNING || s_at_state == AT_RUNNING ||
+      bridge_cap_tune_state() == AT_RUNNING || bridge_long_tune_state() == AT_RUNNING)
+    return false;
+  const int8_t cur = g_cfg.tx_power ? g_cfg.tx_power : s_txp_default;
+  uint8_t best = 0;
+  for (uint8_t i = 1; i < TP_N; i++)
+    if (abs(TP_CANDIDATES[i] - cur) < abs(TP_CANDIDATES[best] - cur)) best = i;
+  s_tp_start_idx = best;
+  s_tp_phase = TP_PH_START;
+  s_tp_steps = 0;
+  s_tp_ref_pps = 0;
+  s_tp_result = 0;
+  for (size_t i = 0; i < TP_N; i++) { s_tp_loss[i] = 0xFFFF; s_tp_delay[i] = 0xFFFF; s_tp_actual[i] = 0; }
+  s_tp_state = AT_RUNNING;
+  tp_start_step(best);
+  printf("[TXP ] Start at %d (configured %d), %u s per step\n",
+         (int)TP_CANDIDATES[best], (int)g_cfg.tx_power,
+         (unsigned)((AT_SETTLE_MS + AT_MEASURE_MS) / 1000));
+  return true;
+}
+
+/* See bridge.h. Restores the configured power if a run is aborted. */
+void bridge_txp_tune_reset(void) {
+  if (s_tp_state == AT_RUNNING) {
+    printf("[TXP ] Aborted - value was saved manually\n");
+    tp_apply(g_cfg.tx_power);
+  }
+  s_tp_state = AT_IDLE;
+}
+
+autotune_state_t bridge_txp_tune_state(void) { return s_tp_state; }
+uint8_t bridge_txp_tune_step(void)           { return s_tp_steps; }
+int8_t  bridge_txp_tune_candidate(void)      { return TP_CANDIDATES[s_tp_idx]; }
+int8_t  bridge_txp_tune_result(void)         { return s_tp_result; }
+size_t  bridge_txp_tune_values(int8_t *k, int8_t *act, uint16_t *loss, uint16_t *delay_x10) {
+  for (size_t i = 0; i < TP_N; i++) {
+    k[i] = TP_CANDIDATES[i]; act[i] = s_tp_actual[i];
+    loss[i] = s_tp_loss[i];  delay_x10[i] = s_tp_delay[i];
+  }
+  return TP_N;
+}
+
+/* Best loss and best delay over the valid measurements so far. */
+static void tp_best(uint16_t *loss, uint16_t *delay) {
+  *loss = 0xFFFF; *delay = 0xFFFF;
+  for (size_t i = 0; i < TP_N; i++) {
+    if (s_tp_loss[i] >= AT_LOSS_COLLAPSED) continue;
+    if (s_tp_loss[i] < *loss)   *loss  = s_tp_loss[i];
+    if (s_tp_delay[i] < *delay) *delay = s_tp_delay[i];
+  }
+}
+
+/* Is candidate i within tolerance of the best measurement? Loss uses the
+ * same slack rule as the retry autotune; the delay may be 25 % + 1 ms worse,
+ * because bursty camera traffic makes it noisier than the loss. */
+static bool tp_within(size_t i) {
+  if (s_tp_loss[i] >= AT_LOSS_COLLAPSED) return false;
+  uint16_t bl, bd;
+  tp_best(&bl, &bd);
+  const uint32_t slack = bl / 4 > 3 ? bl / 4 : 3;
+  uint32_t allowed = (uint32_t)bl + slack;
+  if (allowed < AT_TARGET_LOSS) allowed = AT_TARGET_LOSS;
+  const uint32_t allowed_delay = (uint32_t)bd + bd / 4 + TP_DELAY_SLACK_X10;
+  return s_tp_loss[i] <= allowed && s_tp_delay[i] <= allowed_delay;
+}
+
+/* Pick the highest power within tolerance, apply and save it. */
+static void tp_finish(void) {
+  for (size_t i = TP_N; i-- > 0;) {
+    if (s_tp_loss[i] == 0xFFFF || !tp_within(i)) continue;
+    /* Several requests can end up at the same driver power - save the
+     * smallest of them, so the configuration does not claim a power the
+     * chip never delivers. */
+    while (i > 0 && s_tp_actual[i - 1] == s_tp_actual[i] && s_tp_loss[i - 1] != 0xFFFF) i--;
+    s_tp_result = TP_CANDIDATES[i];
+    g_cfg.tx_power = s_tp_result;
+    cfg_save();
+    tp_apply(s_tp_result);
+    s_tp_state = AT_DONE;
+    printf("[TXP ] Done after %u measurements - chosen: %d (saved)\n",
+           (unsigned)s_tp_steps, (int)s_tp_result);
+    return;
+  }
+  tp_apply(g_cfg.tx_power);
+  s_tp_state = AT_TOO_LITTLE_TRAFFIC;
+  printf("[TXP ] No valid measurement - staying at %d\n", (int)g_cfg.tx_power);
+}
+
+/* Next step after a measurement (or collapse) at s_tp_idx. */
+static void tp_advance(bool collapsed) {
+  if (s_tp_phase == TP_PH_START) s_tp_phase = TP_PH_UP;
+  if (s_tp_phase == TP_PH_UP) {
+    if (!collapsed && s_tp_idx + 1 < (int)TP_N) { tp_start_step(s_tp_idx + 1); return; }
+    s_tp_phase = TP_PH_DOWN;
+    if (s_tp_start_idx > 0 && tp_within(s_tp_start_idx)) { tp_start_step(s_tp_start_idx - 1); return; }
+    tp_finish();
+    return;
+  }
+  /* Down: lower power only gets worse once it leaves the tolerance. */
+  if (!collapsed && s_tp_idx > 0 && tp_within(s_tp_idx)) { tp_start_step(s_tp_idx - 1); return; }
+  tp_finish();
+}
+
+/* TX power autotune state machine, driven from bridge_tick() like
+ * autotune_tick(), with the same settle/measure timing and collapse guard. */
+static void txp_tune_tick(void) {
+  if (s_tp_state != AT_RUNNING) return;
+  const uint32_t elapsed = millis() - s_tp_t0;
+
+  if (s_tp_ref_pps && elapsed >= AT_COLLAPSE_MS) {
+    const uint32_t pkt = s_pkt_e2w - s_tp_pkt_step0;
+    const uint32_t expected = (uint32_t)((uint64_t)s_tp_ref_pps * elapsed / 1000);
+    if ((uint64_t)pkt * 100 < (uint64_t)expected * AT_COLLAPSE_PCT) {
+      printf("[TXP ] %d -> collapse (%u instead of ~%u packets) - aborting step\n",
+             (int)TP_CANDIDATES[s_tp_idx], (unsigned)pkt, (unsigned)expected);
+      s_tp_loss[s_tp_idx] = AT_LOSS_COLLAPSED;
+      s_tp_steps++;
+      tp_apply(TP_CANDIDATES[s_tp_start_idx]);
+      tp_advance(true);
+      return;
+    }
+  }
+
+  if (!s_tp_measuring) {
+    if (elapsed < AT_SETTLE_MS) return;
+    s_tp_pkt0 = s_pkt_e2w; s_tp_drop0 = s_drop_e2w; s_tp_fail0 = s_air_fail;
+    s_tp_qs0 = s_q_sum;    s_tp_dn0 = s_air_done;
+    s_tp_measuring = true;
+    return;
+  }
+  if (elapsed < AT_SETTLE_MS + AT_MEASURE_MS) return;
+
+  const uint32_t dp = s_pkt_e2w - s_tp_pkt0;
+  const uint32_t dd = (s_drop_e2w - s_tp_drop0) + (s_air_fail - s_tp_fail0);
+  const uint32_t dsum = s_q_sum - s_tp_qs0, ddone = s_air_done - s_tp_dn0;
+  s_tp_steps++;
+
+  if (dp + dd < AT_MIN_PACKETS || !ddone) {
+    if (s_tp_phase == TP_PH_START) {
+      printf("[TXP ] Aborted: only %u packets in %u s - too little traffic\n",
+             (unsigned)(dp + dd), (unsigned)(AT_MEASURE_MS / 1000));
+      tp_apply(g_cfg.tx_power);
+      s_tp_state = AT_TOO_LITTLE_TRAFFIC;
+      return;
+    }
+    s_tp_loss[s_tp_idx] = AT_LOSS_COLLAPSED;
+    tp_apply(TP_CANDIDATES[s_tp_start_idx]);
+    tp_advance(true);
+    return;
+  }
+
+  s_tp_loss[s_tp_idx] = (uint16_t)((10000ULL * dd) / (dp + dd));
+  const uint64_t d10 = (10ULL * dsum * AT_MEASURE_MS) / ((uint64_t)ddone * ddone);
+  s_tp_delay[s_tp_idx] = (uint16_t)(d10 < 0xFFFE ? d10 : 0xFFFE);
+  if (s_tp_phase == TP_PH_START) s_tp_ref_pps = (dp + dd) * 1000 / AT_MEASURE_MS;
+  printf("[TXP ] %d (driver %d) -> %u.%02u %% loss, queue %u.%u ms (%u packets)\n",
+         (int)TP_CANDIDATES[s_tp_idx], (int)s_tp_actual[s_tp_idx],
+         (unsigned)(s_tp_loss[s_tp_idx] / 100), (unsigned)(s_tp_loss[s_tp_idx] % 100),
+         (unsigned)(s_tp_delay[s_tp_idx] / 10), (unsigned)(s_tp_delay[s_tp_idx] % 10),
+         (unsigned)(dp + dd));
+  tp_advance(false);
+}
+
+/* ===========================================================================
+ * Autotune of the TX queue cap
+ * ========================================================================= */
+
+/*
+ * The cap trades loss for latency, so the question is how small it can get
+ * before it costs anything measurable. Order: no cap first (the reference
+ * for loss, throughput and packet rate), then ever smaller caps; the first
+ * step that loses more than the tolerance allows (same slack rule as the
+ * other autotunes, relative to the reference) or delivers less than 90 % of
+ * the reference throughput ends the run. A camera's encoder produces a fixed
+ * bitrate, so a TCP stream that backs off under the drops shows up as lost
+ * throughput. The smallest cap that passed is saved - or "off" if none did.
+ *
+ * 15 s windows see the immediate effect on loss and rate, not how a
+ * recorder copes with the retransmissions over hours - worth a look at the
+ * long-run drop counter after applying a result.
+ */
+static const uint8_t QC_CANDIDATES[] = { 0, 24, 16, 12, 8 };   /* 0 = no cap */
+#define QC_N          (sizeof(QC_CANDIDATES) / sizeof(QC_CANDIDATES[0]))
+#define QC_RATE_PCT   90u    /* minimum throughput vs. the reference */
+#define QC_NONE       0xFFu  /* "no result" marker for s_qc_result    */
+
+static autotune_state_t s_qc_state = AT_IDLE;
+static uint8_t   s_qc_idx, s_qc_steps, s_qc_result = QC_NONE;
+static bool      s_qc_measuring;
+static uint32_t  s_qc_t0, s_qc_pkt_step0, s_qc_ref_pps;
+static uint32_t  s_qc_pkt0, s_qc_drop0, s_qc_fail0, s_qc_qs0, s_qc_dn0;
+static uint64_t  s_qc_by0;
+static uint16_t  s_qc_loss[QC_N]  = { 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF };  /* 1/100 % */
+static uint16_t  s_qc_delay[QC_N] = { 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF };  /* 0.1 ms  */
+static uint16_t  s_qc_kbps[QC_N];
+static_assert(QC_N == 5, "update the s_qc_* initializers");
+
+/* Begin measuring candidate `idx`. */
+static void qc_start_step(uint8_t idx) {
+  s_qc_idx = idx;
+  s_txq_cap = QC_CANDIDATES[idx];
+  s_qc_measuring = false;
+  s_qc_t0 = millis();
+  s_qc_pkt_step0 = s_pkt_e2w;
+}
+
+/* See bridge.h. */
+bool bridge_cap_tune_start(void) {
+  if (!s_active || s_qc_state == AT_RUNNING || s_at_state == AT_RUNNING ||
+      s_tp_state == AT_RUNNING || bridge_long_tune_state() == AT_RUNNING) return false;
+  for (size_t i = 0; i < QC_N; i++) { s_qc_loss[i] = 0xFFFF; s_qc_delay[i] = 0xFFFF; s_qc_kbps[i] = 0; }
+  s_qc_steps = 0;
+  s_qc_ref_pps = 0;
+  s_qc_result = QC_NONE;
+  s_qc_state = AT_RUNNING;
+  qc_start_step(0);
+  printf("[QCAP] Start (configured cap %u), %u s per step\n",
+         (unsigned)g_cfg.txq_cap, (unsigned)((AT_SETTLE_MS + AT_MEASURE_MS) / 1000));
+  return true;
+}
+
+/* See bridge.h. Restores the configured cap if a run is aborted. */
+void bridge_cap_tune_reset(void) {
+  if (s_qc_state == AT_RUNNING) {
+    printf("[QCAP] Aborted - value was saved manually\n");
+    s_txq_cap = g_cfg.txq_cap;
+  }
+  s_qc_state = AT_IDLE;
+}
+
+autotune_state_t bridge_cap_tune_state(void) { return s_qc_state; }
+uint8_t bridge_cap_tune_step(void)           { return s_qc_steps; }
+uint8_t bridge_cap_tune_candidate(void)      { return QC_CANDIDATES[s_qc_idx]; }
+uint8_t bridge_cap_tune_result(void)         { return s_qc_result; }
+size_t  bridge_cap_tune_values(uint8_t *k, uint16_t *loss, uint16_t *delay_x10, uint16_t *kbps) {
+  for (size_t i = 0; i < QC_N; i++) {
+    k[i] = QC_CANDIDATES[i]; loss[i] = s_qc_loss[i];
+    delay_x10[i] = s_qc_delay[i]; kbps[i] = s_qc_kbps[i];
+  }
+  return QC_N;
+}
+
+/* Does step i keep up with the reference (step 0)? */
+static bool qc_passes(size_t i) {
+  if (s_qc_loss[i] >= AT_LOSS_COLLAPSED) return false;
+  const uint32_t ref = s_qc_loss[0];
+  const uint32_t slack = ref / 4 > 3 ? ref / 4 : 3;
+  uint32_t allowed = ref + slack;
+  if (allowed < AT_TARGET_LOSS) allowed = AT_TARGET_LOSS;
+  return s_qc_loss[i] <= allowed &&
+         (uint32_t)s_qc_kbps[i] * 100 >= (uint32_t)s_qc_kbps[0] * QC_RATE_PCT;
+}
+
+/* End the run with the smallest passing cap (index `last_ok`), save it. */
+static void qc_finish(uint8_t last_ok) {
+  s_qc_result = QC_CANDIDATES[last_ok];
+  s_txq_cap = s_qc_result;
+  g_cfg.txq_cap = s_qc_result;
+  cfg_save();
+  s_qc_state = AT_DONE;
+  printf("[QCAP] Done after %u measurements - chosen: %s%u (saved)\n",
+         (unsigned)s_qc_steps, s_qc_result ? "cap " : "no cap ", (unsigned)s_qc_result);
+}
+
+/* TX queue cap autotune state machine, driven from bridge_tick() with the
+ * same settle/measure timing and collapse guard as the other autotunes. */
+static void cap_tune_tick(void) {
+  if (s_qc_state != AT_RUNNING) return;
+  const uint32_t elapsed = millis() - s_qc_t0;
+
+  if (s_qc_ref_pps && elapsed >= AT_COLLAPSE_MS) {
+    const uint32_t pkt = s_pkt_e2w - s_qc_pkt_step0;
+    const uint32_t expected = (uint32_t)((uint64_t)s_qc_ref_pps * elapsed / 1000);
+    if ((uint64_t)pkt * 100 < (uint64_t)expected * AT_COLLAPSE_PCT) {
+      printf("[QCAP] Cap %u -> collapse (%u instead of ~%u packets) - stopping\n",
+             (unsigned)QC_CANDIDATES[s_qc_idx], (unsigned)pkt, (unsigned)expected);
+      s_qc_loss[s_qc_idx] = AT_LOSS_COLLAPSED;
+      s_qc_steps++;
+      qc_finish(s_qc_idx - 1);
+      return;
+    }
+  }
+
+  if (!s_qc_measuring) {
+    if (elapsed < AT_SETTLE_MS) return;
+    s_qc_pkt0 = s_pkt_e2w; s_qc_drop0 = s_drop_e2w; s_qc_fail0 = s_air_fail;
+    s_qc_qs0 = s_q_sum;    s_qc_dn0 = s_air_done; s_qc_by0 = s_by_e2w;
+    s_qc_measuring = true;
+    return;
+  }
+  if (elapsed < AT_SETTLE_MS + AT_MEASURE_MS) return;
+
+  const uint32_t dp = s_pkt_e2w - s_qc_pkt0;
+  const uint32_t dd = (s_drop_e2w - s_qc_drop0) + (s_air_fail - s_qc_fail0);
+  const uint32_t dsum = s_q_sum - s_qc_qs0, ddone = s_air_done - s_qc_dn0;
+  const uint64_t dby = s_by_e2w - s_qc_by0;
+  s_qc_steps++;
+
+  if (dp + dd < AT_MIN_PACKETS || !ddone) {
+    if (s_qc_idx == 0) {
+      printf("[QCAP] Aborted: only %u packets in %u s - too little traffic\n",
+             (unsigned)(dp + dd), (unsigned)(AT_MEASURE_MS / 1000));
+      s_txq_cap = g_cfg.txq_cap;
+      s_qc_state = AT_TOO_LITTLE_TRAFFIC;
+      return;
+    }
+    s_qc_loss[s_qc_idx] = AT_LOSS_COLLAPSED;
+    qc_finish(s_qc_idx - 1);
+    return;
+  }
+
+  s_qc_loss[s_qc_idx] = (uint16_t)((10000ULL * dd) / (dp + dd));
+  const uint64_t d10 = (10ULL * dsum * AT_MEASURE_MS) / ((uint64_t)ddone * ddone);
+  s_qc_delay[s_qc_idx] = (uint16_t)(d10 < 0xFFFE ? d10 : 0xFFFE);
+  const uint64_t kb = dby * 8 / AT_MEASURE_MS;
+  s_qc_kbps[s_qc_idx] = (uint16_t)(kb < 0xFFFF ? kb : 0xFFFF);
+  if (s_qc_idx == 0) s_qc_ref_pps = (dp + dd) * 1000 / AT_MEASURE_MS;
+  printf("[QCAP] Cap %2u -> %u.%02u %% loss, queue %u.%u ms, %u kbit/s (%u packets)\n",
+         (unsigned)QC_CANDIDATES[s_qc_idx],
+         (unsigned)(s_qc_loss[s_qc_idx] / 100), (unsigned)(s_qc_loss[s_qc_idx] % 100),
+         (unsigned)(s_qc_delay[s_qc_idx] / 10), (unsigned)(s_qc_delay[s_qc_idx] % 10),
+         (unsigned)s_qc_kbps[s_qc_idx], (unsigned)(dp + dd));
+
+  if (s_qc_idx > 0 && !qc_passes(s_qc_idx)) { qc_finish(s_qc_idx - 1); return; }
+  if (s_qc_idx + 1 < (int)QC_N) { qc_start_step(s_qc_idx + 1); return; }
+  qc_finish(s_qc_idx);
+}
+
+/* ===========================================================================
+ * Long-run check of the TX retries
+ * ========================================================================= */
+
+/*
+ * The retry autotune measures 15 s per value and picks the smallest one
+ * below 0.10 % loss. It cannot separate values that both stay below that:
+ * in practice 8 and 12 retries both pass in 15 s, while hours of operation
+ * show one losing several times more than the other. Only a long
+ * comparison sees that, so this runs one.
+ *
+ * Candidates: one step below the current value, the value itself and two
+ * steps above - the short autotune tends to land too low, so the check
+ * looks mainly upwards. They are rotated in 5-minute blocks (A B C D A B
+ * ...), each block counted after a 10 s settle, so every candidate sees the
+ * same mix of busy and quiet hours - a fair A/B instead of "A in the
+ * afternoon, B at night".
+ *
+ * At the end the smallest value whose loss rate is at most 1.5x the best
+ * one (+50 ppm for noise) wins - smaller values block the Ethernet receive
+ * task less. A candidate needs LR_MIN_PACKETS to count at all; one that
+ * loses more than 1 % is taken out of the rotation immediately, so a value
+ * that is too small cannot hurt the stream for hours. RAM only: a reboot
+ * ends the run without a result.
+ */
+#define LR_MAX_K        4
+#define LR_BLOCK_MS     300000u   /* 5 min per block                     */
+#define LR_SETTLE_MS     10000u   /* not counted at the start of a block */
+#define LR_MIN_PACKETS   50000u   /* per candidate, for a valid result    */
+#define LR_BAD_PPM       10000u   /* 1 % - leaves the rotation at once    */
+#define LR_BAD_MIN_PKTS   5000u   /* ...judged after this many packets    */
+#define LR_SLACK_PPM        50u
+
+static autotune_state_t s_lr_state = AT_IDLE;
+static uint8_t   s_lr_k[LR_MAX_K], s_lr_n, s_lr_cur, s_lr_prev, s_lr_result;
+static bool      s_lr_bad[LR_MAX_K], s_lr_measuring;
+static uint32_t  s_lr_pkts[LR_MAX_K], s_lr_drops[LR_MAX_K];
+static uint32_t  s_lr_t_start, s_lr_dur_ms, s_lr_block_t0, s_lr_pkt0, s_lr_drop0;
+
+/* Loss of candidate i in parts per million (0xFFFFFFFF = no packets). */
+static uint32_t lr_ppm(size_t i) {
+  const uint64_t all = (uint64_t)s_lr_pkts[i] + s_lr_drops[i];
+  return all ? (uint32_t)(1000000ULL * s_lr_drops[i] / all) : 0xFFFFFFFFu;
+}
+
+/* Start a block for candidate i. */
+static void lr_start_block(uint8_t i) {
+  s_lr_cur = i;
+  s_eth_tx_retries = s_lr_k[i];
+  s_lr_block_t0 = millis();
+  s_lr_measuring = false;
+}
+
+/* Add the counts since the block's settle phase ended to candidate cur. */
+static void lr_account(void) {
+  if (!s_lr_measuring) return;
+  s_lr_pkts[s_lr_cur]  += s_pkt_e2w - s_lr_pkt0;
+  s_lr_drops[s_lr_cur] += (s_drop_e2w - s_lr_drop0);
+  s_lr_measuring = false;
+}
+
+/* See bridge.h. */
+bool bridge_long_tune_start(uint8_t hours) {
+  if (!s_active || s_lr_state == AT_RUNNING || s_at_state == AT_RUNNING ||
+      s_tp_state == AT_RUNNING || s_qc_state == AT_RUNNING) return false;
+  if (hours < 1)  hours = 1;
+  if (hours > 48) hours = 48;
+  s_lr_prev = s_eth_tx_retries;
+  const uint8_t c = at_nearest_idx(s_lr_prev);
+  s_lr_n = 0;
+  for (int i = (int)c - 1; i <= (int)c + 2 && s_lr_n < LR_MAX_K; i++) {
+    if (i < 0 || i >= (int)AT_N) continue;
+    s_lr_k[s_lr_n] = AT_CANDIDATES[i];
+    s_lr_pkts[s_lr_n] = 0; s_lr_drops[s_lr_n] = 0; s_lr_bad[s_lr_n] = false;
+    s_lr_n++;
+  }
+  s_lr_dur_ms  = (uint32_t)hours * 3600000u;
+  s_lr_t_start = millis();
+  s_lr_result  = 0;
+  s_lr_state   = AT_RUNNING;
+  lr_start_block(0);
+  printf("[LONG] Retries: %u h, %u candidates around %u, 5 min blocks\n",
+         (unsigned)hours, (unsigned)s_lr_n, (unsigned)s_lr_prev);
+  return true;
+}
+
+/* See bridge.h. Restores the configured retries if a run is aborted. */
+void bridge_long_tune_reset(void) {
+  if (s_lr_state == AT_RUNNING) {
+    printf("[LONG] Aborted\n");
+    s_eth_tx_retries = g_cfg.eth_tx_retries ? g_cfg.eth_tx_retries : ETH_TX_RETRIES_DEF;
+  }
+  s_lr_state = AT_IDLE;
+}
+
+autotune_state_t bridge_long_tune_state(void) { return s_lr_state; }
+uint8_t  bridge_long_tune_candidate(void)     { return s_lr_k[s_lr_cur]; }
+uint8_t  bridge_long_tune_result(void)        { return s_lr_result; }
+void     bridge_long_tune_progress(uint32_t *elapsed_min, uint32_t *total_min) {
+  *elapsed_min = s_lr_state == AT_RUNNING ? (millis() - s_lr_t_start) / 60000u : 0;
+  *total_min   = s_lr_dur_ms / 60000u;
+}
+size_t   bridge_long_tune_values(uint8_t *k, uint32_t *pkts, uint32_t *drops, bool *bad) {
+  for (size_t i = 0; i < s_lr_n; i++) {
+    k[i] = s_lr_k[i]; pkts[i] = s_lr_pkts[i]; drops[i] = s_lr_drops[i]; bad[i] = s_lr_bad[i];
+  }
+  return s_lr_n;
+}
+
+/* Choose and save the result once the duration is over. */
+static void lr_finish(void) {
+  uint32_t best = 0xFFFFFFFFu;
+  for (size_t i = 0; i < s_lr_n; i++)
+    if (!s_lr_bad[i] && s_lr_pkts[i] >= LR_MIN_PACKETS && lr_ppm(i) < best) best = lr_ppm(i);
+  if (best == 0xFFFFFFFFu) {
+    s_eth_tx_retries = s_lr_prev;
+    s_lr_state = AT_TOO_LITTLE_TRAFFIC;
+    printf("[LONG] Not enough traffic for a result - staying at %u\n", (unsigned)s_lr_prev);
+    return;
+  }
+  const uint32_t allowed = best + best / 2 + LR_SLACK_PPM;
+  for (size_t i = 0; i < s_lr_n; i++) {
+    if (s_lr_bad[i] || s_lr_pkts[i] < LR_MIN_PACKETS || lr_ppm(i) > allowed) continue;
+    s_lr_result = s_lr_k[i];
+    break;
+  }
+  s_eth_tx_retries = s_lr_result;
+  g_cfg.eth_tx_retries = s_lr_result;
+  cfg_save();
+  s_lr_state = AT_DONE;
+  printf("[LONG] Done - chosen: %u retries (best %lu ppm, allowed %lu ppm, saved)\n",
+         (unsigned)s_lr_result, (unsigned long)best, (unsigned long)allowed);
+}
+
+/* Long-run state machine, driven from bridge_tick(). */
+static void long_tune_tick(void) {
+  if (s_lr_state != AT_RUNNING) return;
+  const uint32_t now = millis();
+
+  if (!s_lr_measuring && now - s_lr_block_t0 >= LR_SETTLE_MS && now - s_lr_block_t0 < LR_BLOCK_MS) {
+    s_lr_pkt0 = s_pkt_e2w; s_lr_drop0 = s_drop_e2w;
+    s_lr_measuring = true;
+  }
+
+  /* A candidate far beyond any sensible loss leaves the rotation at once -
+   * judged on the running block plus what it collected before. */
+  if (s_lr_measuring) {
+    const uint32_t p = s_lr_pkts[s_lr_cur] + (s_pkt_e2w - s_lr_pkt0);
+    const uint32_t d = s_lr_drops[s_lr_cur] + (s_drop_e2w - s_lr_drop0);
+    if (p + d >= LR_BAD_MIN_PKTS && 1000000ULL * d / (p + d) > LR_BAD_PPM) {
+      lr_account();
+      s_lr_bad[s_lr_cur] = true;
+      printf("[LONG] %u retries lose > 1 %% - out of the rotation\n", (unsigned)s_lr_k[s_lr_cur]);
+      s_lr_block_t0 = now - LR_BLOCK_MS;   /* switch below */
+    }
+  }
+
+  if (now - s_lr_block_t0 < LR_BLOCK_MS) return;
+  lr_account();
+  if (now - s_lr_t_start >= s_lr_dur_ms) { lr_finish(); return; }
+
+  uint8_t next = s_lr_cur;
+  for (size_t step = 1; step <= s_lr_n; step++) {
+    const uint8_t c = (uint8_t)((s_lr_cur + step) % s_lr_n);
+    if (!s_lr_bad[c]) { next = c; break; }
+  }
+  if (s_lr_bad[next]) {         /* every candidate failed */
+    s_eth_tx_retries = s_lr_prev;
+    s_lr_state = AT_TOO_LITTLE_TRAFFIC;
+    printf("[LONG] Every candidate loses > 1 %% - staying at %u\n", (unsigned)s_lr_prev);
+    return;
+  }
+  lr_start_block(next);
+}
+
+/* ===========================================================================
+ * "Calibrate all": the three autotunes in sequence
+ * ========================================================================= */
+
+/*
+ * Runs the retry, TX power and queue cap calibrations one after another, so
+ * each one measures with the results of the previous ones applied: the TX
+ * power with the chosen retries, the cap with both. The order follows the
+ * size of the effect - retries decide most of the loss, the cap is only
+ * judged against what the others leave over.
+ *
+ * Optionally the long-run check of the retries follows, because the
+ * 15-second retry step cannot separate values below 0.10 % loss.
+ *
+ * The chain stops when a stage ends without a result (too little traffic)
+ * or is aborted by a manual save (its state drops back to idle), so it
+ * never keeps measuring on a basis the user has just overridden.
+ */
+static all_stage_t s_all_stage = ALL_IDLE;
+static uint8_t     s_all_long_h = 0;   /* 0 = no long-run stage */
+
+/* See bridge.h. */
+bool bridge_tune_all_start(uint8_t long_hours) {
+  if (s_all_stage >= ALL_RETRIES && s_all_stage <= ALL_LONG) return false;
+  if (!bridge_autotune_start()) return false;
+  s_all_stage  = ALL_RETRIES;
+  s_all_long_h = long_hours;
+  printf("[ALL ] Calibrating retries -> TX power -> queue cap%s\n",
+         long_hours ? " -> long-run retry check" : "");
+  return true;
+}
+
+all_stage_t bridge_tune_all_stage(void) { return s_all_stage; }
+
+/* See bridge.h. Re-applying the saved configuration aborts every running
+ * calibration and restores the values they were varying. */
+void bridge_tune_stop(void) {
+  if (s_all_stage >= ALL_RETRIES && s_all_stage <= ALL_LONG) s_all_stage = ALL_STOPPED;
+  bridge_apply_live_tuning();
+}
+
+/* Advance the chain once the running stage has finished. */
+static void tune_all_tick(void) {
+  if (s_all_stage < ALL_RETRIES || s_all_stage > ALL_LONG) return;
+  const autotune_state_t st = s_all_stage == ALL_RETRIES ? s_at_state
+                            : s_all_stage == ALL_TXP     ? s_tp_state
+                            : s_all_stage == ALL_CAP     ? s_qc_state
+                                                         : s_lr_state;
+  if (st == AT_RUNNING) return;
+  if (st != AT_DONE) {
+    printf("[ALL ] Stopped at stage %u (%s)\n", (unsigned)s_all_stage,
+           st == AT_TOO_LITTLE_TRAFFIC ? "too little traffic" : "aborted");
+    s_all_stage = ALL_STOPPED;
+    return;
+  }
+  if (s_all_stage == ALL_RETRIES && bridge_txp_tune_start()) { s_all_stage = ALL_TXP; return; }
+  if (s_all_stage == ALL_TXP     && bridge_cap_tune_start()) { s_all_stage = ALL_CAP; return; }
+  if (s_all_stage == ALL_CAP && s_all_long_h) {
+    if (bridge_long_tune_start(s_all_long_h)) { s_all_stage = ALL_LONG; return; }
+    s_all_stage = ALL_STOPPED;
+    return;
+  }
+  if (s_all_stage == ALL_CAP || s_all_stage == ALL_LONG) {
+    s_all_stage = ALL_DONE;
+    printf("[ALL ] Done\n");
+    return;
+  }
+  s_all_stage = ALL_STOPPED;     /* next stage refused to start */
 }
 
 /* ===========================================================================
@@ -1963,6 +2739,10 @@ static void roam_tick(void) {
  * kbit/s from the byte counters. */
 void bridge_tick(void) {
   autotune_tick();
+  txp_tune_tick();
+  cap_tune_tick();
+  long_tune_tick();
+  tune_all_tick();
   watchdog_tick();
   roam_tick();
 
@@ -1978,6 +2758,26 @@ void bridge_tick(void) {
   s_kbps_e2w = (uint32_t)(((e - le) * 8ULL) / dt);
   s_kbps_w2e = (uint32_t)(((w - lw) * 8ULL) / dt);
   le = e; lw = w;
+
+  /* TX queue over the last second: mean depth L = dSum / dDone, rate
+   * lambda = dDone / dt, wait W = L / lambda = dSum * dt / dDone^2. */
+  static uint32_t lq = 0, ld = 0, lp = 0;
+  const uint32_t qs = s_q_sum, dn = s_air_done, pk = s_pkt_e2w;
+  const uint32_t dsum = qs - lq, ddone = dn - ld;
+  /* A whole second without a single submission or completion: nothing can
+   * be waiting, so whatever depth is left is accounting drift (e.g. frames
+   * the driver flushed on a disconnect without reporting them). */
+  if (!ddone && pk == lp) {
+    const int32_t depth = txq_depth(dn);
+    if (depth > 0) s_q_idle = s_q_idle + (uint32_t)depth;
+  }
+  lq = qs; ld = dn; lp = pk;
+  if (ddone) {
+    s_q_avg_x10  = (uint32_t)((10ULL * dsum) / ddone);
+    s_q_delay_ms = (uint32_t)(((uint64_t)dsum * dt) / ((uint64_t)ddone * ddone));
+  } else {
+    s_q_avg_x10 = 0; s_q_delay_ms = 0;
+  }
 }
 
 /* See bridge.h. */
@@ -2013,6 +2813,22 @@ void bridge_get_stats(BridgeStats *o) {
   }
   o->wifi_kicks = s_kicks;
   portEXIT_CRITICAL(&s_dl_mux);
+
+  o->air_ok   = s_air_ok;
+  o->air_fail = s_air_fail;
+  o->txq_x10      = s_q_avg_x10;
+  o->txq_delay_ms = s_q_delay_ms;
+  const int32_t depth = txq_depth(s_air_done);
+  o->txq_now = depth > 0 ? (uint32_t)depth : 0;
+  o->drop_cap = s_drop_cap;
+  o->txq_cap  = s_txq_cap;
+  wifi_country_t cc;
+  if (esp_wifi_get_country(&cc) == ESP_OK) {
+    o->country[0] = cc.cc[0] >= ' ' ? cc.cc[0] : '?';
+    o->country[1] = cc.cc[1] >= ' ' ? cc.cc[1] : '?';
+    o->country[2] = '\0';
+    o->country_max_txp = cc.max_tx_power;
+  }
 
   o->eth_link      = s_eth_link;
   o->wifi_up       = s_wifi_up;

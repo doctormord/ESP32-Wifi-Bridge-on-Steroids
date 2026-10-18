@@ -180,6 +180,7 @@ A plain counter does not say *why* the link dropped, and the serial log is not a
 |---|---|---|
 | TX power (2–20 dBm, 11 PHY steps) | immediately | PHY maximum |
 | TX retries LAN→Wi-Fi / Wi-Fi→LAN | immediately | 8 / 1 |
+| TX queue cap LAN→Wi-Fi (frames) | immediately | off |
 | Watchdog on/off, allowed actions, bad windows | immediately | off, all, 3 |
 | Roaming on/off, interval, threshold, margin | immediately | off, 300 s, −70 dBm, 6 dB |
 | Portal idle reboot delay | immediately | 900 s |
@@ -191,6 +192,16 @@ A plain counter does not say *why* the link dropped, and the serial log is not a
 All tuning fields follow one convention: **`0` stored = "use the firmware/sdkconfig default"**, so `sdkconfig.defaults` stays the single source of truth. The portal always shows the value actually in effect.
 
 **Retry calibration (autotune)**: measures the loss rate under real traffic for ~19 s per step, starting at the current value. If that misses the 0.10 % target it goes up while each step brings clearly less loss, then down as long as the loss stays within bounds, and picks the **smallest** value that meets the target — not the best one, because every retry blocks the Ethernet receive task a little longer. A collapse guard aborts a step within seconds if the packet rate drops below 30 % of the reference, and the run aborts honestly if there is not enough traffic to measure.
+
+**TX power calibration**: measures the PHY's power steps from 13 to 20 dBm against the live stream with the same timing and collapse guard. Per step it records the loss (frames without a TX buffer plus frames the MAC abandoned on the air) and the **queue delay** — how long a frame waited in the driver's TX queue, from the TX-done accounting below. It starts at the current value, tries every higher step, then lower ones until one leaves the tolerance, and saves the **highest** power that is as good as the best measurement: power is only reduced where more of it measurably hurts, because link margin is what carries the stream through interference a short measurement never sees. Steps the driver maps to the same actual power are measured once, and the smallest request that reaches it is saved — the ESP32 tested here caps at 14.75 dBm whatever is requested above 15 dBm. Results per step are shown in the portal and at `GET /api/autotune`.
+
+**TX queue cap and its calibration**: with a cap of N, a LAN→Wi-Fi frame larger than 256 bytes is dropped at once when N frames already wait for the air, instead of occupying one of the TX buffers; small frames (TCP ACKs, ARP, ping) always pass. There is deliberately no waiting at the cap — a frame held back in the Ethernet receive task only moves the same backlog into the DMA ring. The cap bounds the queue delay and the heap the queue uses, at the cost of loss in bursts. The calibration measures without a cap first, then caps 24/16/12/8, stops at the first that loses noticeably more than the reference or delivers under 90 % of its throughput, and saves the smallest passing cap — or off. On the camera link it was developed on, even cap 24 lost 0.30 % (vs. 0.00 %) while halving the queue wait, so the result was off: for a TCP video stream, the tail of an I-frame is better off waiting in the queue than being retransmitted.
+
+**Long-run retry check**: short windows cannot separate retry values that both stay below 0.10 % loss — on the development link the 15-second calibration picks 8 retries, while hours of operation showed 12 to lose five times less (0.012 % vs 0.063 %). The long-run check settles that under real operation: one step below the current value, the value itself and two steps above take turns in 5-minute blocks (10 s settle each) for 2–24 h, so every candidate sees the same mix of busy and quiet hours. The smallest value whose loss is at most 1.5× the best one (+50 ppm) is saved; a candidate needs 50,000 packets to count, and one losing more than 1 % leaves the rotation at once. A reboot ends it without a result.
+
+**Calibrate all** runs the retry, TX power and queue cap calibrations in that order, each measuring with the previous results applied (~3–5 min), and by default appends the 6-hour long-run retry check. It stops when a stage has too little traffic, a manual save overrides it, or *Stop* is pressed (which restores the saved values). Every calibration measures the LAN→Wi-Fi direction under the traffic flowing *at that moment* — run it while the client does its real job; a synthetic load such as `iperf3` tunes for bulk transfer, not for a game or a call.
+
+**TX queue and air loss**: a TX-done callback (`esp_wifi_set_tx_done_cb`) reports every frame the Wi-Fi MAC finished, delivered or abandoned after its hardware retries. Frames handed to the driver minus frames finished is the TX queue depth; averaged per completion and divided by the frame rate (Little's law) it gives the time a frame waits for the air. That is the bufferbloat behind high and jittery ping times on a busy channel, and it rises long before frames get lost. The callback reports the encrypted 802.11 frame, so the management stack's few frames cannot be filtered out; the estimate resynchronizes instead whenever it would go negative or the link has been idle for a second.
 
 ---
 
@@ -226,7 +237,8 @@ All endpoints are served on the management IP (or `192.168.4.1` in provisioning 
 | POST | `/api/config` | Save configuration (`application/x-www-form-urlencoded`) |
 | POST | `/api/reboot` | Reboot |
 | POST | `/api/eth_reset` | Restart the Ethernet driver (link down/up for the client) |
-| POST | `/api/autotune` | Start the retry calibration |
+| POST | `/api/autotune` | Start the retry calibration; `?kind=txp` the TX power, `?kind=cap` the queue cap calibration, `?kind=long&h=N` the N-hour long-run retry check (default 6), `?kind=all&h=N` all three in sequence plus an N-hour long-run check (`h=0`: none); `?kind=stop` aborts whatever runs and restores the saved values |
+| GET | `/api/autotune` | Per-step results of all calibrations: `{"retries":[{"k","loss"}],"txp":[{"k","act","loss","delay"}],"cap":[{"k","loss","delay","kbps"}],"long":[{"k","pkts","drops","bad"}]}` (loss in 1/100 %, -1 = collapse; delay in 0.1 ms; powers in 0.25 dBm; cap 0 = off) |
 | GET | `/api/scan` | Scan for Wi-Fi networks |
 | GET | `/api/disconnects` | Wi-Fi disconnect statistics and log |
 | POST 🔑 | `/api/update` | Upload firmware (raw `.bin` body) |
@@ -244,7 +256,11 @@ All endpoints are served on the management IP (or `192.168.4.1` in provisioning 
  "ssid":"HomeNetwork","bssid":"02:aa:bb:cc:dd:01",
  "at":0,"at_s":0,"at_n":10,"at_r":0,"at_k":8,
  "heap":91172,"heap_min":32064,"heap_dma":91172,"heap_blk":53248,
- "txp":66,"bw":20,"time":1792236053,"build":"b1e6aac"}
+ "txp":59,"bw":20,"air_ok":1842977,"air_fail":0,"cc":"01","cc_max":20,
+ "txq":0,"txq_x10":27,"txq_ms":21,"pt":2,"pt_s":3,"pt_k":52,"pt_r":60,
+ "drop_cap":0,"txq_cap":0,"qc":2,"qc_s":2,"qc_k":24,"qc_r":0,"all":5,
+ "lr":1,"lr_k":12,"lr_el":5,"lr_tot":360,"lr_r":0,
+ "time":1792236053,"build":"b1e6aac"}
 ```
 
 | Field | Meaning |
@@ -266,6 +282,14 @@ All endpoints are served on the management IP (or `192.168.4.1` in provisioning 
 | `heap`, `heap_min`, `heap_dma`, `heap_blk` | Free heap, minimum since boot, free DMA-capable internal memory, largest free block (bytes) |
 | `txp` | Actual TX power from the driver, in 0.25 dBm units |
 | `bw` | Negotiated channel width in MHz |
+| `air_ok`, `air_fail` | Frames the Wi-Fi MAC delivered / abandoned after its hardware retries since boot (lost on the air, unlike `drop_up`) |
+| `cc`, `cc_max` | Regulatory country in effect (adopted from the AP by default) and its TX power cap in dBm |
+| `txq`, `txq_x10`, `txq_ms` | Frames waiting in the driver's TX queue now, their mean over the last second ×10, and the resulting mean wait per frame in ms |
+| `pt`, `pt_s`, `pt_k`, `pt_r` | TX power calibration: state (as `at`), completed measurements, power under test and chosen power (0.25 dBm units) |
+| `drop_cap`, `txq_cap` | Frames dropped by the TX queue cap since boot (also counted in `drop_up`), cap in effect (0 = off) |
+| `qc`, `qc_s`, `qc_k`, `qc_r` | Queue cap calibration: state (as `at`), completed measurements, cap under test, chosen cap (0 = off, -1 = no result) |
+| `all` | *Calibrate all*: 0 idle, 1–4 running stage (retries, TX power, queue cap, long-run check), 5 done, 6 stopped |
+| `lr`, `lr_k`, `lr_el`, `lr_tot`, `lr_r` | Long-run retry check: state (as `at`), retries in the running block, minutes elapsed / total, chosen retries |
 | `time` | UTC Unix time, 0 = not synced via SNTP yet |
 | `build` | Git revision of the running firmware (`-dirty` if built from uncommitted changes) |
 
@@ -300,6 +324,7 @@ All endpoints are served on the management IP (or `192.168.4.1` in provisioning 
 | `roam_check_s` | 0 or 30–65535 |
 | `roam_rssi_threshold` | 0 or −100…−1 dBm |
 | `roam_margin_db` | 0–40 |
+| `txq_cap` | 0 (off) or 4–64 frames |
 
 Saving applies TX power and retries immediately; watchdog and roaming settings are read live; everything else takes effect after a reboot.
 
@@ -361,9 +386,9 @@ Enabled when a broker host is set. Plain MQTT (no TLS, deliberately — it would
 | `bridge/<node>/watchdog` | Immediate event per watchdog action: `{"action":"eth_reset\|wifi_reconnect\|reboot","reason":"loss\|disconnects\|probe\|eth_stall","uptime":…}` |
 | `homeassistant/sensor/bridge_<node>/…/config` | Retained autodiscovery entries |
 
-State payload fields: `rssi`, `ch`, `kbps_up`, `kbps_down`, `pkt_up`, `pkt_down`, `drop_up`, `drop_down`, `wifi_disc`, `wifi_kicks`, `disc_reason`, `wd_reconnects`, `wd_eth_resets`, `roam_count`, `eth`, `uptime`, `heap`, `bssid`, `client_ip`.
+State payload fields: `rssi`, `ch`, `kbps_up`, `kbps_down`, `pkt_up`, `pkt_down`, `drop_up`, `drop_down`, `wifi_disc`, `wifi_kicks`, `disc_reason`, `wd_reconnects`, `wd_eth_resets`, `roam_count`, `eth`, `uptime`, `heap`, `bssid`, `client_ip`, `txq_ms`, `air_fail`.
 
-Home Assistant creates one device with sensors for signal strength, Wi-Fi channel, throughput both ways, dropped packets both ways, uptime, free heap, client IP, watchdog reconnects and Ethernet resets, active AP switches, Wi-Fi disconnects total, Wi-Fi drops and last drop reason, plus an **Ethernet link** connectivity binary sensor. The watchdog events show up in the history with Home Assistant's own receive timestamp.
+Home Assistant creates one device with sensors for signal strength, Wi-Fi channel, throughput both ways, dropped packets both ways, uptime, free heap, client IP, watchdog reconnects and Ethernet resets, active AP switches, Wi-Fi disconnects total, Wi-Fi drops and last drop reason, TX queue delay and frames lost on air, plus an **Ethernet link** connectivity binary sensor. The watchdog events show up in the history with Home Assistant's own receive timestamp.
 
 ---
 
