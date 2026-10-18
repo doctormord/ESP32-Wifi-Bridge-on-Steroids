@@ -331,6 +331,12 @@ uint8_t bridge_get_bandwidth_mhz(void);
 #define DISC_SRC_WATCHDOG 2u   /* watchdog level "reconnect Wi-Fi" */
 #define DISC_SRC_ROAM     3u   /* active AP switch */
 #define DISC_SRC_RESTART  4u   /* clean disconnect during esp_restart() */
+#define DISC_SRC_FAILOVER 5u   /* switch to another configured network */
+
+/* Network slot (0..2) the STA is configured for, and network switches
+ * (failover and failback) since boot. */
+uint8_t  bridge_get_net(void);
+uint32_t bridge_get_failovers(void);
 
 typedef struct {
   uint32_t t_s;        /* uptime in s at the drop (of the boot in 'boot') */

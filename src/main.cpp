@@ -109,8 +109,15 @@ static bool s_stable_reported = false;
  * The criterion is deliberately NOT "has booted" but "is reachable over the
  * network" (the caller only invokes this after 30 s of uptime) - losing
  * network access is what hurts on a board installed without serial access.
- * This applies in both modes: a board that only offers the portal is still
- * repairable.
+ *
+ * In portal mode it depends on why the portal is up. Without stored
+ * credentials (fresh or factory-reset device) the portal IS the intended
+ * state, so the image is confirmed. WITH stored credentials, the portal
+ * means this firmware could not get the bridge onto the network that the
+ * previous one served - so it is deliberately left unconfirmed: the portal
+ * idle reboot then rolls back to the previous image instead of looping
+ * between a failed connect and the portal with a broken firmware that
+ * confirmed itself.
  */
 static void ota_confirm_if_pending(void) {
   if (s_ota_confirmed) return;
@@ -409,7 +416,8 @@ static void bridge_loop(void) {
 #ifndef BRIDGE_MINIMAL
   /* Deliberately NOT confirmed in the minimal variant - see bridge_setup().
    * The missing confirmation IS the way back. */
-  if (!s_ota_confirmed && millis() > 30000) ota_confirm_if_pending();
+  if (!s_ota_confirmed && millis() > 30000 && !(s_provisioning && g_cfg.configured))
+    ota_confirm_if_pending();
 #endif
 
   /* Running long enough -> reset the failed-boot counter. Only from here on
