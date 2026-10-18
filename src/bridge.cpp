@@ -1349,6 +1349,7 @@ void bridge_apply_live_tuning(void) {
   bridge_autotune_reset();
   bridge_txp_tune_reset();
   bridge_cap_tune_reset();
+  bridge_long_tune_reset();
   s_txq_cap = g_cfg.txq_cap;
 
   /* Remember the PHY's initial value on the first call. */
@@ -1479,7 +1480,7 @@ static void at_start_step(uint8_t idx) {
 /* See bridge.h. Starts at the candidate closest to the current value. */
 bool bridge_autotune_start(void) {
   if (!s_active || s_at_state == AT_RUNNING || bridge_txp_tune_state() == AT_RUNNING ||
-      bridge_cap_tune_state() == AT_RUNNING)
+      bridge_cap_tune_state() == AT_RUNNING || bridge_long_tune_state() == AT_RUNNING)
     return false;
   s_at_prev      = s_eth_tx_retries;
   s_at_start_idx = at_nearest_idx(s_at_prev);
@@ -1753,7 +1754,8 @@ static void tp_start_step(uint8_t idx) {
 /* See bridge.h. */
 bool bridge_txp_tune_start(void) {
   if (!s_active || s_tp_state == AT_RUNNING || s_at_state == AT_RUNNING ||
-      bridge_cap_tune_state() == AT_RUNNING) return false;
+      bridge_cap_tune_state() == AT_RUNNING || bridge_long_tune_state() == AT_RUNNING)
+    return false;
   const int8_t cur = g_cfg.tx_power ? g_cfg.tx_power : s_txp_default;
   uint8_t best = 0;
   for (uint8_t i = 1; i < TP_N; i++)
@@ -1960,7 +1962,7 @@ static void qc_start_step(uint8_t idx) {
 /* See bridge.h. */
 bool bridge_cap_tune_start(void) {
   if (!s_active || s_qc_state == AT_RUNNING || s_at_state == AT_RUNNING ||
-      s_tp_state == AT_RUNNING) return false;
+      s_tp_state == AT_RUNNING || bridge_long_tune_state() == AT_RUNNING) return false;
   for (size_t i = 0; i < QC_N; i++) { s_qc_loss[i] = 0xFFFF; s_qc_delay[i] = 0xFFFF; s_qc_kbps[i] = 0; }
   s_qc_steps = 0;
   s_qc_ref_pps = 0;
@@ -2080,6 +2082,181 @@ static void cap_tune_tick(void) {
 }
 
 /* ===========================================================================
+ * Long-run check of the TX retries
+ * ========================================================================= */
+
+/*
+ * The retry autotune measures 15 s per value and picks the smallest one
+ * below 0.10 % loss. It cannot separate values that both stay below that:
+ * in practice 8 and 12 retries both pass in 15 s, while hours of operation
+ * show one losing several times more than the other. Only a long
+ * comparison sees that, so this runs one.
+ *
+ * Candidates: one step below the current value, the value itself and two
+ * steps above - the short autotune tends to land too low, so the check
+ * looks mainly upwards. They are rotated in 5-minute blocks (A B C D A B
+ * ...), each block counted after a 10 s settle, so every candidate sees the
+ * same mix of busy and quiet hours - a fair A/B instead of "A in the
+ * afternoon, B at night".
+ *
+ * At the end the smallest value whose loss rate is at most 1.5x the best
+ * one (+50 ppm for noise) wins - smaller values block the Ethernet receive
+ * task less. A candidate needs LR_MIN_PACKETS to count at all; one that
+ * loses more than 1 % is taken out of the rotation immediately, so a value
+ * that is too small cannot hurt the stream for hours. RAM only: a reboot
+ * ends the run without a result.
+ */
+#define LR_MAX_K        4
+#define LR_BLOCK_MS     300000u   /* 5 min per block                     */
+#define LR_SETTLE_MS     10000u   /* not counted at the start of a block */
+#define LR_MIN_PACKETS   50000u   /* per candidate, for a valid result    */
+#define LR_BAD_PPM       10000u   /* 1 % - leaves the rotation at once    */
+#define LR_BAD_MIN_PKTS   5000u   /* ...judged after this many packets    */
+#define LR_SLACK_PPM        50u
+
+static autotune_state_t s_lr_state = AT_IDLE;
+static uint8_t   s_lr_k[LR_MAX_K], s_lr_n, s_lr_cur, s_lr_prev, s_lr_result;
+static bool      s_lr_bad[LR_MAX_K], s_lr_measuring;
+static uint32_t  s_lr_pkts[LR_MAX_K], s_lr_drops[LR_MAX_K];
+static uint32_t  s_lr_t_start, s_lr_dur_ms, s_lr_block_t0, s_lr_pkt0, s_lr_drop0;
+
+/* Loss of candidate i in parts per million (0xFFFFFFFF = no packets). */
+static uint32_t lr_ppm(size_t i) {
+  const uint64_t all = (uint64_t)s_lr_pkts[i] + s_lr_drops[i];
+  return all ? (uint32_t)(1000000ULL * s_lr_drops[i] / all) : 0xFFFFFFFFu;
+}
+
+/* Start a block for candidate i. */
+static void lr_start_block(uint8_t i) {
+  s_lr_cur = i;
+  s_eth_tx_retries = s_lr_k[i];
+  s_lr_block_t0 = millis();
+  s_lr_measuring = false;
+}
+
+/* Add the counts since the block's settle phase ended to candidate cur. */
+static void lr_account(void) {
+  if (!s_lr_measuring) return;
+  s_lr_pkts[s_lr_cur]  += s_pkt_e2w - s_lr_pkt0;
+  s_lr_drops[s_lr_cur] += (s_drop_e2w - s_lr_drop0);
+  s_lr_measuring = false;
+}
+
+/* See bridge.h. */
+bool bridge_long_tune_start(uint8_t hours) {
+  if (!s_active || s_lr_state == AT_RUNNING || s_at_state == AT_RUNNING ||
+      s_tp_state == AT_RUNNING || s_qc_state == AT_RUNNING) return false;
+  if (hours < 1)  hours = 1;
+  if (hours > 48) hours = 48;
+  s_lr_prev = s_eth_tx_retries;
+  const uint8_t c = at_nearest_idx(s_lr_prev);
+  s_lr_n = 0;
+  for (int i = (int)c - 1; i <= (int)c + 2 && s_lr_n < LR_MAX_K; i++) {
+    if (i < 0 || i >= (int)AT_N) continue;
+    s_lr_k[s_lr_n] = AT_CANDIDATES[i];
+    s_lr_pkts[s_lr_n] = 0; s_lr_drops[s_lr_n] = 0; s_lr_bad[s_lr_n] = false;
+    s_lr_n++;
+  }
+  s_lr_dur_ms  = (uint32_t)hours * 3600000u;
+  s_lr_t_start = millis();
+  s_lr_result  = 0;
+  s_lr_state   = AT_RUNNING;
+  lr_start_block(0);
+  printf("[LONG] Retries: %u h, %u candidates around %u, 5 min blocks\n",
+         (unsigned)hours, (unsigned)s_lr_n, (unsigned)s_lr_prev);
+  return true;
+}
+
+/* See bridge.h. Restores the configured retries if a run is aborted. */
+void bridge_long_tune_reset(void) {
+  if (s_lr_state == AT_RUNNING) {
+    printf("[LONG] Aborted\n");
+    s_eth_tx_retries = g_cfg.eth_tx_retries ? g_cfg.eth_tx_retries : ETH_TX_RETRIES_DEF;
+  }
+  s_lr_state = AT_IDLE;
+}
+
+autotune_state_t bridge_long_tune_state(void) { return s_lr_state; }
+uint8_t  bridge_long_tune_candidate(void)     { return s_lr_k[s_lr_cur]; }
+uint8_t  bridge_long_tune_result(void)        { return s_lr_result; }
+void     bridge_long_tune_progress(uint32_t *elapsed_min, uint32_t *total_min) {
+  *elapsed_min = s_lr_state == AT_RUNNING ? (millis() - s_lr_t_start) / 60000u : 0;
+  *total_min   = s_lr_dur_ms / 60000u;
+}
+size_t   bridge_long_tune_values(uint8_t *k, uint32_t *pkts, uint32_t *drops, bool *bad) {
+  for (size_t i = 0; i < s_lr_n; i++) {
+    k[i] = s_lr_k[i]; pkts[i] = s_lr_pkts[i]; drops[i] = s_lr_drops[i]; bad[i] = s_lr_bad[i];
+  }
+  return s_lr_n;
+}
+
+/* Choose and save the result once the duration is over. */
+static void lr_finish(void) {
+  uint32_t best = 0xFFFFFFFFu;
+  for (size_t i = 0; i < s_lr_n; i++)
+    if (!s_lr_bad[i] && s_lr_pkts[i] >= LR_MIN_PACKETS && lr_ppm(i) < best) best = lr_ppm(i);
+  if (best == 0xFFFFFFFFu) {
+    s_eth_tx_retries = s_lr_prev;
+    s_lr_state = AT_TOO_LITTLE_TRAFFIC;
+    printf("[LONG] Not enough traffic for a result - staying at %u\n", (unsigned)s_lr_prev);
+    return;
+  }
+  const uint32_t allowed = best + best / 2 + LR_SLACK_PPM;
+  for (size_t i = 0; i < s_lr_n; i++) {
+    if (s_lr_bad[i] || s_lr_pkts[i] < LR_MIN_PACKETS || lr_ppm(i) > allowed) continue;
+    s_lr_result = s_lr_k[i];
+    break;
+  }
+  s_eth_tx_retries = s_lr_result;
+  g_cfg.eth_tx_retries = s_lr_result;
+  cfg_save();
+  s_lr_state = AT_DONE;
+  printf("[LONG] Done - chosen: %u retries (best %lu ppm, allowed %lu ppm, saved)\n",
+         (unsigned)s_lr_result, (unsigned long)best, (unsigned long)allowed);
+}
+
+/* Long-run state machine, driven from bridge_tick(). */
+static void long_tune_tick(void) {
+  if (s_lr_state != AT_RUNNING) return;
+  const uint32_t now = millis();
+
+  if (!s_lr_measuring && now - s_lr_block_t0 >= LR_SETTLE_MS && now - s_lr_block_t0 < LR_BLOCK_MS) {
+    s_lr_pkt0 = s_pkt_e2w; s_lr_drop0 = s_drop_e2w;
+    s_lr_measuring = true;
+  }
+
+  /* A candidate far beyond any sensible loss leaves the rotation at once -
+   * judged on the running block plus what it collected before. */
+  if (s_lr_measuring) {
+    const uint32_t p = s_lr_pkts[s_lr_cur] + (s_pkt_e2w - s_lr_pkt0);
+    const uint32_t d = s_lr_drops[s_lr_cur] + (s_drop_e2w - s_lr_drop0);
+    if (p + d >= LR_BAD_MIN_PKTS && 1000000ULL * d / (p + d) > LR_BAD_PPM) {
+      lr_account();
+      s_lr_bad[s_lr_cur] = true;
+      printf("[LONG] %u retries lose > 1 %% - out of the rotation\n", (unsigned)s_lr_k[s_lr_cur]);
+      s_lr_block_t0 = now - LR_BLOCK_MS;   /* switch below */
+    }
+  }
+
+  if (now - s_lr_block_t0 < LR_BLOCK_MS) return;
+  lr_account();
+  if (now - s_lr_t_start >= s_lr_dur_ms) { lr_finish(); return; }
+
+  uint8_t next = s_lr_cur;
+  for (size_t step = 1; step <= s_lr_n; step++) {
+    const uint8_t c = (uint8_t)((s_lr_cur + step) % s_lr_n);
+    if (!s_lr_bad[c]) { next = c; break; }
+  }
+  if (s_lr_bad[next]) {         /* every candidate failed */
+    s_eth_tx_retries = s_lr_prev;
+    s_lr_state = AT_TOO_LITTLE_TRAFFIC;
+    printf("[LONG] Every candidate loses > 1 %% - staying at %u\n", (unsigned)s_lr_prev);
+    return;
+  }
+  lr_start_block(next);
+}
+
+/* ===========================================================================
  * "Calibrate all": the three autotunes in sequence
  * ========================================================================= */
 
@@ -2090,29 +2267,43 @@ static void cap_tune_tick(void) {
  * size of the effect - retries decide most of the loss, the cap is only
  * judged against what the others leave over.
  *
+ * Optionally the long-run check of the retries follows, because the
+ * 15-second retry step cannot separate values below 0.10 % loss.
+ *
  * The chain stops when a stage ends without a result (too little traffic)
  * or is aborted by a manual save (its state drops back to idle), so it
  * never keeps measuring on a basis the user has just overridden.
  */
 static all_stage_t s_all_stage = ALL_IDLE;
+static uint8_t     s_all_long_h = 0;   /* 0 = no long-run stage */
 
 /* See bridge.h. */
-bool bridge_tune_all_start(void) {
-  if (s_all_stage >= ALL_RETRIES && s_all_stage <= ALL_CAP) return false;
+bool bridge_tune_all_start(uint8_t long_hours) {
+  if (s_all_stage >= ALL_RETRIES && s_all_stage <= ALL_LONG) return false;
   if (!bridge_autotune_start()) return false;
-  s_all_stage = ALL_RETRIES;
-  printf("[ALL ] Calibrating retries -> TX power -> queue cap\n");
+  s_all_stage  = ALL_RETRIES;
+  s_all_long_h = long_hours;
+  printf("[ALL ] Calibrating retries -> TX power -> queue cap%s\n",
+         long_hours ? " -> long-run retry check" : "");
   return true;
 }
 
 all_stage_t bridge_tune_all_stage(void) { return s_all_stage; }
 
+/* See bridge.h. Re-applying the saved configuration aborts every running
+ * calibration and restores the values they were varying. */
+void bridge_tune_stop(void) {
+  if (s_all_stage >= ALL_RETRIES && s_all_stage <= ALL_LONG) s_all_stage = ALL_STOPPED;
+  bridge_apply_live_tuning();
+}
+
 /* Advance the chain once the running stage has finished. */
 static void tune_all_tick(void) {
-  if (s_all_stage < ALL_RETRIES || s_all_stage > ALL_CAP) return;
+  if (s_all_stage < ALL_RETRIES || s_all_stage > ALL_LONG) return;
   const autotune_state_t st = s_all_stage == ALL_RETRIES ? s_at_state
                             : s_all_stage == ALL_TXP     ? s_tp_state
-                                                         : s_qc_state;
+                            : s_all_stage == ALL_CAP     ? s_qc_state
+                                                         : s_lr_state;
   if (st == AT_RUNNING) return;
   if (st != AT_DONE) {
     printf("[ALL ] Stopped at stage %u (%s)\n", (unsigned)s_all_stage,
@@ -2122,7 +2313,12 @@ static void tune_all_tick(void) {
   }
   if (s_all_stage == ALL_RETRIES && bridge_txp_tune_start()) { s_all_stage = ALL_TXP; return; }
   if (s_all_stage == ALL_TXP     && bridge_cap_tune_start()) { s_all_stage = ALL_CAP; return; }
-  if (s_all_stage == ALL_CAP) {
+  if (s_all_stage == ALL_CAP && s_all_long_h) {
+    if (bridge_long_tune_start(s_all_long_h)) { s_all_stage = ALL_LONG; return; }
+    s_all_stage = ALL_STOPPED;
+    return;
+  }
+  if (s_all_stage == ALL_CAP || s_all_stage == ALL_LONG) {
     s_all_stage = ALL_DONE;
     printf("[ALL ] Done\n");
     return;
@@ -2545,6 +2741,7 @@ void bridge_tick(void) {
   autotune_tick();
   txp_tune_tick();
   cap_tune_tick();
+  long_tune_tick();
   tune_all_tick();
   watchdog_tick();
   roam_tick();

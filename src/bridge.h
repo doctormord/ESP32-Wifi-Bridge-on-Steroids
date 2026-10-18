@@ -263,12 +263,38 @@ size_t           bridge_cap_tune_values(uint8_t *candidates, uint16_t *loss,
  * without a result or is aborted by a manual save. The individual results
  * are reported by the three autotunes as usual.
  * ------------------------------------------------------------------------ */
-typedef enum { ALL_IDLE = 0, ALL_RETRIES, ALL_TXP, ALL_CAP, ALL_DONE, ALL_STOPPED } all_stage_t;
+typedef enum { ALL_IDLE = 0, ALL_RETRIES, ALL_TXP, ALL_CAP, ALL_LONG,
+               ALL_DONE, ALL_STOPPED } all_stage_t;
 
-/* Start the chain. Returns false if it or any single autotune is running,
- * or the bridge is inactive. */
-bool        bridge_tune_all_start(void);
+/* Start the chain; long_hours > 0 appends the long-run retry check with
+ * that duration. Returns false if it or any single autotune is running, or
+ * the bridge is inactive. */
+bool        bridge_tune_all_start(uint8_t long_hours);
 all_stage_t bridge_tune_all_stage(void);
+/* Abort every running calibration (and the chain) and restore the saved
+ * values they were varying. */
+void        bridge_tune_stop(void);
+
+/* ---------------------------------------------------------------------------
+ * Long-run check of the TX retries
+ *
+ * The 15 s retry autotune cannot separate values that both stay below 0.10 %
+ * loss; hours of operation can. This rotates one step below the current
+ * value, the value itself and two steps above in 5-minute blocks for the
+ * given number of hours (1-48), then saves the smallest value whose loss
+ * rate is at most 1.5x the best one (+50 ppm). Candidates losing > 1 % leave
+ * the rotation at once. Runs alone; a reboot ends it without a result.
+ * ------------------------------------------------------------------------ */
+bool             bridge_long_tune_start(uint8_t hours);
+void             bridge_long_tune_reset(void);
+autotune_state_t bridge_long_tune_state(void);
+uint8_t          bridge_long_tune_candidate(void);  /* retries in the running block */
+uint8_t          bridge_long_tune_result(void);     /* chosen retries, 0 = none */
+void             bridge_long_tune_progress(uint32_t *elapsed_min, uint32_t *total_min);
+/* Per candidate: retries, counted packets and drops, out of the rotation.
+ * Arrays need room for 4 entries; returns the number filled. */
+size_t           bridge_long_tune_values(uint8_t *candidates, uint32_t *pkts,
+                                         uint32_t *drops, bool *bad);
 
 /* TX power actually in effect, in 0.25 dBm units, queried from the driver.
  * Usually differs from the configured value because the PHY only knows 11

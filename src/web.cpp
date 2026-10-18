@@ -384,13 +384,24 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
       recorder, a PC during its real workload. A synthetic load (e.g.
       <code>iperf3</code>) tunes for bulk transfer, not for a game or a call.
       Without traffic the run stops with &ldquo;too little traffic&rdquo;.
-      <br>Limit of short measurements: the retry step takes the smallest
-      value below 0.10&nbsp;% loss and cannot tell apart values that are
-      both below that &ndash; only the <i>Dropped</i> counter over hours can.
-      If a long run has shown a larger value to be better, set it back
-      after the run.
+      <br>The 15-second retry step cannot tell apart values that both stay
+      below 0.10&nbsp;% loss &ndash; on a real camera link 8 and 12 retries
+      both passed, while hours of operation showed 8 losing five times more.
+      So by default the run ends with the <b>long-run check</b> of the
+      retries (see below), which settles exactly that.
     </div>
-    <button onclick="autotune('all')" style="margin-top:0">Calibrate all</button>
+    <label>Then long-run check of the retries</label>
+    <select id="allh">
+      <option value="6" selected>6 hours (recommended)</option>
+      <option value="12">12 hours</option>
+      <option value="24">24 hours</option>
+      <option value="2">2 hours (quick, less certain)</option>
+      <option value="0">skip</option>
+    </select>
+    <div class="row" style="margin-top:8px">
+      <button onclick="autotune('all',$('allh').value)" style="margin-top:0">Calibrate all</button>
+      <button class="sec" onclick="autotune('stop')" style="margin-top:0">Stop running calibration</button>
+    </div>
     <div id="allmsg" style="margin-top:10px;font-size:13px"></div>
   </div>
 
@@ -410,6 +421,29 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
     <button onclick="autotune()" style="margin-top:0">Start calibration</button>
     <div id="atmsg" style="margin-top:10px;font-size:13px"></div>
     <table id="attab" style="margin-top:6px;font-size:12px;border-collapse:collapse"></table>
+
+    <b style="font-size:13px;display:block;margin-top:14px">Long-run check</b>
+    <div class="sub" style="margin:4px 0 8px">
+      Compares one step below the current value, the value itself and two
+      steps above under real operation: they take turns in 5-minute blocks,
+      so each sees the same mix of busy and quiet hours. At the end the
+      <b>smallest</b> value whose loss is at most 1.5&times; the best one is
+      saved. A value losing more than 1&nbsp;% is dropped from the rotation
+      at once. Use the bridge normally meanwhile; a reboot ends the check
+      without a result. Run it after the short calibration &ndash; that one
+      cannot separate values below 0.10&nbsp;% loss.
+    </div>
+    <div class="row">
+      <select id="lrh">
+        <option value="6" selected>6 hours (recommended)</option>
+        <option value="12">12 hours</option>
+        <option value="24">24 hours</option>
+        <option value="2">2 hours (quick, less certain)</option>
+      </select>
+      <button onclick="autotune('long',$('lrh').value)" style="margin-top:0">Start long-run check</button>
+    </div>
+    <div id="lrmsg" style="margin-top:10px;font-size:13px"></div>
+    <table id="lrtab" style="margin-top:6px;font-size:12px;border-collapse:collapse"></table>
   </div>
 
   <div style="margin-top:14px;padding:12px;background:#232833;border-radius:8px">
@@ -626,7 +660,7 @@ let PROV=false;
    the TRANSITION to "done". Doing it on every 2 s poll while the board
    reports "done" would make a manually edited value jump back before it
    is saved. */
-let ATPREV=-1, PTPREV=-1, PTRES=0, QCPREV=-1, QCRES=-1;
+let ATPREV=-1, PTPREV=-1, PTRES=0, QCPREV=-1, QCRES=-1, LRPREV=-1, LRRES=0, LRPOLL=0;
 function fmt(k){return k>1000?(k/1000).toFixed(1)+' Mbit/s':k+' kbit/s'}
 function dur(s){const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
   return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m')}
@@ -725,8 +759,11 @@ async function tick(){
     /* The tables only change when a measurement finishes - fill them on the
        first poll, refresh them while a run is active and once on the
        transition out of it. */
-    if(ATPREV===-1||s.at===1||s.pt===1||s.qc===1||(ATPREV===1&&s.at!==1)||
-       (PTPREV===1&&s.pt!==1)||(QCPREV===1&&s.qc!==1)) atTables();
+    /* A long-run check only changes its table every few minutes - poll it
+       every 15th status tick (30 s), not every 2 s for hours. */
+    const lrTick=s.lr===1&&(++LRPOLL%15===0);
+    if(ATPREV===-1||s.at===1||s.pt===1||s.qc===1||lrTick||(ATPREV===1&&s.at!==1)||
+       (PTPREV===1&&s.pt!==1)||(QCPREV===1&&s.qc!==1)||(LRPREV===1&&s.lr!==1)) atTables();
     ATPREV=s.at;
     const dbm=v=>(v/4).toFixed(2).replace(/\.?0+$/,'')+' dBm';
     if(s.pt===1) $('ptmsg').textContent='TX power calibration running - measurement '+(s.pt_s+1)+
@@ -746,12 +783,23 @@ async function tick(){
     else if(s.qc===3) $('qcmsg').textContent='Aborted: too little traffic during the measurement. '+
                       'Let the camera stream and start again.';
     QCPREV=s.qc;
-    /* "Calibrate all": 1-3 = running stage, 4 done, 5 stopped. */
-    if(s.all>=1&&s.all<=3) $('allmsg').textContent='Running - step '+s.all+' of 3: '+
-                 ['retries','TX power','queue cap'][s.all-1]+' (details in its section below)';
-    else if(s.all===4) $('allmsg').textContent='Done - all three results saved (see below).';
-    else if(s.all===5) $('allmsg').textContent='Stopped - a step had too little traffic or was '+
-                 'overridden by a manual save. Results found up to then are kept.';
+    /* Long-run check: progress, result. */
+    const hm=m=>Math.floor(m/60)+' h '+String(m%60).padStart(2,'0')+' min';
+    if(s.lr===1) $('lrmsg').textContent='Long-run check running - '+hm(s.lr_el)+' of '+hm(s.lr_tot)+
+                 ', now testing '+s.lr_k+' retries (blocks of 5 min)';
+    else if(s.lr===2){ LRRES=s.lr_r; $('lrmsg').textContent='Done - chosen: '+s.lr_r+' retries, saved.';
+                       if(LRPREV===1){ $('eth_tx_retries').value=s.lr_r;
+                         if(SNAP){SNAP.eth_tx_retries=String(s.lr_r);dirtyCheck()} } }
+    else if(s.lr===3) $('lrmsg').textContent='No result: not enough traffic, or every value lost more '+
+                      'than 1 %. The previous value is active again.';
+    LRPREV=s.lr;
+    /* "Calibrate all": 1-4 = running stage, 5 done, 6 stopped. */
+    if(s.all>=1&&s.all<=4) $('allmsg').textContent='Running - '+
+                 ['retries','TX power','queue cap','long-run check of the retries'][s.all-1]+
+                 ' (details in its section below)';
+    else if(s.all===5) $('allmsg').textContent='Done - all results saved (see below).';
+    else if(s.all===6) $('allmsg').textContent='Stopped - a step had too little traffic or was '+
+                 'stopped / overridden by a manual save. Results found up to then are kept.';
     /* Mean frames waiting in the driver queue and the resulting wait. A few
        ms is normal; tens to hundreds of ms mean the uplink cannot keep up. */
     $('txq').textContent=(s.wifi&&s.txq_ms!==undefined)?s.txq_ms+' ms':'-';
@@ -860,13 +908,16 @@ function defaults(){
   dirtyCheck();   /* set by script - does not fire an input event */
 }
 /* Start the retry calibration, with kind 'txp' / 'cap' the TX power or
-   queue cap one, with 'all' the three in sequence. */
-async function autotune(kind){
-  const m=$(kind==='txp'?'ptmsg':kind==='cap'?'qcmsg':kind==='all'?'allmsg':'atmsg');
-  m.textContent='Starting...';
+   queue cap one, 'long' the long-run retry check, 'all' the chain (h =
+   hours of the long-run check, 0 = none); 'stop' aborts whatever runs. */
+async function autotune(kind,h){
+  const m=$({txp:'ptmsg',cap:'qcmsg',all:'allmsg',stop:'allmsg',long:'lrmsg'}[kind]||'atmsg');
+  m.textContent=kind==='stop'?'Stopping...':'Starting...';
   try{
-    const j=await(await fetch('/api/autotune'+(kind?'?kind='+kind:''),{method:'POST'})).json();
-    m.textContent=j.ok?'Calibration running - please keep traffic flowing.'
+    const j=await(await fetch('/api/autotune'+(kind?'?kind='+kind+(h!==undefined?'&h='+h:''):''),
+                              {method:'POST'})).json();
+    m.textContent=kind==='stop'?'Stopped - the saved values are active again.'
+                 :j.ok?'Calibration running - please keep traffic flowing.'
                       :('Not started: '+(j.err||'unknown'));
   }catch(e){m.textContent='Error while starting'}
 }
@@ -887,6 +938,12 @@ async function atTables(){
       j.cap.map(e=>'<tr'+(e.k===QCRES?' style="font-weight:bold"':'')+'>'+td(e.k?e.k+' frames':'off')+
         td(pct(e.loss))+td(e.delay<0?'-':(e.delay/10).toFixed(1)+' ms')+
         td(e.kbps<0?'-':(e.kbps/1000).toFixed(2)+' Mbit/s')+'</tr>').join(''):'';
+    /* Loss in ppm-accurate percent: long runs separate values far below
+       0.01 %, so three decimals. */
+    $('lrtab').innerHTML=j.long&&j.long.length?'<tr>'+['Retries','Packets','Lost','Loss'].map(t=>td(t,1)).join('')+'</tr>'+
+      j.long.map(e=>{const a=e.pkts+e.drops;return '<tr'+(e.k===LRRES?' style="font-weight:bold"':'')+'>'+
+        td(e.k)+td(e.pkts.toLocaleString())+td(e.drops.toLocaleString())+
+        td(e.bad?'<b class="bad">&gt; 1 % - dropped</b>':a?(100*e.drops/a).toFixed(3)+' %':'-')+'</tr>'}).join(''):'';
   }catch(e){}
 }
 /* Trigger a reboot and reload the page as soon as the board answers again -
@@ -1089,8 +1146,10 @@ static esp_err_t h_root(httpd_req_t *r) {
 static esp_err_t h_status(httpd_req_t *r) {
   BridgeStats st;
   bridge_get_stats(&st);
+  uint32_t lr_el, lr_tot;
+  bridge_long_tune_progress(&lr_el, &lr_tot);
 
-  char buf[1250];
+  char buf[1350];
   snprintf(buf, sizeof(buf),
     "{\"prov\":%d,\"wifi\":%d,\"eth\":%d,\"rssi\":%d,\"ch\":%u,"
     "\"kbps_up\":%lu,\"kbps_down\":%lu,\"pkt_up\":%lu,\"pkt_down\":%lu,"
@@ -1106,6 +1165,7 @@ static esp_err_t h_status(httpd_req_t *r) {
     "\"txq\":%lu,\"txq_x10\":%lu,\"txq_ms\":%lu,"
     "\"pt\":%d,\"pt_s\":%u,\"pt_k\":%d,\"pt_r\":%d,"
     "\"drop_cap\":%lu,\"txq_cap\":%u,\"qc\":%d,\"qc_s\":%u,\"qc_k\":%u,\"qc_r\":%d,\"all\":%d,"
+    "\"lr\":%d,\"lr_k\":%u,\"lr_el\":%lu,\"lr_tot\":%lu,\"lr_r\":%u,"
     "\"time\":%lu,\"build\":\"" GIT_REV "\"}",
     s_provisioning ? 1 : 0, st.wifi_up ? 1 : 0, st.eth_link ? 1 : 0,
     (int)st.rssi, (unsigned)st.channel,
@@ -1155,8 +1215,12 @@ static esp_err_t h_status(httpd_req_t *r) {
     (unsigned long)st.drop_cap, (unsigned)st.txq_cap,
     (int)bridge_cap_tune_state(), bridge_cap_tune_step(), bridge_cap_tune_candidate(),
     bridge_cap_tune_result() == 0xFF ? -1 : (int)bridge_cap_tune_result(),
-    /* "Calibrate all": 0 idle, 1-3 running stage, 4 done, 5 stopped. */
+    /* "Calibrate all": 0 idle, 1-4 running stage, 5 done, 6 stopped. */
     (int)bridge_tune_all_stage(),
+    /* Long-run retry check: state, retries in the running block, minutes
+     * elapsed / total, chosen retries. */
+    (int)bridge_long_tune_state(), bridge_long_tune_candidate(),
+    (unsigned long)lr_el, (unsigned long)lr_tot, bridge_long_tune_result(),
     /* Time UTC, 0 = not set via SNTP yet. */
     (unsigned long)crashlog_now());
 
@@ -1552,16 +1616,26 @@ static esp_err_t h_config_post(httpd_req_t *r) {
 }
 
 /* POST /api/autotune - start the retry autotune, with ?kind=txp the TX power
- * autotune, with ?kind=cap the TX queue cap autotune, with ?kind=all all
- * three in sequence (see bridge.h). */
+ * autotune, with ?kind=cap the TX queue cap autotune, with ?kind=long&h=N
+ * the N-hour long-run retry check (default 6), with ?kind=all all three in
+ * sequence (&h=N appends the long-run check). ?kind=stop aborts whatever
+ * runs and restores the saved values (see bridge.h). */
 static esp_err_t h_autotune(httpd_req_t *r) {
-  char q[32] = "", kind[8] = "";
-  if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK)
+  char q[48] = "", kind[8] = "", hs[4] = "";
+  if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK) {
     httpd_query_key_value(q, "kind", kind, sizeof(kind));
-  const bool ok = strcmp(kind, "txp") == 0 ? bridge_txp_tune_start()
-                : strcmp(kind, "cap") == 0 ? bridge_cap_tune_start()
-                : strcmp(kind, "all") == 0 ? bridge_tune_all_start()
-                                           : bridge_autotune_start();
+    httpd_query_key_value(q, "h", hs, sizeof(hs));
+  }
+  int h = atoi(hs);
+  if (h < 0)  h = 0;
+  if (h > 48) h = 48;
+  bool ok = true;
+  if (strcmp(kind, "stop") == 0) bridge_tune_stop();
+  else ok = strcmp(kind, "txp")  == 0 ? bridge_txp_tune_start()
+          : strcmp(kind, "cap")  == 0 ? bridge_cap_tune_start()
+          : strcmp(kind, "long") == 0 ? bridge_long_tune_start((uint8_t)(h ? h : 6))
+          : strcmp(kind, "all")  == 0 ? bridge_tune_all_start((uint8_t)h)
+                                      : bridge_autotune_start();
   httpd_resp_set_type(r, "application/json");
   httpd_resp_set_hdr(r, "Cache-Control", "no-store");
   return httpd_resp_send(r, ok ? "{\"ok\":true}"
@@ -1580,8 +1654,10 @@ static esp_err_t h_autotune_get(httpd_req_t *r) {
   const size_t pn = bridge_txp_tune_values(pk, pa, pl, pd);
   uint8_t  ck[8]; uint16_t cl[8], cd[8], cr[8];
   const size_t cn = bridge_cap_tune_values(ck, cl, cd, cr);
+  uint8_t  lk[4]; uint32_t lp[4], ld[4]; bool lb[4];
+  const size_t ln = bridge_long_tune_values(lk, lp, ld, lb);
 
-  char buf[1300];
+  char buf[1600];
   int n = snprintf(buf, sizeof(buf), "{\"retries\":[");
   bool first = true;
   for (size_t i = 0; i < rn && n < (int)sizeof(buf) - 64; i++) {
@@ -1611,6 +1687,11 @@ static esp_err_t h_autotune_get(httpd_req_t *r) {
                   col ? -1 : (int)cr[i]);
     first = false;
   }
+  n += snprintf(buf + n, sizeof(buf) - n, "],\"long\":[");
+  for (size_t i = 0; i < ln && n < (int)sizeof(buf) - 80; i++)
+    n += snprintf(buf + n, sizeof(buf) - n, "%s{\"k\":%u,\"pkts\":%lu,\"drops\":%lu,\"bad\":%d}",
+                  i ? "," : "", (unsigned)lk[i], (unsigned long)lp[i],
+                  (unsigned long)ld[i], lb[i] ? 1 : 0);
   snprintf(buf + n, sizeof(buf) - n, "]}");
   httpd_resp_set_type(r, "application/json");
   httpd_resp_set_hdr(r, "Cache-Control", "no-store");
