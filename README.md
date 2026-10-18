@@ -197,6 +197,8 @@ All tuning fields follow one convention: **`0` stored = "use the firmware/sdkcon
 
 **TX queue cap and its calibration**: with a cap of N, a LAN→Wi-Fi frame larger than 256 bytes is dropped at once when N frames already wait for the air, instead of occupying one of the TX buffers; small frames (TCP ACKs, ARP, ping) always pass. There is deliberately no waiting at the cap — a frame held back in the Ethernet receive task only moves the same backlog into the DMA ring. The cap bounds the queue delay and the heap the queue uses, at the cost of loss in bursts. The calibration measures without a cap first, then caps 24/16/12/8, stops at the first that loses noticeably more than the reference or delivers under 90 % of its throughput, and saves the smallest passing cap — or off. On the camera link it was developed on, even cap 24 lost 0.30 % (vs. 0.00 %) while halving the queue wait, so the result was off: for a TCP video stream, the tail of an I-frame is better off waiting in the queue than being retransmitted.
 
+**Calibrate all** runs the retry, TX power and queue cap calibrations in that order, each measuring with the previous results applied (~3–5 min). It stops when a stage has too little traffic or a manual save overrides it. Every calibration measures the LAN→Wi-Fi direction under the traffic flowing *at that moment* — run it while the client does its real job; a synthetic load such as `iperf3` tunes for bulk transfer, not for a game or a call. Short windows also cannot separate retry values that both stay below 0.10 % loss: on the development link the calibration picks 8 retries, while hours of operation showed 12 to lose five times less (0.012 % vs 0.063 %).
+
 **TX queue and air loss**: a TX-done callback (`esp_wifi_set_tx_done_cb`) reports every frame the Wi-Fi MAC finished, delivered or abandoned after its hardware retries. Frames handed to the driver minus frames finished is the TX queue depth; averaged per completion and divided by the frame rate (Little's law) it gives the time a frame waits for the air. That is the bufferbloat behind high and jittery ping times on a busy channel, and it rises long before frames get lost. The callback reports the encrypted 802.11 frame, so the management stack's few frames cannot be filtered out; the estimate resynchronizes instead whenever it would go negative or the link has been idle for a second.
 
 ---
@@ -233,7 +235,7 @@ All endpoints are served on the management IP (or `192.168.4.1` in provisioning 
 | POST | `/api/config` | Save configuration (`application/x-www-form-urlencoded`) |
 | POST | `/api/reboot` | Reboot |
 | POST | `/api/eth_reset` | Restart the Ethernet driver (link down/up for the client) |
-| POST | `/api/autotune` | Start the retry calibration; `?kind=txp` the TX power, `?kind=cap` the queue cap calibration |
+| POST | `/api/autotune` | Start the retry calibration; `?kind=txp` the TX power, `?kind=cap` the queue cap calibration, `?kind=all` all three in sequence |
 | GET | `/api/autotune` | Per-step results of all calibrations: `{"retries":[{"k","loss"}],"txp":[{"k","act","loss","delay"}],"cap":[{"k","loss","delay","kbps"}]}` (loss in 1/100 %, -1 = collapse; delay in 0.1 ms; powers in 0.25 dBm; cap 0 = off) |
 | GET | `/api/scan` | Scan for Wi-Fi networks |
 | GET | `/api/disconnects` | Wi-Fi disconnect statistics and log |
@@ -283,6 +285,7 @@ All endpoints are served on the management IP (or `192.168.4.1` in provisioning 
 | `pt`, `pt_s`, `pt_k`, `pt_r` | TX power calibration: state (as `at`), completed measurements, power under test and chosen power (0.25 dBm units) |
 | `drop_cap`, `txq_cap` | Frames dropped by the TX queue cap since boot (also counted in `drop_up`), cap in effect (0 = off) |
 | `qc`, `qc_s`, `qc_k`, `qc_r` | Queue cap calibration: state (as `at`), completed measurements, cap under test, chosen cap (0 = off, -1 = no result) |
+| `all` | *Calibrate all*: 0 idle, 1–3 running stage (retries, TX power, queue cap), 4 done, 5 stopped |
 | `time` | UTC Unix time, 0 = not synced via SNTP yet |
 | `build` | Git revision of the running firmware (`-dirty` if built from uncommitted changes) |
 

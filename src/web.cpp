@@ -372,6 +372,29 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
   </div>
 
   <div style="margin-top:14px;padding:12px;background:#232833;border-radius:8px">
+    <b style="font-size:13px">Calibrate all</b>
+    <div class="sub" style="margin:4px 0 8px">
+      Runs the three calibrations below one after another &ndash; retries,
+      then TX power, then queue cap &ndash; each measuring with the results
+      of the previous ones applied. About 5&nbsp;minutes; every result is
+      saved as it is found and shown in its own section below.
+      <br>All calibrations measure the <b>LAN&rarr;Wi-Fi</b> direction under
+      <b>the traffic that is flowing right now</b>, so run them while the
+      client does what it will normally do: a camera streaming to its
+      recorder, a PC during its real workload. A synthetic load (e.g.
+      <code>iperf3</code>) tunes for bulk transfer, not for a game or a call.
+      Without traffic the run stops with &ldquo;too little traffic&rdquo;.
+      <br>Limit of short measurements: the retry step takes the smallest
+      value below 0.10&nbsp;% loss and cannot tell apart values that are
+      both below that &ndash; only the <i>Dropped</i> counter over hours can.
+      If a long run has shown a larger value to be better, set it back
+      after the run.
+    </div>
+    <button onclick="autotune('all')" style="margin-top:0">Calibrate all</button>
+    <div id="allmsg" style="margin-top:10px;font-size:13px"></div>
+  </div>
+
+  <div style="margin-top:14px;padding:12px;background:#232833;border-radius:8px">
     <b style="font-size:13px">Automatic calibration</b>
     <div class="sub" style="margin:4px 0 8px">
       Measures the loss rate for about 15&nbsp;s per step, starting at the
@@ -723,6 +746,12 @@ async function tick(){
     else if(s.qc===3) $('qcmsg').textContent='Aborted: too little traffic during the measurement. '+
                       'Let the camera stream and start again.';
     QCPREV=s.qc;
+    /* "Calibrate all": 1-3 = running stage, 4 done, 5 stopped. */
+    if(s.all>=1&&s.all<=3) $('allmsg').textContent='Running - step '+s.all+' of 3: '+
+                 ['retries','TX power','queue cap'][s.all-1]+' (details in its section below)';
+    else if(s.all===4) $('allmsg').textContent='Done - all three results saved (see below).';
+    else if(s.all===5) $('allmsg').textContent='Stopped - a step had too little traffic or was '+
+                 'overridden by a manual save. Results found up to then are kept.';
     /* Mean frames waiting in the driver queue and the resulting wait. A few
        ms is normal; tens to hundreds of ms mean the uplink cannot keep up. */
     $('txq').textContent=(s.wifi&&s.txq_ms!==undefined)?s.txq_ms+' ms':'-';
@@ -830,10 +859,10 @@ function defaults(){
   $('tmsg').textContent='Defaults filled in - save to apply.';
   dirtyCheck();   /* set by script - does not fire an input event */
 }
-/* Start the retry calibration, or with kind 'txp' / 'cap' the TX power or
-   queue cap one. */
+/* Start the retry calibration, with kind 'txp' / 'cap' the TX power or
+   queue cap one, with 'all' the three in sequence. */
 async function autotune(kind){
-  const m=$(kind==='txp'?'ptmsg':kind==='cap'?'qcmsg':'atmsg');
+  const m=$(kind==='txp'?'ptmsg':kind==='cap'?'qcmsg':kind==='all'?'allmsg':'atmsg');
   m.textContent='Starting...';
   try{
     const j=await(await fetch('/api/autotune'+(kind?'?kind='+kind:''),{method:'POST'})).json();
@@ -1076,7 +1105,7 @@ static esp_err_t h_status(httpd_req_t *r) {
     "\"txp\":%d,\"bw\":%u,\"air_ok\":%lu,\"air_fail\":%lu,\"cc\":\"%s\",\"cc_max\":%d,"
     "\"txq\":%lu,\"txq_x10\":%lu,\"txq_ms\":%lu,"
     "\"pt\":%d,\"pt_s\":%u,\"pt_k\":%d,\"pt_r\":%d,"
-    "\"drop_cap\":%lu,\"txq_cap\":%u,\"qc\":%d,\"qc_s\":%u,\"qc_k\":%u,\"qc_r\":%d,"
+    "\"drop_cap\":%lu,\"txq_cap\":%u,\"qc\":%d,\"qc_s\":%u,\"qc_k\":%u,\"qc_r\":%d,\"all\":%d,"
     "\"time\":%lu,\"build\":\"" GIT_REV "\"}",
     s_provisioning ? 1 : 0, st.wifi_up ? 1 : 0, st.eth_link ? 1 : 0,
     (int)st.rssi, (unsigned)st.channel,
@@ -1126,6 +1155,8 @@ static esp_err_t h_status(httpd_req_t *r) {
     (unsigned long)st.drop_cap, (unsigned)st.txq_cap,
     (int)bridge_cap_tune_state(), bridge_cap_tune_step(), bridge_cap_tune_candidate(),
     bridge_cap_tune_result() == 0xFF ? -1 : (int)bridge_cap_tune_result(),
+    /* "Calibrate all": 0 idle, 1-3 running stage, 4 done, 5 stopped. */
+    (int)bridge_tune_all_stage(),
     /* Time UTC, 0 = not set via SNTP yet. */
     (unsigned long)crashlog_now());
 
@@ -1521,13 +1552,15 @@ static esp_err_t h_config_post(httpd_req_t *r) {
 }
 
 /* POST /api/autotune - start the retry autotune, with ?kind=txp the TX power
- * autotune, with ?kind=cap the TX queue cap autotune (see bridge.h). */
+ * autotune, with ?kind=cap the TX queue cap autotune, with ?kind=all all
+ * three in sequence (see bridge.h). */
 static esp_err_t h_autotune(httpd_req_t *r) {
   char q[32] = "", kind[8] = "";
   if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK)
     httpd_query_key_value(q, "kind", kind, sizeof(kind));
   const bool ok = strcmp(kind, "txp") == 0 ? bridge_txp_tune_start()
                 : strcmp(kind, "cap") == 0 ? bridge_cap_tune_start()
+                : strcmp(kind, "all") == 0 ? bridge_tune_all_start()
                                            : bridge_autotune_start();
   httpd_resp_set_type(r, "application/json");
   httpd_resp_set_hdr(r, "Cache-Control", "no-store");

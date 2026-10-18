@@ -257,6 +257,19 @@ uint8_t          bridge_cap_tune_result(void);     /* chosen cap, 0 = off,
 size_t           bridge_cap_tune_values(uint8_t *candidates, uint16_t *loss,
                                         uint16_t *delay_x10, uint16_t *kbps);
 
+/* ---------------------------------------------------------------------------
+ * "Calibrate all": retry, TX power and queue cap autotune in sequence, each
+ * measuring with the previous results applied. Stops when a stage ends
+ * without a result or is aborted by a manual save. The individual results
+ * are reported by the three autotunes as usual.
+ * ------------------------------------------------------------------------ */
+typedef enum { ALL_IDLE = 0, ALL_RETRIES, ALL_TXP, ALL_CAP, ALL_DONE, ALL_STOPPED } all_stage_t;
+
+/* Start the chain. Returns false if it or any single autotune is running,
+ * or the bridge is inactive. */
+bool        bridge_tune_all_start(void);
+all_stage_t bridge_tune_all_stage(void);
+
 /* TX power actually in effect, in 0.25 dBm units, queried from the driver.
  * Usually differs from the configured value because the PHY only knows 11
  * discrete steps and rounds down. <0 = could not be determined. */

@@ -2080,6 +2080,57 @@ static void cap_tune_tick(void) {
 }
 
 /* ===========================================================================
+ * "Calibrate all": the three autotunes in sequence
+ * ========================================================================= */
+
+/*
+ * Runs the retry, TX power and queue cap calibrations one after another, so
+ * each one measures with the results of the previous ones applied: the TX
+ * power with the chosen retries, the cap with both. The order follows the
+ * size of the effect - retries decide most of the loss, the cap is only
+ * judged against what the others leave over.
+ *
+ * The chain stops when a stage ends without a result (too little traffic)
+ * or is aborted by a manual save (its state drops back to idle), so it
+ * never keeps measuring on a basis the user has just overridden.
+ */
+static all_stage_t s_all_stage = ALL_IDLE;
+
+/* See bridge.h. */
+bool bridge_tune_all_start(void) {
+  if (s_all_stage >= ALL_RETRIES && s_all_stage <= ALL_CAP) return false;
+  if (!bridge_autotune_start()) return false;
+  s_all_stage = ALL_RETRIES;
+  printf("[ALL ] Calibrating retries -> TX power -> queue cap\n");
+  return true;
+}
+
+all_stage_t bridge_tune_all_stage(void) { return s_all_stage; }
+
+/* Advance the chain once the running stage has finished. */
+static void tune_all_tick(void) {
+  if (s_all_stage < ALL_RETRIES || s_all_stage > ALL_CAP) return;
+  const autotune_state_t st = s_all_stage == ALL_RETRIES ? s_at_state
+                            : s_all_stage == ALL_TXP     ? s_tp_state
+                                                         : s_qc_state;
+  if (st == AT_RUNNING) return;
+  if (st != AT_DONE) {
+    printf("[ALL ] Stopped at stage %u (%s)\n", (unsigned)s_all_stage,
+           st == AT_TOO_LITTLE_TRAFFIC ? "too little traffic" : "aborted");
+    s_all_stage = ALL_STOPPED;
+    return;
+  }
+  if (s_all_stage == ALL_RETRIES && bridge_txp_tune_start()) { s_all_stage = ALL_TXP; return; }
+  if (s_all_stage == ALL_TXP     && bridge_cap_tune_start()) { s_all_stage = ALL_CAP; return; }
+  if (s_all_stage == ALL_CAP) {
+    s_all_stage = ALL_DONE;
+    printf("[ALL ] Done\n");
+    return;
+  }
+  s_all_stage = ALL_STOPPED;     /* next stage refused to start */
+}
+
+/* ===========================================================================
  * Watchdog
  *
  * Detects a bridge that the driver still reports as connected (wifi_up =
@@ -2494,6 +2545,7 @@ void bridge_tick(void) {
   autotune_tick();
   txp_tune_tick();
   cap_tune_tick();
+  tune_all_tick();
   watchdog_tick();
   roam_tick();
 
