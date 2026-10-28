@@ -14,6 +14,7 @@
  *   POST /api/update        raw OTA upload            (admin key)
  *   GET/DELETE /api/coredump  coredump summary/erase  (admin key)
  *   GET/DELETE /api/crashes   crash history/erase     (admin key)
+ *   GET  /api/log?since=N   console output since byte N (admin key)
  */
 
 #include "web.h"
@@ -32,6 +33,7 @@
 #include "esp_core_dump.h"
 #include "build_info.h"
 #include "crashlog.h"
+#include "conlog.h"
 
 #define AP_PASSWORD   "bridgesetup"   /* at least 8 characters, otherwise open */
 
@@ -236,6 +238,7 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
     <div class="m"><div class="k">Channel width</div><div class="v" id="bw">-</div></div>
     <div class="m"><div class="k">TX queue</div><div class="v" id="txq">-</div></div>
     <div class="m"><div class="k">Lost on air</div><div class="v" id="airf">-</div></div>
+    <div class="m" id="spim" style="display:none"><div class="k">Ethernet SPI</div><div class="v" id="spi">-</div></div>
   </div>
   <div class="sub" style="margin:12px 0 0" id="detail"></div>
   <div id="cdbox" style="display:none;margin-top:10px;padding:10px;background:rgba(255,107,107,.08);
@@ -254,6 +257,14 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
     <div id="dlsum" class="sub" style="margin:6px 0"></div>
     <div style="overflow-x:auto"><table id="dltab" class="sub" style="border-collapse:collapse;width:100%;font-size:12px"></table></div>
     <button class="sec" onclick="loadDisc()" style="margin-top:6px">Refresh</button>
+  </details>
+  <details id="lgbox" style="margin-top:10px" ontoggle="logToggle(this.open)">
+    <summary class="sub" style="cursor:pointer">Console log</summary>
+    <pre id="lgpre" style="background:#0d1015;border-radius:8px;padding:8px;margin:6px 0 0;
+         max-height:360px;overflow:auto;font-size:11px;line-height:1.35;white-space:pre-wrap;
+         word-break:break-all"></pre>
+    <span class="hint" id="lghint"></span>
+    <button class="sec" onclick="$('lgpre').textContent=''" style="margin-top:6px">Clear view</button>
   </details>
 </div>
 
@@ -744,6 +755,8 @@ async function tick(){
     $('txp').textContent=(s.wifi&&s.txp>=0)?(s.txp/4).toFixed(2).replace(/\.?0+$/,'')+' dBm':'-';
     /* Actual value from the driver: shows whether HT40 was really negotiated. */
     $('bw').textContent=(s.wifi&&s.bw)?s.bw+' MHz':'-';
+    /* Only SPI Ethernet (W5500) has a bus clock to show; the EMAC reports 0. */
+    if(s.spi){$('spim').style.display='';$('spi').textContent=s.spi+' MHz'}
     /* Calibration progress. at: 0=idle 1=running 2=done 3=too little traffic */
     /* The number of steps is not known in advance (up first, then down,
        stop at the first outlier) - so no remaining time, only the progress. */
@@ -1126,6 +1139,37 @@ function upload(){
   $('omsg').textContent='Starting upload...';
   x.send(f);
 }
+/* Console log: while the box is open, fetch only the output that is new
+   since the last poll (lgSince = byte position returned by the board) once
+   a second. Closed, it costs nothing. The view is capped so a long session
+   does not grow the page without bound. */
+let lgSince=0,lgTimer=null,lgBusy=false;
+function logToggle(open){
+  clearInterval(lgTimer);lgTimer=null;
+  if(open){logPoll();lgTimer=setInterval(logPoll,1000)}
+}
+/* One request at a time: the 1 s timer and the immediate follow-up after a
+   full reply must not both read from the same position. */
+async function logPoll(){
+  if(lgBusy)return;
+  lgBusy=true;let more=false;
+  try{
+    const r=await fetch('/api/log?since='+lgSince,{headers:cdHeaders(),cache:'no-store'});
+    if(!r.ok){$('lghint').textContent=r.status==401?'Admin key required (enter it under Firmware update)':'Error '+r.status;return}
+    const t=await r.text(),p=$('lgpre');
+    const atEnd=p.scrollTop+p.clientHeight>=p.scrollHeight-4;
+    if(r.headers.get('X-Log-Reset')==='1'&&p.textContent)
+      p.textContent+='\n--- board rebooted or older lines dropped ---\n';
+    p.textContent+=t;
+    if(p.textContent.length>65536)p.textContent=p.textContent.slice(-49152);
+    lgSince=+(r.headers.get('X-Log-Next')||0);
+    if(atEnd)p.scrollTop=p.scrollHeight;
+    $('lghint').textContent='';
+    more=t.length>=2048;   /* full reply: more is waiting */
+  }catch(e){$('lghint').textContent='Board not reachable'}
+  finally{lgBusy=false}
+  if(more&&lgTimer)logPoll();
+}
 load();tick();checkCoredump();checkCrashes();setInterval(tick,2000);
 </script></body></html>)HTML";
 
@@ -1170,7 +1214,7 @@ static esp_err_t h_status(httpd_req_t *r) {
     "\"pt\":%d,\"pt_s\":%u,\"pt_k\":%d,\"pt_r\":%d,"
     "\"drop_cap\":%lu,\"txq_cap\":%u,\"qc\":%d,\"qc_s\":%u,\"qc_k\":%u,\"qc_r\":%d,\"all\":%d,"
     "\"lr\":%d,\"lr_k\":%u,\"lr_el\":%lu,\"lr_tot\":%lu,\"lr_r\":%u,"
-    "\"time\":%lu,\"build\":\"" GIT_REV "\"}",
+    "\"spi\":%u,\"time\":%lu,\"build\":\"" GIT_REV "\"}",
     s_provisioning ? 1 : 0, st.wifi_up ? 1 : 0, st.eth_link ? 1 : 0,
     (int)st.rssi, (unsigned)st.channel,
     (unsigned long)st.kbps_eth2wifi, (unsigned long)st.kbps_wifi2eth,
@@ -1227,6 +1271,8 @@ static esp_err_t h_status(httpd_req_t *r) {
      * elapsed / total, chosen retries. */
     (int)bridge_long_tune_state(), bridge_long_tune_candidate(),
     (unsigned long)lr_el, (unsigned long)lr_tot, bridge_long_tune_result(),
+    /* W5500 SPI clock in MHz, 0 = internal EMAC. */
+    (unsigned)bridge_get_eth_spi_mhz(),
     /* Time UTC, 0 = not set via SNTP yet. */
     (unsigned long)crashlog_now());
 
@@ -2068,13 +2114,48 @@ static esp_err_t h_crashes_delete(httpd_req_t *r) {
  * Start
  * ========================================================================= */
 
+/* GET /api/log?since=N - console output from byte position N on, as plain
+ * text (see conlog.h). X-Log-Next carries the position for the next poll;
+ * X-Log-Reset: 1 means the requested position was no longer (or not yet)
+ * available - the board rebooted or the ring wrapped - and the reply starts
+ * at the oldest byte held. A reply carries at most LOG_REPLY_MAX bytes; the
+ * portal asks again right away when it got a full one. That keeps the ring
+ * lock short and the buffer on the httpd stack small. Protected like the
+ * other diagnostics: the log shows network details. */
+#define LOG_REPLY_MAX 2048
+static esp_err_t h_log(httpd_req_t *r) {
+  if (!admin_key_ok(r)) {
+    httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "wrong key");
+    return ESP_FAIL;
+  }
+  uint32_t since = 0;
+  char q[32], v[12];
+  if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK &&
+      httpd_query_key_value(q, "since", v, sizeof(v)) == ESP_OK) {
+    since = (uint32_t)strtoul(v, NULL, 10);
+  }
+
+  char buf[LOG_REPLY_MAX];
+  uint32_t next = since;
+  bool reset = false;
+  const size_t n = conlog_read(since, buf, sizeof(buf), &next, &reset);
+
+  char next_s[12];
+  snprintf(next_s, sizeof(next_s), "%lu", (unsigned long)next);
+  httpd_resp_set_type(r, "text/plain; charset=utf-8");
+  httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+  httpd_resp_set_hdr(r, "X-Log-Next", next_s);
+  httpd_resp_set_hdr(r, "X-Log-Reset", reset ? "1" : "0");
+  return httpd_resp_send(r, buf, n);
+}
+
 /* Start the HTTP server and register all routes (see web.h). */
 bool web_start(bool provisioning) {
   s_provisioning = provisioning;
 
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.stack_size       = 6144;
-  cfg.max_uri_handlers = 18;    /* currently 15 routes (uris[] below) - if this
+  cfg.max_uri_handlers = 18;    /* currently 16 routes (uris[] below) - if this
                                  * is too small, registration fails silently */
   cfg.recv_wait_timeout = 20;   /* the OTA upload needs patience */
   cfg.lru_purge_enable = true;
@@ -2116,6 +2197,7 @@ bool web_start(bool provisioning) {
 #endif
     { "/api/crashes", HTTP_GET,    h_crashes_get,     NULL },
     { "/api/crashes", HTTP_DELETE, h_crashes_delete,  NULL },
+    { "/api/log",     HTTP_GET,    h_log,             NULL },
   };
   for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
     httpd_register_uri_handler(s_httpd, &uris[i]);

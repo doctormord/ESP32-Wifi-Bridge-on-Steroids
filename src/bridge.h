@@ -72,8 +72,13 @@ struct BridgeStats {
   char     client_name[32];   /* host name from the DHCP request (option 12)  */
 };
 
-/* Initialize Ethernet (RMII MAC + LAN8720 PHY, no netif). */
+/* Initialize Ethernet without a netif: RMII MAC + LAN8720 PHY on the
+ * WT32-ETH01, a W5500 on SPI on the ESP32-C5 target. */
 bool bridge_eth_init(void);
+
+/* SPI clock the W5500 actually runs at, in MHz, after the step-down in
+ * bridge_eth_init(). 0 = no SPI Ethernet (internal EMAC) or not initialized. */
+uint8_t bridge_get_eth_spi_mhz(void);
 
 /* Start Ethernet and wait for the first frame from the client to learn its
  * MAC. timeout_ms = 0 -> wait forever. Returns false on timeout. */

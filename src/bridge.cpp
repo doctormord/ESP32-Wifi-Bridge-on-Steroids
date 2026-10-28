@@ -825,6 +825,12 @@ static void eth_set_bridge_filters(void) {
   }
 }
 
+/* SPI clock the W5500 was brought up with, see bridge_get_eth_spi_mhz(). */
+static uint8_t s_eth_spi_mhz = 0;
+
+/* See bridge.h. */
+uint8_t bridge_get_eth_spi_mhz(void) { return s_eth_spi_mhz; }
+
 #if CONFIG_ETH_USE_ESP32_EMAC
 /* Power up the LAN8720 PHY and install the ESP32 EMAC driver (RMII with the
  * external 50 MHz clock on GPIO0, as wired on the WT32-ETH01). No netif is
@@ -939,7 +945,8 @@ bool bridge_eth_init(void) {
     s_eth = NULL;
   }
   if (!s_eth) return false;
-  printf("[ETH ] W5500 on SPI at %d MHz\n", hz_used / 1000000);
+  s_eth_spi_mhz = (uint8_t)(hz_used / 1000000);
+  printf("[ETH ] W5500 on SPI at %u MHz\n", (unsigned)s_eth_spi_mhz);
 
   /* The W5500 has no factory MAC. In promiscuous mode its own address plays
    * no role in the data path (frames are sent with the client's source MAC),

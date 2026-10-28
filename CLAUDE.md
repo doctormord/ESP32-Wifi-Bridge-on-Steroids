@@ -100,6 +100,10 @@ TX power is quantized by the PHY to 11 discrete steps (2/5/7/8.5/11/13/14/15/16.
 
 Single self-contained HTML/CSS/JS page (`PAGE[]`) served at `/`, plus a small JSON API (`/api/status`, `/api/config` GET/POST, `/api/scan`, `/api/reboot`, `/api/update`). Config POST uses hand-rolled form-urlencoded parsing (`form_get`) — empty password fields mean "leave unchanged", not "clear". `/api/update` streams a raw `.bin` directly into the inactive OTA partition (`esp_ota_*`), gated by an optional `X-Admin-Key` header checked against `admin_pass`; there's no TLS (originally rejected for the ~40 KB of flash it costs on the believed-2 MB layout). Note that the admin key only guards `/api/update` and `/api/coredump` — `/api/config` POST (including changing `admin_pass` itself) and `/api/reboot` are unauthenticated.
 
+The "Console log" box in the portal shows the serial console over the network: `conlog.cpp` swaps `stdout` for a `funopen()` stream at the very start of `app_main()` (tasks inherit `stdout` from `_GLOBAL_REENT` when created, so it must come first), keeps the last 8 KB in a ring buffer and still forwards everything to the real console. `GET /api/log?since=N` returns up to 2 KB from byte position `N`, with `X-Log-Next` for the next poll and `X-Log-Reset: 1` after a reboot or ring wrap; it is guarded by the admin key like the other diagnostics. Only `printf`/`ESP_LOG` output is captured — ROM and bootloader output (`esp_rom_printf`) never goes through `stdout`.
+
+OTA from the command line: `scripts/ota_flash.sh <ip> [admin-key] [pio-env]` (env defaults to `wt32-eth01`) builds, archives the matching `firmware.elf` under `elf_archive/` and uploads.
+
 ### Telemetry (`telemetry.cpp`)
 
 Optional MQTT client (only starts if `mqtt_host` is configured), publishes state to `bridge/<mac-suffix>/state` and does Home Assistant MQTT autodiscovery (`homeassistant/sensor/.../config`) on (re)connect.

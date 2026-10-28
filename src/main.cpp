@@ -48,6 +48,7 @@
 #include "web.h"
 #include "telemetry.h"
 #include "crashlog.h"
+#include "conlog.h"
 
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -466,6 +467,7 @@ static void bridge_loop(void) {
  * without the Arduino core behind it.
  * ------------------------------------------------------------------------ */
 extern "C" void app_main(void) {
+  conlog_init();   /* first, so every task created later logs into the ring too */
   bridge_setup();
   for (;;) {
     bridge_loop();
