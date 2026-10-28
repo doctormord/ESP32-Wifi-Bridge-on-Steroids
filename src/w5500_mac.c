@@ -56,8 +56,9 @@ static const char *TAG = "w5500m";
 
 /* Bytes fetched from RX memory per SPI read: room for four full frames plus
  * the 2-byte headers. Larger reads save transactions, but delay the first
- * frame of a batch and cost RAM. Multiple of 4 (DMA alignment). */
-#define RX_CHUNK           6144
+ * frame of a batch and cost RAM. Multiple of 4 (DMA alignment). Capped at
+ * runtime to what the SPI bus was set up for (rx_chunk). */
+#define RX_CHUNK           W5500_MAC_MAX_TRANSFER
 
 /* Transfers above this size wait for the SPI interrupt instead of spinning,
  * so the CPU is free for the Wi-Fi stack while the DMA runs. Small register
@@ -126,6 +127,7 @@ typedef struct {
    * that was cut off at the end of the previous read is kept here, so it is
    * not fetched twice. */
   uint8_t            *rx_buf;
+  uint32_t            rx_chunk;    /* bytes per read: RX_CHUNK or the bus limit */
   uint32_t            rx_have;
   uint16_t            rx_rd;
 
@@ -325,7 +327,7 @@ static rx_result_t rx_service(w5500m_t *m) {
   m->rx_rd = rd;
   if (rsr == 0) return RX_IDLE;
 
-  const uint32_t want = rsr < RX_CHUNK ? rsr : RX_CHUNK;
+  const uint32_t want = rsr < m->rx_chunk ? rsr : m->rx_chunk;
   if (want > m->rx_have) {
     /* Re-read up to 3 already buffered bytes so the DMA target stays
      * 4-byte aligned; they read back identical. */
@@ -373,7 +375,8 @@ IRAM_ATTR static void w5500m_isr(void *arg) {
  * received), frames in the TX ring, or reception still has a backlog - then
  * alternates TX bursts and RX rounds until both sides are idle. It never
  * sleeps while INT is low, so an edge missed by the GPIO interrupt only costs
- * the wake-up, never strands frames; the 1 s timeout is a last fallback. */
+ * the wake-up, never strands frames. As a last fallback, a full second
+ * without any wake-up also checks RX memory, whatever the INT level says. */
 static void w5500m_task(void *arg) {
   w5500m_t *m = (w5500m_t *)arg;
   bool rx_more = false;
@@ -382,7 +385,7 @@ static void w5500m_task(void *arg) {
     const bool tx_waiting = m->tx_tail != m->tx_head;
     if (!m->running ||
         (!rx_more && !tx_waiting && gpio_get_level(m->int_gpio) != 0)) {
-      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+      if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000)) == 0) rx_more = true;
     }
 
     rx_result_t rx = RX_IDLE;
@@ -743,6 +746,14 @@ esp_eth_mac_t *w5500_mac_new(const eth_w5500_config_t *w5500_config,
     ESP_LOGE(TAG, "adding device to SPI host #%d failed", w5500_config->spi_host_id + 1);
     m->spi = NULL;
     goto err;
+  }
+  size_t bus_max = 0;
+  m->rx_chunk = RX_CHUNK;
+  if (spi_bus_get_max_transaction_len(w5500_config->spi_host_id, &bus_max) == ESP_OK &&
+      bus_max < m->rx_chunk) {
+    m->rx_chunk = bus_max & ~3u;
+    ESP_LOGW(TAG, "SPI bus allows only %u bytes per transfer, RX batches limited",
+             (unsigned)bus_max);
   }
 
   const BaseType_t core = (mac_config->flags & ETH_MAC_FLAG_PIN_TO_CORE)

@@ -24,6 +24,12 @@
 extern "C" {
 #endif
 
+/* Largest single SPI transfer the driver issues (a batch of received
+ * frames). Pass it as max_transfer_sz to spi_bus_initialize(): the bus
+ * default (4092 bytes with DMA) is smaller. With a smaller bus limit the
+ * driver still works, just with smaller batches. */
+#define W5500_MAC_MAX_TRANSFER 6144
+
 /* Create the MAC instance. Takes the same configuration as
  * esp_eth_mac_new_w5500(), except that int_gpio_num is mandatory
  * (poll_period_ms must be 0) and custom SPI drivers are not supported.
