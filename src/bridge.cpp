@@ -31,6 +31,8 @@
 #include "esp_mac.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "esp_log.h"
+#include "nvs.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -778,6 +780,7 @@ static void eth_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
  * reconnects, which the watchdog and roaming rely on. */
 /* Defined with the network slot logic further down (see sta_lock_ap()). */
 static void sta_release_lock_on_disconnect(void);
+static void last_ap_note(const uint8_t bssid[6], uint8_t channel);
 
 static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
   (void)arg; (void)base;
@@ -786,6 +789,7 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
     s_wifi_up = true;
     wifi_event_sta_connected_t *e = (wifi_event_sta_connected_t *)data;
     if (e) mac2str(e->bssid, s_bssid_str);
+    if (e) last_ap_note(e->bssid, e->channel);
     printf("[WIFI] Connected (AP %s)\n", s_bssid_str);
     disc_log_reconnected();
 
@@ -1298,6 +1302,60 @@ static void sta_release_lock_on_disconnect(void) {
   sta_set_net(s_cur_net);
 }
 
+/* --- Last AP (fast start) ---------------------------------------------------
+ * The AP of the last successful connection, kept in NVS so it survives a
+ * power loss too. At boot, bridge_wifi_start() first tries it directly - no
+ * scan - and only scans if that fails. Written only when it changes (roaming,
+ * a different network), so the flash sees a write per AP change, not per
+ * boot. */
+#define LAST_AP_NS    "wifi_last"
+#define LAST_AP_KEY   "ap"
+#define LAST_AP_MAGIC 0x4c415031u   /* "LAP1" */
+
+typedef struct {
+  uint32_t magic;
+  uint8_t  slot;       /* network slot 0..2 */
+  uint8_t  channel;
+  uint8_t  bssid[6];
+} last_ap_t;
+
+static last_ap_t     s_last_ap = {};
+static volatile bool s_last_ap_dirty = false;
+
+/* Load the stored last AP; false if none or invalid. */
+static bool last_ap_load(last_ap_t *out) {
+  nvs_handle_t h;
+  if (nvs_open(LAST_AP_NS, NVS_READONLY, &h) != ESP_OK) return false;
+  size_t sz = sizeof(*out);
+  const esp_err_t e = nvs_get_blob(h, LAST_AP_KEY, out, &sz);
+  nvs_close(h);
+  return e == ESP_OK && sz == sizeof(*out) && out->magic == LAST_AP_MAGIC && out->slot < 3;
+}
+
+/* Called from wifi_evt() on every connect: remember the AP in RAM only. The
+ * NVS write happens later in last_ap_tick(), outside the event task. */
+static void last_ap_note(const uint8_t bssid[6], uint8_t channel) {
+  if (s_last_ap.magic == LAST_AP_MAGIC && s_last_ap.slot == s_cur_net &&
+      s_last_ap.channel == channel && memcmp(s_last_ap.bssid, bssid, 6) == 0) return;
+  s_last_ap.magic   = LAST_AP_MAGIC;
+  s_last_ap.slot    = s_cur_net;
+  s_last_ap.channel = channel;
+  memcpy(s_last_ap.bssid, bssid, 6);
+  s_last_ap_dirty = true;
+}
+
+/* Persist a changed last AP; called from bridge_tick(). */
+static void last_ap_tick(void) {
+  if (!s_last_ap_dirty) return;
+  s_last_ap_dirty = false;
+  nvs_handle_t h;
+  if (nvs_open(LAST_AP_NS, NVS_READWRITE, &h) != ESP_OK) return;
+  esp_err_t e = nvs_set_blob(h, LAST_AP_KEY, &s_last_ap, sizeof(s_last_ap));
+  if (e == ESP_OK) e = nvs_commit(h);
+  nvs_close(h);
+  if (e != ESP_OK) printf("[WIFI] Storing the last AP failed: %s\n", esp_err_to_name(e));
+}
+
 /* Passive dwell time per channel for our scans. The IDF default of 360 ms
  * makes a dual-band scan slow, because most 5 GHz channels are DFS channels
  * that may only be scanned passively. APs beacon every ~102 ms, so 150 ms
@@ -1541,6 +1599,46 @@ bool bridge_wifi_start(void) {
    * network 1 would cost its full timeout x attempts on every boot before
    * network 2 is even tried. If the scan fails, the plain priority order is
    * used. */
+  /* While connecting, let the Wi-Fi driver report its state changes
+   * (auth -> assoc -> run) with timestamps, so a slow connect can be traced
+   * in the log. Back to the quiet default once connected or given up. */
+  esp_log_level_set("wifi", ESP_LOG_INFO);
+
+  /* Fast path: straight to the AP of the last successful connection, no
+   * scan. Only if it is still allowed under the band setting; the attempt
+   * ends early on the first disconnect (AP not found, rejected) instead of
+   * waiting out the full timeout. */
+  last_ap_t la;
+  if (last_ap_load(&la) && net_in_use(la.slot)) {
+    wifi_ap_record_t rec = {};
+    memcpy(rec.bssid, la.bssid, 6);
+    rec.primary = la.channel;
+    if (ap_allowed(&rec)) {
+      s_last_ap = la;   /* known, so an identical connect does not rewrite NVS */
+      sta_lock_ap(la.slot, &rec, false);
+      printf("[WIFI] Connecting to '%s' via last AP %02x:%02x:%02x:%02x:%02x:%02x, channel %u (no scan)...\n",
+             net_ssid(la.slot), la.bssid[0], la.bssid[1], la.bssid[2], la.bssid[3],
+             la.bssid[4], la.bssid[5], (unsigned)la.channel);
+      const uint32_t disc0 = s_wifi_disc_count;
+      esp_wifi_connect();
+      const uint32_t t0 = millis();
+      while (!s_wifi_up && s_wifi_disc_count == disc0 && (millis() - t0) < connect_timeout_ms)
+        delay(100);
+      if (s_wifi_up) {
+        s_cur_net = la.slot;
+        esp_log_level_set("wifi", ESP_LOG_WARN);
+#ifndef BRIDGE_MINIMAL
+        detect_location(la.slot);
+#endif
+        return true;
+      }
+      printf("[WIFI] Last AP not reachable - scanning\n");
+      disc_mark_own(DISC_SRC_CONNECT);
+      esp_wifi_disconnect();
+      sta_set_net(la.slot);
+    }
+  }
+
   bool vis[3] = { false, false, false };
   bool have[3] = { false, false, false };
   wifi_ap_record_t best[3];
@@ -1584,6 +1682,7 @@ bool bridge_wifi_start(void) {
     }
     if (s_wifi_up) {
       s_cur_net = (uint8_t)i;
+      esp_log_level_set("wifi", ESP_LOG_WARN);
       /* Connected - but at WHICH site? The SSID slot does not tell when
        * several sites share the same SSID. So try the profiles in use and
        * ping their gateways, starting with the profile of the connected slot
@@ -1598,6 +1697,7 @@ bool bridge_wifi_start(void) {
     disc_mark_own(DISC_SRC_CONNECT);
     esp_wifi_disconnect();
   }
+  esp_log_level_set("wifi", ESP_LOG_WARN);
   esp_wifi_stop();
   return false;
 }
@@ -3238,6 +3338,7 @@ void bridge_tick(void) {
   tune_all_tick();
   watchdog_tick();
   roam_tick();
+  last_ap_tick();
   failover_tick();
 
   static uint32_t last = 0;

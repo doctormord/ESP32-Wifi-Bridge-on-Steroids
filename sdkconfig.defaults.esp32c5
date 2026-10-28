@@ -47,3 +47,11 @@ CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 # With 0 (the default) a crash that is itself stack-related - an overflow or
 # a corrupted stack - can make the coredump write fail, leaving no image.
 CONFIG_ESP_COREDUMP_STACK_SIZE=1792
+
+# --- Logging ----------------------------------------------------------------
+# Default level stays WARN (sdkconfig.defaults). The maximum is raised to
+# INFO so bridge_wifi_start() can switch the Wi-Fi driver's log to INFO while
+# connecting - its state changes (auth -> assoc -> run) show where a slow
+# connect spends its time. Above the maximum, esp_log_level_set() has no
+# effect.
+CONFIG_LOG_MAXIMUM_LEVEL_INFO=y
