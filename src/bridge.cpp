@@ -1589,6 +1589,22 @@ bool bridge_wifi_start(void) {
   esp_err_t td = esp_wifi_set_tx_done_cb(wifi_tx_done);
   if (td != ESP_OK) printf("[WIFI] tx_done_cb: %s\n", esp_err_to_name(td));
 
+  /* The driver scans on its own before every connect and reconnect, even
+   * with BSSID and channel given, and by default dwells 360 ms on every
+   * passive (DFS) channel - on a dual-band chip that alone is close to 10 s.
+   * Use the same shorter passive dwell as our own scans. Needs a started
+   * driver. */
+  /* Filled by hand: WIFI_SCAN_PARAMS_DEFAULT_CONFIG() uses nested C
+   * designators that C++ does not accept. Everything but the passive time
+   * stays at the IDF default. */
+  wifi_scan_default_params_t sp = {};
+  sp.scan_time.active.min    = WIFI_ACTIVE_SCAN_MIN_DEFAULT_TIME;
+  sp.scan_time.active.max    = WIFI_ACTIVE_SCAN_MAX_DEFAULT_TIME;
+  sp.scan_time.passive       = SCAN_PASSIVE_MS;
+  sp.home_chan_dwell_time    = WIFI_SCAN_HOME_CHANNEL_DWELL_DEFAULT_TIME;
+  esp_err_t spe = esp_wifi_set_scan_parameters(&sp);
+  if (spe != ESP_OK) printf("[WIFI] set_scan_parameters: %s\n", esp_err_to_name(spe));
+
   /* TX power only AFTER esp_wifi_start() - before that the API returns
    * ESP_ERR_WIFI_NOT_STARTED. */
   bridge_apply_live_tuning();
