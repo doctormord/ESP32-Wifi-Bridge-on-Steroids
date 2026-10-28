@@ -143,6 +143,15 @@ static bool dump_read(crash_rec_t *r) {
  * reason indicates a crash - prepends a record built from the old heartbeat
  * and (for panics) the coredump. On the very first boot with this feature an
  * existing coredump is imported once, with unknown time. */
+/* Set by crashlog_boot(), read by the status API. */
+static uint8_t s_boot_rst = 0;
+static bool    s_rtc_retained = false;
+
+/* See crashlog.h. */
+uint8_t crashlog_reset_reason(void) { return s_boot_rst; }
+bool    crashlog_rtc_retained(void) { return s_rtc_retained; }
+
+/* See crashlog.h. */
 void crashlog_boot(bool watchdog_restart) {
   /* Save the previous boot's heartbeat before the new boot overwrites it. */
   const heartbeat_t prev = s_hb;
@@ -160,10 +169,18 @@ void crashlog_boot(bool watchdog_restart) {
 
   const bool exists = log_load();
   const esp_reset_reason_t rr = esp_reset_reason();
+  s_boot_rst = (uint8_t)rr;
+  s_rtc_retained = prev_valid;
+  printf("[BOOT] Reset reason %d, RTC data from previous boot %s\n",
+         (int)rr, prev_valid ? "retained" : "not retained");
 
+  /* Every reset that is a fault, not a deliberate or external action. A CPU
+   * lockup (RISC-V double exception) and a power glitch are as much a crash
+   * as a panic or a brownout, even though no coredump is written for them. */
   const bool crashed = rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT ||
                        rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT ||
-                       rr == ESP_RST_BROWNOUT;
+                       rr == ESP_RST_BROWNOUT || rr == ESP_RST_CPU_LOCKUP ||
+                       rr == ESP_RST_PWR_GLITCH;
   if (crashed) {
     crash_rec_t r = {};
     r.rst      = (uint8_t)rr;

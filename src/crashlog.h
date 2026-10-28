@@ -46,6 +46,14 @@ typedef struct {
  * crash of the previous boot if there was one, and starts the heartbeat. */
 void crashlog_boot(bool watchdog_restart);
 
+/* Reset reason of the current boot (esp_reset_reason_t), and whether the
+ * previous boot's RTC heartbeat was found intact. The latter shows whether
+ * RTC_NOINIT memory survived the reset - all RTC-based diagnostics (this
+ * heartbeat, the Wi-Fi disconnect log, the planned-restart marker) depend on
+ * it. Both are valid after crashlog_boot(). */
+uint8_t crashlog_reset_reason(void);
+bool    crashlog_rtc_retained(void);
+
 /* Start SNTP once the management netif is up (bridge mode). */
 void crashlog_time_start(const uint8_t gw[4]);
 
