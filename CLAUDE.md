@@ -27,7 +27,10 @@ The pioarduino `platform-espressif32` rejects Python ≥ 3.14 outright in its `p
 
 Moving `~/.platformio/platforms/espressif32` out of the way does *not* work as a dodge: PlatformIO re-downloads it from the URL in `platformio.ini`, and the current release carries the same check.
 
-There is only one environment (`wt32-eth01`); no separate test suite (this is embedded firmware — verification is build success + on-device serial log behavior).
+There are two environments, built from the same sources; no separate test suite (this is embedded firmware — verification is build success + on-device serial log behavior):
+
+- `wt32-eth01` — ESP32 + internal EMAC + LAN8720A (the original target, 8 MB flash).
+- `nicemcu-c5-w5500` — NiceMCU ESP32-C5_MINI_V1.0 (ESP32-C5HF4: single-core RISC-V, dual-band Wi-Fi 6, 4 MB in-package flash, no PSRAM, native USB) + a W5500 over SPI. See "Second target" below. Flash and monitor over the board's USB-C port (`/dev/cu.usbmodem*`).
 
 ### Flash budget
 
@@ -104,3 +107,15 @@ Optional MQTT client (only starts if `mqtt_host` is configured), publishes state
 ### Partition layout
 
 `partitions_8mb_ota.csv` is the live table: 24 KB NVS, 8 KB otadata, two 3 MB OTA app slots, a 64 KB coredump partition, ~1.8 MB unallocated reserve. The partition table cannot be changed via OTA, hence the generous slots. App partitions must start on 64 KB boundaries, hence the gap after otadata. (`partitions_2mb_ota.csv` is the obsolete leftover from the mistaken 2 MB belief — not referenced by the build.)
+
+### Second target: ESP32-C5 + W5500 (`nicemcu-c5-w5500`)
+
+Target differences are compile-time switches, not a fork: `CONFIG_ETH_USE_ESP32_EMAC` vs `CONFIG_ETH_SPI_ETHERNET_W5500` (Ethernet init and pins in `bridge.cpp`), `CONFIG_SOC_WIFI_SUPPORT_5G` (dual-band: `esp_wifi_set_band_mode(AUTO)` + the plural `esp_wifi_set_protocols`/`_bandwidths`, because the singular APIs return `ESP_ERR_NOT_SUPPORTED` in auto-band mode), `CONFIG_IDF_TARGET_ESP32C5` (factory-reset pin IO4) and `CONFIG_IDF_TARGET_ARCH_XTENSA` (`/api/coredump` and `crashlog.cpp`: RISC-V has no on-device backtrace, so `ra`/`mcause`/`mtval` are reported instead). C5-only Kconfig lives in `sdkconfig.defaults.esp32c5`, which ESP-IDF loads automatically on top of `sdkconfig.defaults` for that target; partitions are `partitions_4mb_ota.csv` (2 × 1920 KB). The generated cache is `sdkconfig.nicemcu-c5-w5500` — the drift rules above apply to it too.
+
+Wiring: SCLK IO9, MOSI IO8, MISO IO2, CS IO10, INT IO12 (the RXD pin), RST IO3. SCLK/MOSI are not the SPI2 IO_MUX pins (IO6/IO7), so the bus runs through the GPIO matrix, which on the C5 is equivalent up to 80 MHz. IO2 is a strapping pin but harmless as MISO; IO3 is JTAG MTDI, not a strapping pin. Because INT sits on UART0 RX, the console is USB-Serial/JTAG only (`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG`) — don't move it back to UART0. The BOOT button (IO28) can't be the factory reset: held at reset it enters download mode.
+
+W5500 specifics that matter for the data path:
+- The IDF W5500 driver sets "block multicast" in MACRAW mode; `eth_set_bridge_filters()` clears it via `ETH_CMD_S_ALL_MULTICAST` alongside promiscuous. Every place that (re)starts the driver calls it.
+- 80 MHz SPI is the W5500's *theoretical* maximum; only 33.3 MHz is guaranteed. `bridge_eth_init()` steps down 80 → 40 → 20 MHz if the chip-version check at init fails, but that only catches gross failures — the SPI link has no checksum, so marginal bit errors show up later as TCP retransmissions or corrupted UDP payloads.
+- `emac_w5500_transmit()` busy-polls SEND_OK for every frame, and it runs inside `wifi_rx_cb`. Wi-Fi→Ethernet is therefore serialized at roughly SPI-transfer + wire time per frame (~0.3 ms per 1500 B at 80 MHz), with the Wi-Fi RX path blocked meanwhile. The C5 is also single-core, so Wi-Fi, the W5500 task and lwIP share one CPU. Don't expect WT32-EMAC numbers without measuring.
+- The C5's LP core cannot help the data path: it has no access to the Wi-Fi driver or SPI2 and only reaches LP GPIOs IO0–IO6.

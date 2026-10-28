@@ -56,8 +56,15 @@
 #include "lwip/apps/netbiosns.h"
 
 /* Pull this pin to GND at boot for a factory reset. On the WT32-ETH01 most
- * GPIOs are taken by RMII; IO14 is free and not a strapping pin. */
+ * GPIOs are taken by RMII; IO14 is free and not a strapping pin. On the
+ * NiceMCU ESP32-C5 Mini, IO4 is free and not a strapping pin. The C5's BOOT
+ * button (IO28) cannot serve this purpose: held during reset, it selects
+ * the serial download mode. */
+#if CONFIG_IDF_TARGET_ESP32C5
+#define FACTORY_RESET_GPIO   4
+#else
 #define FACTORY_RESET_GPIO   14
+#endif
 
 /* How long to wait for the first client frame before giving up and offering
  * the portal instead. Without a client MAC there is no bridge. */

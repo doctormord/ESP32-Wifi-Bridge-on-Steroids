@@ -115,9 +115,15 @@ static bool dump_read(crash_rec_t *r) {
     strlcpy(r->task, sum->exc_task, sizeof(r->task));
     r->pc   = sum->exc_pc;
     r->bt_n = 0;
+#if CONFIG_IDF_TARGET_ARCH_XTENSA
     for (uint32_t i = 0; i < sum->exc_bt_info.depth && r->bt_n < 8; i++)
       r->bt[r->bt_n++] = sum->exc_bt_info.bt[i];
     if (sum->exc_bt_info.corrupted) r->flags |= CRASH_F_BT_CORRUPT;
+#else
+    /* RISC-V has no on-device backtrace (see h_coredump_get() in web.cpp);
+     * the return address is the best single call-site hint. */
+    r->bt[r->bt_n++] = sum->ex_info.ra;
+#endif
     strlcpy(r->elf_sha, (const char *)sum->app_elf_sha256, sizeof(r->elf_sha));
     esp_core_dump_get_panic_reason(r->reason, sizeof(r->reason));
     r->flags |= CRASH_F_DUMP;

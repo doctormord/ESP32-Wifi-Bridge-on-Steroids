@@ -1949,21 +1949,35 @@ static esp_err_t h_coredump_get(httpd_req_t *r) {
   char task_esc[40];
   json_escape(sum.exc_task, task_esc, sizeof(task_esc));
 
+  char bt[400] = "";
+  char extra[80] = "";
+#if CONFIG_IDF_TARGET_ARCH_XTENSA
   /* Backtrace as hex addresses - resolvable to file+line with the matching
    * firmware.elf via xtensa-esp32-elf-addr2line. */
-  char bt[400] = "";
   size_t o = 0;
   for (uint32_t i = 0; i < sum.exc_bt_info.depth && i < 16 && o + 13 < sizeof(bt); i++) {
     o += snprintf(bt + o, sizeof(bt) - o, "%s\"0x%08lx\"", i ? "," : "",
                   (unsigned long)sum.exc_bt_info.bt[i]);
   }
+  const bool corrupted = sum.exc_bt_info.corrupted;
+#else
+  /* RISC-V: ESP-IDF builds no backtrace on the device, only registers and a
+   * raw stack dump (the full backtrace comes from espcoredump.py on the host).
+   * The return address ra is the one call-site entry available without the
+   * ELF; mcause/mtval say what happened (e.g. mcause 5 = load access fault,
+   * mtval = the faulting address). The JSON shape stays the same. */
+  snprintf(bt, sizeof(bt), "\"0x%08lx\"", (unsigned long)sum.ex_info.ra);
+  snprintf(extra, sizeof(extra), ",\"mcause\":\"0x%08lx\",\"mtval\":\"0x%08lx\"",
+           (unsigned long)sum.ex_info.mcause, (unsigned long)sum.ex_info.mtval);
+  const bool corrupted = false;
+#endif
 
-  char buf[1200];
+  char buf[1280];
   snprintf(buf, sizeof(buf),
     "{\"present\":true,\"readable\":true,\"corrupted\":%s,"
-    "\"task\":\"%s\",\"pc\":\"0x%08lx\",\"reason\":\"%s\",\"bt\":[%s]}",
-    sum.exc_bt_info.corrupted ? "true" : "false",
-    task_esc, (unsigned long)sum.exc_pc, reason_esc, bt);
+    "\"task\":\"%s\",\"pc\":\"0x%08lx\",\"reason\":\"%s\",\"bt\":[%s]%s}",
+    corrupted ? "true" : "false",
+    task_esc, (unsigned long)sum.exc_pc, reason_esc, bt, extra);
 
   return httpd_resp_send(r, buf, HTTPD_RESP_USE_STRLEN);
 }

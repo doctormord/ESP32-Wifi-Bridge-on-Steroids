@@ -1,0 +1,42 @@
+# ============================================================================
+#  sdkconfig.defaults.esp32c5  -  ESP32-C5 target only
+# ============================================================================
+#  ESP-IDF loads this file automatically IN ADDITION to sdkconfig.defaults
+#  when IDF_TARGET=esp32c5 (env:nicemcu-c5-w5500). It only holds what differs
+#  from the WT32-ETH01; everything else is shared.
+#
+#  The CONFIG_ETH_DMA_* lines in sdkconfig.defaults only concern the internal
+#  EMAC of the classic ESP32. The C5 has none, so Kconfig ignores them for
+#  this target.
+
+# --- Ethernet: W5500 on SPI instead of EMAC + LAN8720 -----------------------
+CONFIG_ETH_USE_SPI_ETHERNET=y
+CONFIG_ETH_SPI_ETHERNET_W5500=y
+CONFIG_ETH_SPI_ETHERNET_DM9051=n
+CONFIG_ETH_SPI_ETHERNET_KSZ8851SNL=n
+
+# The W5500 driver talks to the chip several times per frame through
+# spi_device_polling_transmit (RX size, header, payload, read pointer, RECV
+# command). Keeping those paths in IRAM instead of fetching them through the
+# flash cache matters at 80 MHz SPI, where the software gaps between
+# transfers are a noticeable share of the time per frame.
+CONFIG_SPI_MASTER_IN_IRAM=y
+CONFIG_SPI_MASTER_ISR_IN_IRAM=y
+
+# --- Console: native USB only -----------------------------------------------
+# The W5500 interrupt is wired to the UART0 RX pin (IO12), so UART0 must not
+# be claimed by the console. The board's USB-C connector is the chip's own
+# USB-Serial/JTAG port, which carries both flashing and the serial log.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# --- CPU --------------------------------------------------------------------
+# CONFIG_ESP32_DEFAULT_CPU_FREQ_240 in sdkconfig.defaults is an ESP32-only
+# symbol; this is the C5 equivalent. The C5 also runs at 240 MHz.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# --- Flash ------------------------------------------------------------------
+# board_build.flash_size does not reach Kconfig, which would otherwise fall
+# back to 2 MB. Set explicitly to match the C5HF4's 4 MB in-package flash and
+# partitions_4mb_ota.csv.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
