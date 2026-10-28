@@ -776,6 +776,9 @@ static void eth_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
  * (re)installs our RX callback. On disconnect: logs the event and, while the
  * bridge is active, reconnects immediately - this is the single place that
  * reconnects, which the watchdog and roaming rely on. */
+/* Defined with the network slot logic further down (see sta_lock_ap()). */
+static void sta_release_lock_on_disconnect(void);
+
 static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
   (void)arg; (void)base;
 
@@ -803,6 +806,10 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
     printf("[WIFI] Disconnected (reason %d %s, %d dBm)\n", d ? d->reason : -1,
            bridge_wifi_reason_str(d ? d->reason : 0), d ? d->rssi : 0);
     disc_log_add(d, was_up);
+    /* A BSSID binding (sta_lock_ap()) holds for one connection only: release
+     * it on the first disconnect that is not our own roaming switch, so the
+     * reconnect below may pick any AP of the SSID again. */
+    sta_release_lock_on_disconnect();
     /* In operation, keep reconnecting - but not while esp_restart() is
      * stopping the driver, where a connect would race the shutdown. */
     if (s_active && !s_restarting) esp_wifi_connect();
@@ -1173,6 +1180,11 @@ static void detect_location(size_t preferred) {
 /* Index (0..2) of the network slot the STA is configured for right now. */
 static volatile uint8_t s_cur_net = 0;
 
+/* STA config bound to one BSSID (see sta_lock_ap()); s_ap_lock_skip = the
+ * next disconnect is our own and must not release the binding. */
+static volatile bool s_ap_locked    = false;
+static volatile bool s_ap_lock_skip = false;
+
 static const char *net_ssid(size_t i) { return i==2 ? g_cfg.ssid3 : i==1 ? g_cfg.ssid2 : g_cfg.ssid1; }
 static const char *net_pass(size_t i) { return i==2 ? g_cfg.pass3 : i==1 ? g_cfg.pass2 : g_cfg.pass1; }
 static bool        net_in_use(size_t i) { return net_ssid(i)[0] != '\0'; }
@@ -1193,13 +1205,113 @@ static void sta_set_net(size_t i) {
   esp_err_t e = esp_wifi_set_config(WIFI_IF_STA, &wc);
   if (e != ESP_OK) printf("[WIFI] set_config('%s'): %s\n", net_ssid(i), esp_err_to_name(e));
   s_cur_net = (uint8_t)i;
+  s_ap_locked = false;
 }
 
-/* One blocking scan of all channels; vis[i] = network slot i was seen.
+/* --- AP selection by band ------------------------------------------------- */
+
+/* Under "both bands, 5 GHz preferred", a 5 GHz AP wins as long as its signal
+ * is at least this strong; below that, the better range of 2.4 GHz is worth
+ * more than the higher 5 GHz rates. */
+#define BAND_5G_MIN_RSSI  (-75)
+
+/* Is this AP on 5 GHz? Channels above 14 only exist there. */
+static inline bool ap_is_5g(const wifi_ap_record_t *r) { return r->primary > 14; }
+
+/* Band setting in effect: always "both, strongest" on 2.4 GHz-only chips. */
+static uint8_t band_setting(void) {
+#if CONFIG_SOC_WIFI_SUPPORT_5G
+  return g_cfg.wifi_band <= WIFI_BAND_MAX ? g_cfg.wifi_band : WIFI_BAND_PREFER_5G;
+#else
+  return WIFI_BAND_STRONGEST;
+#endif
+}
+
+/* May the station use this AP under the band setting? The "only" settings are
+ * also enforced by the driver's band mode; checking here keeps scan results
+ * from the other band out of the selection anyway. */
+static bool ap_allowed(const wifi_ap_record_t *r) {
+  switch (band_setting()) {
+    case WIFI_BAND_ONLY_5G: return ap_is_5g(r);
+    case WIFI_BAND_ONLY_2G: return !ap_is_5g(r);
+    default:                return true;
+  }
+}
+
+/* Ranking of an allowed AP, higher is better. With 5 GHz preferred, every
+ * usable 5 GHz AP (>= BAND_5G_MIN_RSSI) ranks above every 2.4 GHz AP, and
+ * within a group the signal decides. */
+static int ap_rank(const wifi_ap_record_t *r) {
+  if (band_setting() == WIFI_BAND_PREFER_5G && ap_is_5g(r) && r->rssi >= BAND_5G_MIN_RSSI)
+    return 1000 + r->rssi;
+  return r->rssi;
+}
+
+/* Best allowed AP for 'ssid' among scan records, skipping 'skip_bssid' (the
+ * current AP when roaming; NULL = none). Returns false if none qualifies. */
+static bool pick_best_ap(const char *ssid, const wifi_ap_record_t *recs, uint16_t n,
+                         const uint8_t *skip_bssid, wifi_ap_record_t *out) {
+  bool found = false;
+  for (uint16_t k = 0; k < n; k++) {
+    if (strcmp((const char *)recs[k].ssid, ssid) != 0) continue;
+    if (skip_bssid && memcmp(recs[k].bssid, skip_bssid, 6) == 0) continue;
+    if (!ap_allowed(&recs[k])) continue;
+    if (!found || ap_rank(&recs[k]) > ap_rank(out)) { *out = recs[k]; found = true; }
+  }
+  return found;
+}
+
+/* Point the STA at network slot i, bound to one specific AP (BSSID and
+ * channel from a scan). The driver then associates right away instead of
+ * scanning all channels of both bands again first, which saves several
+ * seconds per connect. The binding only holds for the next connection: the
+ * first disconnect afterwards (a failed attempt or a later drop) releases it
+ * in wifi_evt(), so a vanished AP cannot keep the bridge offline.
+ * skip_next_disc: the caller is about to disconnect on purpose (roaming) -
+ * that one disconnect must not release the binding yet. */
+static void sta_lock_ap(size_t i, const wifi_ap_record_t *ap, bool skip_next_disc) {
+  wifi_config_t wc = {};
+  strncpy((char *)wc.sta.ssid,     net_ssid(i), sizeof(wc.sta.ssid) - 1);
+  strncpy((char *)wc.sta.password, net_pass(i), sizeof(wc.sta.password) - 1);
+  wc.sta.pmf_cfg.capable = true;
+  wc.sta.scan_method = WIFI_FAST_SCAN;
+  wc.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+  wc.sta.bssid_set   = true;
+  memcpy(wc.sta.bssid, ap->bssid, 6);
+  wc.sta.channel     = ap->primary;
+  esp_err_t e = esp_wifi_set_config(WIFI_IF_STA, &wc);
+  if (e != ESP_OK) {
+    printf("[WIFI] set_config(locked '%s'): %s\n", net_ssid(i), esp_err_to_name(e));
+    sta_set_net(i);
+    return;
+  }
+  s_cur_net         = (uint8_t)i;
+  s_ap_lock_skip    = skip_next_disc;
+  s_ap_locked       = true;
+}
+
+/* Called by wifi_evt() on every disconnect: releases a BSSID binding unless
+ * this disconnect is the deliberate one announced by sta_lock_ap(). */
+static void sta_release_lock_on_disconnect(void) {
+  if (!s_ap_locked) return;
+  if (s_ap_lock_skip) { s_ap_lock_skip = false; return; }
+  sta_set_net(s_cur_net);
+}
+
+/* Passive dwell time per channel for our scans. The IDF default of 360 ms
+ * makes a dual-band scan slow, because most 5 GHz channels are DFS channels
+ * that may only be scanned passively. APs beacon every ~102 ms, so 150 ms
+ * still catches at least one beacon per channel. */
+#define SCAN_PASSIVE_MS  150
+
+/* One blocking scan of all channels (of the allowed bands); vis[i] = network
+ * slot i was seen, best[i] = its best AP under the band setting (valid only
+ * where have[i] is set - a slot can be visible only on a forbidden band).
  * Returns false if the scan itself failed (vis is then meaningless). Only
  * call while no connect attempt is running - IDF refuses to scan then. */
-static bool scan_visible_nets(bool vis[3]) {
+static bool scan_visible_nets(bool vis[3], wifi_ap_record_t best[3], bool have[3]) {
   wifi_scan_config_t sc = {};
+  sc.scan_time.passive = SCAN_PASSIVE_MS;
   if (esp_wifi_scan_start(&sc, true) != ESP_OK) return false;
   uint16_t n = 0;
   esp_wifi_scan_get_ap_num(&n);
@@ -1211,6 +1323,8 @@ static bool scan_visible_nets(bool vis[3]) {
   for (uint16_t k = 0; k < n; k++)
     for (size_t i = 0; i < 3; i++)
       if (net_in_use(i) && strcmp((const char *)recs[k].ssid, net_ssid(i)) == 0) vis[i] = true;
+  for (size_t i = 0; i < 3; i++)
+    have[i] = net_in_use(i) && pick_best_ap(net_ssid(i), recs, n, NULL, &best[i]);
   free(recs);
   return true;
 }
@@ -1342,7 +1456,12 @@ bool bridge_wifi_start(void) {
    * mode the single-band APIs esp_wifi_set_protocol/_bandwidth return
    * ESP_ERR_NOT_SUPPORTED, hence the plural variants. The 802.11b switch only
    * concerns 2.4 GHz; 5 GHz has no b rates. */
-  esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);
+  /* "Only" settings are enforced by the driver, so neither its own scans nor
+   * a reconnect can ever end up on the other band. */
+  const uint8_t band = band_setting();
+  esp_wifi_set_band_mode(band == WIFI_BAND_ONLY_5G ? WIFI_BAND_MODE_5G_ONLY :
+                         band == WIFI_BAND_ONLY_2G ? WIFI_BAND_MODE_2G_ONLY :
+                                                     WIFI_BAND_MODE_AUTO);
   wifi_protocols_t protos = {};
   protos.ghz_2g = g_cfg.no_11b
       ? (WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AX)
@@ -1423,7 +1542,9 @@ bool bridge_wifi_start(void) {
    * network 2 is even tried. If the scan fails, the plain priority order is
    * used. */
   bool vis[3] = { false, false, false };
-  const bool scanned = scan_visible_nets(vis);
+  bool have[3] = { false, false, false };
+  wifi_ap_record_t best[3];
+  const bool scanned = scan_visible_nets(vis, best, have);
   size_t order[3]; size_t n = 0;
   for (size_t i = 0; i < 3; i++) if (net_in_use(i) && (!scanned || vis[i])) order[n++] = i;
   for (size_t i = 0; i < 3; i++) if (net_in_use(i) && scanned && !vis[i]) order[n++] = i;
@@ -1433,8 +1554,19 @@ bool bridge_wifi_start(void) {
     /* The driver was started with the first slot in use, but the scan may
      * have put another one first - always point it at this one. */
     if (i != s_cur_net) sta_set_net(i);
-    printf("[WIFI] Connecting to '%s'%s...\n", net_ssid(i),
-           scanned ? (vis[i] ? " (seen in scan)" : " (not seen in scan)") : "");
+    /* First attempt straight to the AP the scan picked; the binding is
+     * released by the first failure (wifi_evt()), so further attempts fall
+     * back to the driver's own full scan. */
+    if (scanned && have[i]) {
+      sta_lock_ap(i, &best[i], false);
+      printf("[WIFI] Connecting to '%s' via %02x:%02x:%02x:%02x:%02x:%02x, channel %u (%s, %d dBm)...\n",
+             net_ssid(i), best[i].bssid[0], best[i].bssid[1], best[i].bssid[2],
+             best[i].bssid[3], best[i].bssid[4], best[i].bssid[5], (unsigned)best[i].primary,
+             ap_is_5g(&best[i]) ? "5 GHz" : "2.4 GHz", (int)best[i].rssi);
+    } else {
+      printf("[WIFI] Connecting to '%s'%s...\n", net_ssid(i),
+             scanned ? (vis[i] ? " (seen in scan, no AP on an allowed band)" : " (not seen in scan)") : "");
+    }
 
     for (int attempt = 0; attempt < connect_retries; attempt++) {
       if (attempt > 0) {
@@ -2889,17 +3021,19 @@ static void watchdog_tick(void) {
 static uint32_t s_roam_t0    = 0;
 static uint32_t s_roam_count = 0;
 
-/* Best RSSI among the OTHER APs with the given SSID - the currently connected
- * one (cur_bssid) does not count as a candidate. Otherwise a mere measurement
- * difference between the averaged RSSI from esp_wifi_sta_get_ap_info() and
- * the single value from the scan could "beat" the margin, and the bridge
- * would disconnect only to reconnect to the same AP. Blocking scan.
- * Returns false if the scan failed or no other AP was visible. */
+/* Best candidate among the OTHER APs with the given SSID under the band
+ * setting (pick_best_ap()) - the currently connected one (cur_bssid) does not
+ * count. Otherwise a mere measurement difference between the averaged RSSI
+ * from esp_wifi_sta_get_ap_info() and the single value from the scan could
+ * "beat" the margin, and the bridge would disconnect only to reconnect to
+ * the same AP. Blocking scan. Returns false if the scan failed or no other
+ * allowed AP was visible. */
 static bool roam_scan_best(const uint8_t *ssid, const uint8_t *cur_bssid,
-                           int8_t *out_best) {
+                           wifi_ap_record_t *out) {
   wifi_scan_config_t sc = {};
   sc.ssid        = (uint8_t *)ssid;
   sc.show_hidden = false;
+  sc.scan_time.passive = SCAN_PASSIVE_MS;
   if (esp_wifi_scan_start(&sc, true) != ESP_OK) return false;
 
   uint16_t n = 0;
@@ -2908,28 +3042,27 @@ static bool roam_scan_best(const uint8_t *ssid, const uint8_t *cur_bssid,
   if (n > 20) n = 20;
 
   wifi_ap_record_t *recs = (wifi_ap_record_t *)malloc(sizeof(wifi_ap_record_t) * n);
-  if (!recs) return false;
+  if (!recs) { esp_wifi_clear_ap_list(); return false; }
   esp_wifi_scan_get_ap_records(&n, recs);
+  esp_wifi_clear_ap_list();
 
-  bool found = false;
-  int8_t best = -127;
-  for (uint16_t i = 0; i < n; i++) {
-    if (memcmp(recs[i].bssid, cur_bssid, 6) == 0) continue;
-    if (recs[i].rssi > best) best = recs[i].rssi;
-    found = true;
-  }
+  const bool found = pick_best_ap((const char *)ssid, recs, n, cur_bssid, out);
   free(recs);
-
-  *out_best = best;
   return found;
 }
 
-/* Roaming check; called from bridge_tick(). Every roam_check_s seconds: if
- * the current RSSI is below the threshold, scan for other APs of the same
- * SSID and disconnect if one is better by at least the margin - the
- * reconnect in wifi_evt() then picks the strongest AP. */
+/* Roaming check; called from bridge_tick(). Every roam_check_s seconds it
+ * may scan for other APs of the same SSID and switch to one of them:
+ *  - roaming (roam_enable): when the current RSSI is below the threshold and
+ *    a candidate is better by at least the margin;
+ *  - band return (5 GHz preferred, regardless of roam_enable): when the
+ *    bridge sits on 2.4 GHz and a usable 5 GHz AP (BAND_5G_MIN_RSSI) is in
+ *    range - e.g. because 5 GHz was not available when it connected.
+ * The switch binds the STA to the chosen AP (sta_lock_ap()) and disconnects;
+ * wifi_evt()'s reconnect then goes straight to that AP. */
 static void roam_tick(void) {
-  if (!g_cfg.roam_enable || !s_active || s_paused) { s_roam_t0 = 0; return; }
+  const bool band_return = band_setting() == WIFI_BAND_PREFER_5G;
+  if ((!g_cfg.roam_enable && !band_return) || !s_active || s_paused) { s_roam_t0 = 0; return; }
 
   const uint32_t interval_ms =
       (g_cfg.roam_check_s ? g_cfg.roam_check_s : ROAM_CHECK_S_DEF) * 1000UL;
@@ -2941,23 +3074,27 @@ static void roam_tick(void) {
   wifi_ap_record_t ap;
   if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return;   /* not connected right now */
 
+  const bool want_5g = band_return && !ap_is_5g(&ap);
   const int8_t threshold = g_cfg.roam_rssi_threshold
       ? g_cfg.roam_rssi_threshold : ROAM_RSSI_THRESHOLD_DEF;
-  if (ap.rssi >= threshold) return;   /* good enough already - don't even scan */
+  const bool weak = g_cfg.roam_enable && ap.rssi < threshold;
+  if (!want_5g && !weak) return;   /* nothing to look for - don't even scan */
 
-  int8_t best;
-  if (!roam_scan_best(ap.ssid, ap.bssid, &best)) return;
+  wifi_ap_record_t cand;
+  if (!roam_scan_best(ap.ssid, ap.bssid, &cand)) return;
 
   const uint8_t margin = g_cfg.roam_margin_db ? g_cfg.roam_margin_db : ROAM_MARGIN_DB_DEF;
-  if ((int)best - (int)ap.rssi < (int)margin) return;   /* no sufficient candidate */
-
-  printf("[ROAM] Current %d dBm, found candidate with %d dBm - switching AP\n",
-         (int)ap.rssi, (int)best);
+  if (want_5g && ap_is_5g(&cand) && cand.rssi >= BAND_5G_MIN_RSSI) {
+    printf("[ROAM] On 2.4 GHz (%d dBm), 5 GHz AP with %d dBm on channel %u - switching\n",
+           (int)ap.rssi, (int)cand.rssi, (unsigned)cand.primary);
+  } else if (weak && (int)cand.rssi - (int)ap.rssi >= (int)margin) {
+    printf("[ROAM] Current %d dBm, found candidate with %d dBm - switching AP\n",
+           (int)ap.rssi, (int)cand.rssi);
+  } else {
+    return;   /* no sufficient candidate */
+  }
   s_roam_count++;
-  /* wifi_evt()'s WIFI_EVENT_STA_DISCONNECTED handler reconnects automatically
-   * (s_active is always set here) and, via WIFI_ALL_CHANNEL_SCAN +
-   * WIFI_CONNECT_AP_BY_SIGNAL, again picks the strongest visible AP - no
-   * extra esp_wifi_connect() needed. */
+  sta_lock_ap(s_cur_net, &cand, true);
   disc_mark_own(DISC_SRC_ROAM);
   esp_wifi_disconnect();
 }

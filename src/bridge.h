@@ -153,6 +153,13 @@ typedef struct {
 #define WD_ACT_WIFI_RECON  0x02u
 #define WD_ACT_REBOOT      0x04u
 #define WD_ACT_ALL         (WD_ACT_ETH_RESET | WD_ACT_WIFI_RECON | WD_ACT_REBOOT)
+
+/* Values of g_cfg.wifi_band (dual-band chips only). */
+#define WIFI_BAND_PREFER_5G  0u   /* both bands, 5 GHz wins if usable (default) */
+#define WIFI_BAND_ONLY_5G    1u   /* 5 GHz only, enforced in the driver         */
+#define WIFI_BAND_ONLY_2G    2u   /* 2.4 GHz only, enforced in the driver       */
+#define WIFI_BAND_STRONGEST  3u   /* both bands, strongest signal wins          */
+#define WIFI_BAND_MAX        3u
 #define WD_BAD_WINDOWS_DEF 3u
 
 /* Firmware default for ap_idle_reboot_s (config.h) - defined here rather than

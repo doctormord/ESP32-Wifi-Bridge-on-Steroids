@@ -625,6 +625,22 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
     <option value="0">keep enabled (default)</option>
     <option value="1">disable - saves airtime</option>
   </select>
+  <div id="bandrow" style="display:none">
+    <label>Wi-Fi band</label>
+    <select id="wifi_band">
+      <option value="0">Both, prefer 5 GHz (default)</option>
+      <option value="1">5 GHz only</option>
+      <option value="2">2.4 GHz only</option>
+      <option value="3">Both, strongest signal</option>
+    </select>
+    <div class="sub" style="margin:6px 0 0">
+      With "prefer 5 GHz" a 5 GHz AP is used whenever its signal is at least
+      -75&nbsp;dBm, and a bridge that had to fall back to 2.4&nbsp;GHz moves
+      back to 5&nbsp;GHz on its own once a usable AP is in range (checked at
+      the roaming interval, even with roaming off). "Only" settings are
+      enforced by the radio itself and also apply to every reconnect.
+    </div>
+  </div>
   <div class="sub" style="margin:6px 0 0">
     HT40 doubles the gross rate but occupies twice the bandwidth and picks
     up correspondingly more interference. In crowded 2.4&nbsp;GHz
@@ -745,7 +761,7 @@ async function tick(){
     $('rssi').textContent=s.wifi?s.rssi+' dBm':'-';
     /* -30 dBm = excellent, -90 = dead */
     $('rssibar').style.width=Math.max(0,Math.min(100,(s.rssi+95)*100/65))+'%';
-    $('ch').textContent=s.wifi?s.ch:'-';
+    $('ch').textContent=s.wifi?s.ch+(s.ch>14?' (5 GHz)':' (2.4 GHz)'):'-';
     $('up').textContent=fmt(s.kbps_up); $('down').textContent=fmt(s.kbps_down);
     $('drops').textContent=s.drop_up+' / '+s.drop_down;
     $('drops').className='v '+((s.drop_up+s.drop_down)?'bad':'ok');
@@ -858,11 +874,13 @@ const CFG=['name','ssid1','ssid2','ssid3','ip','mask','gw','ip2','mask2','gw2','
            'static_rx_buf','dynamic_rx_buf','dynamic_tx_buf','rx_ba_win',
            'ht40','no_11b','wd_enable','wd_actions','wd_bad_windows',
            'wifi_connect_timeout_s','wifi_connect_retries','ap_idle_reboot_s',
-           'roam_enable','roam_check_s','roam_rssi_threshold','roam_margin_db','txq_cap'];
+           'roam_enable','roam_check_s','roam_rssi_threshold','roam_margin_db','txq_cap',
+           'wifi_band'];
 /* Fill the form from /api/config and take the unsaved-changes snapshot. */
 async function load(){
   const c=await(await fetch('/api/config')).json();
   DEF=c.def||null;
+  $('bandrow').style.display=c.band5g?'':'none';
   for(const k of CFG) if(c[k]!==undefined)$(k).value=c[k];
   snapshot();
   /* Buffers: the form shows the SAVED value (otherwise a change made before
@@ -1410,7 +1428,7 @@ static esp_err_t h_config_get(httpd_req_t *r) {
     "\"wifi_connect_timeout_s\":%u,\"wifi_connect_retries\":%u,"
     "\"ap_idle_reboot_s\":%u,"
     "\"roam_enable\":%u,\"roam_check_s\":%u,\"roam_rssi_threshold\":%d,"
-    "\"roam_margin_db\":%u,\"txq_cap\":%u,"
+    "\"roam_margin_db\":%u,\"txq_cap\":%u,\"wifi_band\":%u,\"band5g\":%d,"
     "\"def\":{\"eth_tx_retries\":%u,\"wifi_tx_retries\":%u,"
     "\"static_rx_buf\":%u,\"dynamic_rx_buf\":%u,\"dynamic_tx_buf\":%u,"
     "\"rx_ba_win\":%u,\"wifi_connect_timeout_s\":%u,"
@@ -1439,7 +1457,12 @@ static esp_err_t h_config_get(httpd_req_t *r) {
     eff.wd_actions, eff.wd_bad_windows,
     eff.wifi_connect_timeout_s, eff.wifi_connect_retries, eff.ap_idle_reboot_s,
     g_cfg.roam_enable, eff.roam_check_s, (int)eff.roam_rssi_threshold, eff.roam_margin_db,
-    g_cfg.txq_cap,
+    g_cfg.txq_cap, g_cfg.wifi_band,
+#if CONFIG_SOC_WIFI_SUPPORT_5G
+    1,
+#else
+    0,
+#endif
     def.eth_retries, def.wifi_retries,
     def.static_rx, def.dyn_rx, def.dyn_tx, def.ba_win,
     def.wifi_connect_timeout_s, def.wifi_connect_retries, def.ap_idle_reboot_s,
@@ -1574,6 +1597,10 @@ static esp_err_t h_config_post(httpd_req_t *r) {
   }
   if (form_get(body, "ht40",   v, sizeof(v))) g_cfg.ht40   = (uint8_t)(atoi(v) ? 1 : 0);
   if (form_get(body, "no_11b", v, sizeof(v))) g_cfg.no_11b = (uint8_t)(atoi(v) ? 1 : 0);
+  if (form_get(body, "wifi_band", v, sizeof(v))) {
+    int t = atoi(v);
+    g_cfg.wifi_band = (uint8_t)((t < 0 || t > (int)WIFI_BAND_MAX) ? WIFI_BAND_PREFER_5G : t);
+  }
 
   /* Take effect at the next connect (bridge_wifi_start()), not immediately -
    * unlike tx_power/retries they do not affect an existing connection. Upper

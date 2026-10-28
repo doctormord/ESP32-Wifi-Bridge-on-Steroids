@@ -170,6 +170,13 @@ struct BridgeConfig {
    * bridge.cpp: eth_rx_cb(). 0 = off, i.e. the queue is only limited by the
    * TX buffer count. */
   uint8_t  txq_cap;
+
+  /* --- Wi-Fi band (dual-band chips such as the ESP32-C5) ------------------
+   * Which band(s) the station may use and which one wins when an SSID is
+   * visible on both - see bridge.cpp: ap_allowed()/ap_rank(). One of the
+   * WIFI_BAND_* values in bridge.h; 0 = both bands, 5 GHz preferred. Ignored
+   * on 2.4 GHz-only chips. Takes effect at the next boot. */
+  uint8_t  wifi_band;
 };
 
 extern BridgeConfig g_cfg;
