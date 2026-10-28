@@ -24,9 +24,10 @@ CONFIG_SPI_MASTER_IN_IRAM=y
 CONFIG_SPI_MASTER_ISR_IN_IRAM=y
 
 # --- Console: native USB only -----------------------------------------------
-# The W5500 interrupt is wired to the UART0 RX pin (IO12), so UART0 must not
-# be claimed by the console. The board's USB-C connector is the chip's own
-# USB-Serial/JTAG port, which carries both flashing and the serial log.
+# The board's USB-C connector is the chip's own USB-Serial/JTAG port, which
+# carries both flashing and the serial log; there is no USB-UART chip, so a
+# UART0 console would only reach the bare TXD/RXD header pins. A host reading
+# the log must assert DTR, otherwise the port delivers no output.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 
