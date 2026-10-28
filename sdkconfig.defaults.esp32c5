@@ -41,3 +41,9 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 # back to 2 MB. Set explicitly to match the C5HF4's 4 MB in-package flash and
 # partitions_4mb_ota.csv.
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# --- Coredump ---------------------------------------------------------------
+# Write the coredump on a dedicated stack instead of the crashing task's own.
+# With 0 (the default) a crash that is itself stack-related - an overflow or
+# a corrupted stack - can make the coredump write fail, leaving no image.
+CONFIG_ESP_COREDUMP_STACK_SIZE=1792

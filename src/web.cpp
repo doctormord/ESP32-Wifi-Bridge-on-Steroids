@@ -15,6 +15,7 @@
  *   GET/DELETE /api/coredump  coredump summary/erase  (admin key)
  *   GET/DELETE /api/crashes   crash history/erase     (admin key)
  *   GET  /api/log?since=N   console output since byte N (admin key)
+ *   GET  /api/log?prev=1    end of the previous boot's output  (admin key)
  */
 
 #include "web.h"
@@ -265,6 +266,10 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
          word-break:break-all"></pre>
     <span class="hint" id="lghint"></span>
     <button class="sec" onclick="$('lgpre').textContent=''" style="margin-top:6px">Clear view</button>
+    <button class="sec" onclick="logPrev()" style="margin-top:6px">Previous boot</button>
+    <pre id="lgprev" style="display:none;background:#0d1015;border-radius:8px;padding:8px;margin:6px 0 0;
+         max-height:360px;overflow:auto;font-size:11px;line-height:1.35;white-space:pre-wrap;
+         word-break:break-all"></pre>
   </details>
 </div>
 
@@ -1161,6 +1166,23 @@ function upload(){
    since the last poll (lgSince = byte position returned by the board) once
    a second. Closed, it costs nothing. The view is capped so a long session
    does not grow the page without bound. */
+/* Reset reasons for the previous-boot log header (esp_reset_reason_t). */
+const RSTN={1:'power-on',2:'reset pin',3:'software restart',4:'panic',5:'interrupt watchdog',
+  6:'task watchdog',7:'hardware watchdog',8:'deep sleep',9:'brownout',11:'USB',12:'JTAG',
+  14:'power glitch',15:'CPU lockup'};
+/* Show the end of the previous boot's log (stored in NVS at boot), headed
+   by the reset reason that ended it. */
+async function logPrev(){
+  const p=$('lgprev');p.style.display='block';
+  try{
+    const r=await fetch('/api/log?prev=1',{headers:cdHeaders(),cache:'no-store'});
+    if(!r.ok){p.textContent=r.status==401?'Admin key required (enter it under Firmware update)':'Error '+r.status;return}
+    const t=await r.text(),n=+(r.headers.get('X-Log-Rst')||0);
+    p.textContent=t?'--- previous boot, ended by: '+(RSTN[n]||('reset '+n))+' ---\n'+t
+                   :'No previous boot log stored (none since the last power-on).';
+    p.scrollTop=p.scrollHeight;
+  }catch(e){p.textContent='Board not reachable'}
+}
 let lgSince=0,lgTimer=null,lgBusy=false;
 function logToggle(open){
   clearInterval(lgTimer);lgTimer=null;
@@ -2159,13 +2181,28 @@ static esp_err_t h_log(httpd_req_t *r) {
     return ESP_FAIL;
   }
   uint32_t since = 0;
+  bool prev = false;
   char q[32], v[12];
-  if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK &&
-      httpd_query_key_value(q, "since", v, sizeof(v)) == ESP_OK) {
-    since = (uint32_t)strtoul(v, NULL, 10);
+  if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK) {
+    if (httpd_query_key_value(q, "since", v, sizeof(v)) == ESP_OK)
+      since = (uint32_t)strtoul(v, NULL, 10);
+    if (httpd_query_key_value(q, "prev", v, sizeof(v)) == ESP_OK)
+      prev = atoi(v) != 0;
   }
 
   char buf[LOG_REPLY_MAX];
+  if (prev) {
+    /* The end of the previous boot's log from NVS (see conlog.h), with the
+     * reset reason that ended that boot in X-Log-Rst; empty if none. */
+    uint8_t rst = 0;
+    const size_t pn = conlog_get_prev(buf, sizeof(buf), &rst);
+    char rst_s[4];
+    snprintf(rst_s, sizeof(rst_s), "%u", (unsigned)rst);
+    httpd_resp_set_type(r, "text/plain; charset=utf-8");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(r, "X-Log-Rst", rst_s);
+    return httpd_resp_send(r, buf, pn);
+  }
   uint32_t next = since;
   bool reset = false;
   const size_t n = conlog_read(since, buf, sizeof(buf), &next, &reset);
@@ -2178,6 +2215,26 @@ static esp_err_t h_log(httpd_req_t *r) {
   httpd_resp_set_hdr(r, "X-Log-Reset", reset ? "1" : "0");
   return httpd_resp_send(r, buf, n);
 }
+
+#ifdef BRIDGE_PANIC_TEST
+/* POST /api/panic_test - deliberately crash, to verify on real hardware that
+ * a panic writes a coredump and that RTC and .noinit RAM (crash heartbeat,
+ * previous-boot log) survive the reset. Only exists in builds made with
+ * -DBRIDGE_PANIC_TEST, never in the regular firmware, and additionally
+ * requires the admin key. */
+static esp_err_t h_panic_test(httpd_req_t *r) {
+  if (!admin_key_ok(r)) {
+    httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "wrong key");
+    return ESP_FAIL;
+  }
+  httpd_resp_sendstr(r, "{\"ok\":true}");
+  printf("[TEST] Deliberate panic requested via /api/panic_test\n");
+  fflush(stdout);
+  delay(200);   /* let the reply and the log line go out */
+  abort();
+  return ESP_OK;
+}
+#endif
 
 /* Start the HTTP server and register all routes (see web.h). */
 bool web_start(bool provisioning) {
@@ -2228,6 +2285,9 @@ bool web_start(bool provisioning) {
     { "/api/crashes", HTTP_GET,    h_crashes_get,     NULL },
     { "/api/crashes", HTTP_DELETE, h_crashes_delete,  NULL },
     { "/api/log",     HTTP_GET,    h_log,             NULL },
+#ifdef BRIDGE_PANIC_TEST
+    { "/api/panic_test", HTTP_POST, h_panic_test,     NULL },
+#endif
   };
   for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
     httpd_register_uri_handler(s_httpd, &uris[i]);

@@ -187,6 +187,9 @@ static void bridge_setup(void) {
     ESP_ERROR_CHECK(nvs_flash_erase());
     ESP_ERROR_CHECK(nvs_flash_init());
   }
+  /* Store the end of the previous boot's log (taken from RAM by
+   * conlog_init()) now that NVS is available - see /api/log?prev=1. */
+  conlog_persist_prev();
 
   ESP_ERROR_CHECK(esp_netif_init());
   esp_err_t e = esp_event_loop_create_default();
