@@ -105,9 +105,12 @@ extern "C" esp_err_t esp_wifi_set_tx_done_cb(
  * grossly too fast fails there and the next step is tried. Marginal bit
  * errors during operation are NOT caught by this (the SPI link has no
  * checksum) - if they show up as TCP retransmissions or corrupted UDP
- * payloads, pin the list to 40 MHz. */
-static const int W5500_SPI_HZ[] = { 80 * 1000 * 1000, 40 * 1000 * 1000,
-                                    20 * 1000 * 1000 };
+ * payloads, pin the list to 40 MHz.
+ * The steps are whole divisors of the C5's 160 MHz SPI clock source
+ * (PLL_F160M): /2, /3, /4, /8. 53.3 MHz sits between the 80 MHz that the
+ * GPIO-matrix routing above cannot read reliably and the safe 40 MHz. */
+static const int W5500_SPI_HZ[] = { 160 * 1000 * 1000 / 2, 160 * 1000 * 1000 / 3,
+                                    160 * 1000 * 1000 / 4, 160 * 1000 * 1000 / 8 };
 #else
 #error "No supported Ethernet driver configured (ESP32 EMAC or W5500)"
 #endif
