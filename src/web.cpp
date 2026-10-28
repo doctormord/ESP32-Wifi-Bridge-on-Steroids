@@ -1236,8 +1236,10 @@ static esp_err_t h_status(httpd_req_t *r) {
   bridge_get_stats(&st);
   uint32_t lr_el, lr_tot;
   bridge_long_tune_progress(&lr_el, &lr_tot);
+  uint32_t ethd[4];
+  bridge_get_eth_drv_stats(ethd);
 
-  char buf[1350];
+  char buf[1450];
   snprintf(buf, sizeof(buf),
     "{\"prov\":%d,\"wifi\":%d,\"eth\":%d,\"rssi\":%d,\"ch\":%u,"
     "\"kbps_up\":%lu,\"kbps_down\":%lu,\"pkt_up\":%lu,\"pkt_down\":%lu,"
@@ -1254,7 +1256,7 @@ static esp_err_t h_status(httpd_req_t *r) {
     "\"pt\":%d,\"pt_s\":%u,\"pt_k\":%d,\"pt_r\":%d,"
     "\"drop_cap\":%lu,\"txq_cap\":%u,\"qc\":%d,\"qc_s\":%u,\"qc_k\":%u,\"qc_r\":%d,\"all\":%d,"
     "\"lr\":%d,\"lr_k\":%u,\"lr_el\":%lu,\"lr_tot\":%lu,\"lr_r\":%u,"
-    "\"spi\":%u,\"rst\":%u,\"rtc\":%d,\"time\":%lu,\"build\":\"" GIT_REV "\"}",
+    "\"spi\":%u,\"w5\":[%lu,%lu,%lu,%lu],\"rst\":%u,\"rtc\":%d,\"time\":%lu,\"build\":\"" GIT_REV "\"}",
     s_provisioning ? 1 : 0, st.wifi_up ? 1 : 0, st.eth_link ? 1 : 0,
     (int)st.rssi, (unsigned)st.channel,
     (unsigned long)st.kbps_eth2wifi, (unsigned long)st.kbps_wifi2eth,
@@ -1313,6 +1315,9 @@ static esp_err_t h_status(httpd_req_t *r) {
     (unsigned long)lr_el, (unsigned long)lr_tot, bridge_long_tune_result(),
     /* W5500 SPI clock in MHz, 0 = internal EMAC. */
     (unsigned)bridge_get_eth_spi_mhz(),
+    /* Ethernet driver drops: TX ring full, SEND timeout, RX resync, RX no
+     * heap (see bridge_get_eth_drv_stats()). */
+    (unsigned long)ethd[0], (unsigned long)ethd[1], (unsigned long)ethd[2], (unsigned long)ethd[3],
     /* Why this boot happened (esp_reset_reason_t) and whether RTC memory
      * survived it - see crashlog.h. */
     (unsigned)crashlog_reset_reason(), crashlog_rtc_retained() ? 1 : 0,

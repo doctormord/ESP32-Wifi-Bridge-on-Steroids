@@ -27,6 +27,7 @@
 #if CONFIG_ETH_SPI_ETHERNET_W5500
 #include "esp_eth_mac_spi.h"
 #include "driver/spi_master.h"
+#include "w5500_mac.h"
 #endif
 #include "esp_mac.h"
 #include "esp_system.h"
@@ -846,6 +847,25 @@ static uint8_t s_eth_spi_mhz = 0;
 /* See bridge.h. */
 uint8_t bridge_get_eth_spi_mhz(void) { return s_eth_spi_mhz; }
 
+#if CONFIG_ETH_SPI_ETHERNET_W5500
+/* The W5500 MAC instance, for its driver counters. */
+static esp_eth_mac_t *s_w5500_mac = NULL;
+#endif
+
+/* See bridge.h. */
+void bridge_get_eth_drv_stats(uint32_t out[4]) {
+  out[0] = out[1] = out[2] = out[3] = 0;
+#if CONFIG_ETH_SPI_ETHERNET_W5500
+  if (!s_w5500_mac) return;
+  w5500_mac_stats_t st;
+  w5500_mac_get_stats(s_w5500_mac, &st);
+  out[0] = st.tx_ring_full;
+  out[1] = st.tx_timeout;
+  out[2] = st.rx_bad_len;
+  out[3] = st.rx_no_mem;
+#endif
+}
+
 #if CONFIG_ETH_USE_ESP32_EMAC
 /* Power up the LAN8720 PHY and install the ESP32 EMAC driver (RMII with the
  * external 50 MHz clock on GPIO0, as wired on the WT32-ETH01). No netif is
@@ -937,7 +957,7 @@ bool bridge_eth_init(void) {
     eth_w5500_config_t w5500 = ETH_W5500_DEFAULT_CONFIG(W5500_SPI_HOST, &dev);
     w5500.int_gpio_num = W5500_INT_GPIO;
 
-    esp_eth_mac_t *mac = esp_eth_mac_new_w5500(&w5500, &mac_cfg);
+    esp_eth_mac_t *mac = w5500_mac_new(&w5500, &mac_cfg);
     esp_eth_phy_t *phy = esp_eth_phy_new_w5500(&phy_cfg);
     if (!mac || !phy) {
       printf("[ETH ] Could not create W5500 MAC/PHY object\n");
@@ -948,7 +968,7 @@ bool bridge_eth_init(void) {
 
     esp_eth_config_t cfg = ETH_DEFAULT_CONFIG(mac, phy);
     err = esp_eth_driver_install(&cfg, &s_eth);
-    if (err == ESP_OK) { hz_used = W5500_SPI_HZ[i]; break; }
+    if (err == ESP_OK) { hz_used = W5500_SPI_HZ[i]; s_w5500_mac = mac; break; }
 
     printf("[ETH ] W5500 not responding at %d MHz (%s)\n",
            W5500_SPI_HZ[i] / 1000000, esp_err_to_name(err));
