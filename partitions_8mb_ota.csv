@@ -1,35 +1,33 @@
 # ============================================================================
-#  Partitionstabelle fuer WT32-ETH01 mit 8 MB Flash, mit OTA
+#  Partition table for the WT32-ETH01 with 8 MB flash, with OTA
 # ============================================================================
-#  Ersetzt partitions_2mb_ota.csv. Hintergrund: die Projektnotiz ging von
-#  2 MB Flash aus, das Board hat aber tatsaechlich 8 MB. Am 2026-08-13 direkt
-#  an der Hardware nachgemessen, mit zwei unabhaengigen Verfahren:
-#    - esptool flash-id: Zbit 0x5E, Device 0x4017 - Kapazitaetsbyte 0x17 = 8 MiB
-#    - Aliasing-Test: 0x001000 und 0x401000 liefern verschiedene Daten, ein
-#      4-MB-Chip muesste dort spiegeln
+#  Replaces partitions_2mb_ota.csv, which assumed 2 MB of flash. The board
+#  actually has 8 MB, verified with two independent methods:
+#    - esptool flash-id: Zbit 0x5E, device 0x4017 - capacity byte 0x17 = 8 MiB
+#    - aliasing test: 0x001000 and 0x401000 return different data, a 4 MB
+#      chip would mirror there
 #
-#  Damit entfaellt der Grund fuer die alten 960-KB-Slots. 3 MB pro Slot sind
-#  beim aktuellen Image (~800 KB) das Vierfache dessen, was gebraucht wird -
-#  das ist bewusst grosszuegig, weil eine Partitionstabelle NICHT per OTA
-#  aenderbar ist. Wer sie spaeter vergroessern will, braucht das Board wieder
-#  am Kabel. Lieber jetzt Luft lassen.
+#  3 MB per slot is about four times what the current image (~900 KB) needs -
+#  deliberately generous, because a partition table can NOT be changed via
+#  OTA. Enlarging it later requires the board on a cable again. Better to
+#  leave room now.
 #
-#    nvs        24 KB  - Konfiguration (BridgeConfig) + WiFi-Kalibrierung
-#    otadata     8 KB  - merkt sich, welcher App-Slot aktiv ist
-#    app0        3 MB  - OTA-Slot 0
-#    app1        3 MB  - OTA-Slot 1
-#    coredump   64 KB  - Absturzabbild, siehe unten
-#    (ab 0x630000 bleiben 1,8 MB unbelegt - Reserve)
+#    nvs        24 KB  - configuration (BridgeConfig) + Wi-Fi calibration
+#    otadata     8 KB  - remembers which app slot is active
+#    app0        3 MB  - OTA slot 0
+#    app1        3 MB  - OTA slot 1
+#    coredump   64 KB  - crash image, see below
+#    (from 0x630000 on, 1.8 MB remain unallocated - reserve)
 #
-#  Zur Coredump-Partition: Das Board sitzt im Betrieb ohne seriellen Zugang.
-#  Ohne Coredump ist ein Absturz genau eine Information ("es startete neu"),
-#  mit Coredump liegt der Stacktrace im Flash und ist spaeter auslesbar
-#  (esp_core_dump_image_get() bzw. per Kabel mit espcoredump.py). Kostet
-#  64 KB Flash und etwas Code - bei 8 MB kein Thema mehr, bei 2 MB war es
-#  bewusst abgeschaltet.
+#  About the coredump partition: the board runs without serial access.
+#  Without a coredump a crash is exactly one piece of information ("it
+#  rebooted"); with a coredump the stack trace sits in flash and can be read
+#  later (esp_core_dump_image_get() at runtime, or espcoredump.py via cable).
+#  Costs 64 KB of flash and a little code - negligible with 8 MB.
 #
-#  App-Partitionen muessen auf 64-KB-Grenzen beginnen (MMU-Anforderung) -
-#  daher die Luecke zwischen otadata-Ende (0x11000) und app0-Start (0x20000).
+#  App partitions must start on 64 KB boundaries (MMU requirement) - hence
+#  the gap between the end of otadata (0x11000) and the start of app0
+#  (0x20000).
 # ----------------------------------------------------------------------------
 # Name,     Type, SubType,   Offset,   Size,     Flags
 nvs,        data, nvs,       0x9000,   0x6000,

@@ -1,35 +1,31 @@
 # ============================================================================
-#  sdkconfig.defaults  -  abgeleitet aus dem Rust-Original
+#  sdkconfig.defaults  -  derived from the Rust implementation this project
+#  is based on
 # ============================================================================
 
 # --- FreeRTOS ---------------------------------------------------------------
-# FREERTOS_HZ bleibt beim Standard (100 Hz). Die 1000 Hz waren nur fuer das
-# vTaskDelay(1) der alten Flusskontrolle da - die ist raus, weil sie sich als
-# schaedlich erwiesen hat. Ein 10x haeufigerer Scheduler-Tick kostet Rechenzeit
-# im Paketpfad, ohne dass ihn noch jemand braucht. Das Rust-Original hat die
-# Zeile ebenfalls auskommentiert.
+# FREERTOS_HZ stays at the default (100 Hz). 1000 Hz was only needed for the
+# vTaskDelay(1) of an earlier flow control that turned out to be harmful and
+# was removed. A 10x more frequent scheduler tick costs CPU time in the packet
+# path without anyone needing it. The Rust original has the line commented
+# out as well.
 
-# --- Wi-Fi Puffer und Block-Ack-Fenster ------------------------------------
-# DIESE DATEI IST DIE EINZIGE QUELLE FUER DIE PUFFERGROESSEN.
-# bridge.cpp hat die drei Werte frueher zusaetzlich zur Laufzeit in
-# wifi_init_config_t gesetzt - das war nicht "doppelt abgesichert", sondern
-# hat die Kconfig-Werte ueberschrieben und damit jede Erhoehung hier wirkungslos
-# gemacht. Die Zuweisungen sind raus, WIFI_INIT_CONFIG_DEFAULT() liest die
-# Werte von hier.
+# --- Wi-Fi buffers and block-ack window -------------------------------------
+# THIS FILE IS THE SINGLE SOURCE OF TRUTH FOR THE BUFFER SIZES.
+# bridge.cpp must not assign these values to wifi_init_config_t at runtime -
+# that would override the Kconfig values and make every change here
+# ineffective. WIFI_INIT_CONFIG_DEFAULT() reads the values from here.
 #
-# Exakt die Werte des Rust-Originals (16/32/32, RX_BA_WIN=32).
+# Exactly the values of the Rust original (16/32/32, RX_BA_WIN=32).
 #
-# Der Umweg dorthin ist lehrreich: Zwischendurch standen hier 24/48/48, in der
-# Annahme "mehr Puffer = weniger Drops". Am 2026-08-13 auf echter Hardware
-# gemessen war das falsch. Eine Erhoehung von DYNAMIC_TX auf 64 riss den freien
-# Heap von 111 kB auf 9 kB und HALBIERTE den Download, weil Sende- und
-# Empfangspuffer um denselben Speicher konkurrieren. Das Original ist mit
-# KLEINEREN Puffern fuenfmal schneller - der Engpass lag nie hier.
+# More buffers are NOT better: raising DYNAMIC_TX to 64 dropped the free heap
+# from 111 kB to 9 kB and HALVED the download, because TX and RX buffers
+# compete for the same memory. The bottleneck was never here.
 #
-# RX_BA_WIN=32 trotz STATIC_RX=16: die oft zitierte Regel
-# "RX_BA_WIN <= STATIC_RX und <= DYNAMIC_RX/2" wird von der IDF nicht
-# erzwungen, und das Original faehrt seit jeher gut damit. Ein groesseres
-# Block-Ack-Fenster heisst weniger Quittungs-Overhead im Download.
+# RX_BA_WIN=32 despite STATIC_RX=16: the often-quoted rule
+# "RX_BA_WIN <= STATIC_RX and <= DYNAMIC_RX/2" is not enforced by IDF, and
+# the original has always run fine with it. A larger block-ack window means
+# less acknowledgement overhead on the download.
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
@@ -38,9 +34,9 @@ CONFIG_ESP_WIFI_TX_BA_WIN=32
 CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
 CONFIG_ESP_WIFI_RX_BA_WIN=32
 
-# --- IRAM-Optimierung -------------------------------------------------------
-# Kritische WiFi-/Ethernet-Pfade ins IRAM statt Flash. Senkt Interrupt-Latenz
-# spuerbar.
+# --- IRAM optimization ------------------------------------------------------
+# Critical Wi-Fi/Ethernet paths in IRAM instead of flash. Noticeably lowers
+# interrupt latency.
 CONFIG_ESP_WIFI_IRAM_OPT=y
 CONFIG_ESP_WIFI_SLP_IRAM_OPT=y
 CONFIG_ESP_WIFI_RX_IRAM_OPT=y
@@ -48,141 +44,137 @@ CONFIG_ESP_WIFI_EXTRA_IRAM_OPT=y
 CONFIG_ETH_IRAM_OPTIMIZATION=y
 
 # --- Ethernet DMA -----------------------------------------------------------
-# Default ist 512 Byte x 10 Puffer.
-# Ein 1514-Byte-Frame belegt damit 3 Deskriptoren. Mit 1522 x 30 passt jedes
-# Frame in genau einen Puffer und es gibt echte Burst-Reserve.
-# Beide zurueck auf die 30 des Originals (2026-08-13). Die Absenkung auf 20
-# war ein Zugestaendnis an lwIP + HTTP-Server + MQTT, mit der Notiz "falls die
-# Drop-Zaehler hochgehen: hier ansetzen" - genau das ist eingetreten.
+# The default is 512 bytes x 10 buffers, so a 1514-byte frame occupies 3
+# descriptors. With 1522 x 30 every frame fits into exactly one buffer and
+# there is real burst headroom. 30 matches the original; lowering the count
+# to save memory for lwIP/HTTP/MQTT shows up as rising drop counters.
 CONFIG_ETH_DMA_BUFFER_SIZE=1522
 CONFIG_ETH_DMA_RX_BUFFER_NUM=30
 CONFIG_ETH_DMA_TX_BUFFER_NUM=30
 
-# --- Sonstiges --------------------------------------------------------------
-CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=768
+# --- Miscellaneous ----------------------------------------------------------
+# IDLE stack: IDF default 1536. The Kconfig minimum of 768 is not enough and
+# leads to "stack overflow in task IDLE0" crashes: the IDLE task cleans up
+# deleted tasks (among them the ping session tasks of the gateway probe) and
+# carries interrupt frames under Wi-Fi/EMAC load. Costs ~1.5 KB of RAM (two
+# cores); the heap has enough reserve.
+CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=1536
+
+# SNTP for timestamps (crashlog.cpp): gateway + pool.ntp.org as fallback.
+CONFIG_LWIP_SNTP_MAX_SERVERS=2
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
-# CPU auf voller Taktrate, kein Powermanagement
+# CPU at full clock, no power management
 CONFIG_ESP32_DEFAULT_CPU_FREQ_240=y
 CONFIG_PM_ENABLE=n
 
-# Compiler auf GESCHWINDIGKEIT (2026-08-13).
-# Vorher stand hier OPTIMIZATION_SIZE, weil die Firmware nicht in einen
-# 960-KB-OTA-Slot passte. Dieser Zwang ist entfallen: der Flash hat 8 MB, die
-# Slots je 3 MB, die Belegung liegt bei 26 %. Damit gab es keinen Grund mehr,
-# IDF, lwIP und die WLAN-/Ethernet-Treiber auf Groesse statt Tempo zu
-# uebersetzen - in einem Projekt, dessen einzige Aufgabe Paketdurchsatz ist.
-# Die urspruengliche Annahme im alten Kommentar ("der Datenpfad haengt kaum an
-# dieser Einstellung") war eine Vermutung, keine Messung.
+# Compiler optimized for SPEED.
+# With 8 MB of flash and 3 MB slots at under 30 % usage there is no reason to
+# compile IDF, lwIP and the Wi-Fi/Ethernet drivers for size instead of speed
+# in a project whose only job is packet throughput. Switch back to
+# CONFIG_COMPILER_OPTIMIZATION_SIZE only if the image ever stops fitting.
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 
-# --- Optional: Logging im Produktivbetrieb abschalten -----------------------
-# Spart etwas CPU und Flash. Zum Debuggen auskommentiert lassen.
+# --- Optional: disable logging in production --------------------------------
+# Saves a little CPU and flash. Leave commented out for debugging.
 #CONFIG_LOG_DEFAULT_LEVEL_NONE=y
 #CONFIG_LOG_DEFAULT_LEVEL=0
 #CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
 #CONFIG_BOOTLOADER_LOG_LEVEL=0
 
 # --- lwIP / HTTP / MQTT -----------------------------------------------------
-# Der Management-Stack ist bewusst klein gehalten - er bedient nur ein
-# Webinterface und eine MQTT-Verbindung, nicht den Bridge-Verkehr.
-# 8 war zu knapp und hat den Webserver komplett verhindert (am 2026-08-13 auf
-# echter Hardware gesehen: "max_open_sockets is too large (max allowed 5)",
-# danach "[WEB ] Start fehlgeschlagen" - das Board bot das Setup-WLAN an, war
-# darueber aber nicht konfigurierbar).
-# Rechnung: der HTTP-Server belegt 3 Sockets intern PLUS max_open_sockets,
-# und MQTT und DNS wollen auch noch welche. Bei 12 gehen 3+7 an den httpd
-# (web.cpp rechnet sich das selbst aus) und es bleiben 2 uebrig.
+# The management stack is deliberately small - it only serves a web UI and
+# one MQTT connection, not the bridged traffic.
+# 8 sockets are too few and prevent the web server from starting at all
+# ("max_open_sockets is too large (max allowed 5)").
+# Budget: the HTTP server uses 3 sockets internally PLUS max_open_sockets,
+# and MQTT and DNS need some too. With 12, 3+7 go to the httpd (web.cpp
+# computes this itself) and 2 remain.
 CONFIG_LWIP_MAX_SOCKETS=12
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
 CONFIG_LWIP_TCP_WND_DEFAULT=2880
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 
-# PFLICHT fuer den Management-Zugang von der Ethernet-Seite (siehe eth_rx_cb).
-# Ohne diese Option referenziert wlanif_input() den uebergebenen Puffer nur
-# (PBUF_REF), statt ihn zu kopieren - eth_rx_cb gibt seinen Puffer aber
-# unmittelbar danach frei, und lwIP wuerde auf totem Speicher arbeiten.
-# bridge.cpp hat dazu ein #error, das Abschalten faellt also beim Bauen auf.
-# Die Kopie kostet hier praktisch nichts: durch lwIP laeuft in diesem Entwurf
-# nur Management-Verkehr, der eigentliche Bridge-Strom geht daran vorbei.
+# REQUIRED for management access from the Ethernet side (see eth_rx_cb).
+# Without this option wlanif_input() only references the passed buffer
+# (PBUF_REF) instead of copying it - but eth_rx_cb frees its buffer right
+# afterwards, and lwIP would work on dead memory. bridge.cpp has an #error
+# for it, so disabling it is caught at build time.
+# The copy costs practically nothing here: in this design only management
+# traffic goes through lwIP, the actual bridge stream bypasses it.
 CONFIG_LWIP_L2_TO_L3_COPY=y
 CONFIG_MQTT_TRANSPORT_SSL=n
 CONFIG_MQTT_TRANSPORT_WEBSOCKET=n
 
-# --- OTA mit automatischem Rollback -----------------------------------------
-# Entscheidend fuer ein Board ohne seriellen Zugang: bootet die neue Firmware
-# nicht sauber durch und ruft nie esp_ota_mark_app_valid_cancel_rollback(),
-# faellt der Bootloader beim naechsten Start auf den alten Slot zurueck.
-# Ohne das bedeutet ein misslungenes Update: Board ausbauen.
+# --- OTA with automatic rollback --------------------------------------------
+# Crucial for a board without serial access: if the new firmware does not
+# boot cleanly and never calls esp_ota_mark_app_valid_cancel_rollback(), the
+# bootloader falls back to the old slot on the next boot.
+# Without this, a failed update means removing the board.
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 CONFIG_BOOTLOADER_WDT_ENABLE=y
 CONFIG_BOOTLOADER_WDT_TIME_MS=9000
 
-# --- Flash-Diaet ------------------------------------------------------------
+# --- Flash diet -------------------------------------------------------------
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n
 
-# Bluetooth wird nirgends benutzt.
+# Bluetooth is not used anywhere.
 CONFIG_BT_ENABLED=n
 
-# printf/scanf ohne Fliesskomma-Maschinerie. Der Code benutzt ausschliesslich
-# %d/%u/%s/%02x/%lu - kein %f, kein %g, kein %ll. Die volle newlib-Variante
-# zieht _vfprintf_r (11,4 kB), _svfprintf_r (11,2 kB), __ssvfscanf_r (8,7 kB)
-# und _dtoa_r/_strtod_l (6,5 kB) ins Image, also ~35 kB fuer nichts.
-# Falls hier je eine Fliesskommaausgabe dazukommt: Wert wieder auf n, sonst
-# erscheint statt der Zahl nur Buchstabensalat.
+# printf/scanf without the floating-point machinery. The code only uses
+# %d/%u/%s/%02x/%lu - no %f, no %g, no %ll. The full newlib variant pulls
+# _vfprintf_r (11.4 kB), _svfprintf_r (11.2 kB), __ssvfscanf_r (8.7 kB) and
+# _dtoa_r/_strtod_l (6.5 kB) into the image, i.e. ~35 kB for nothing.
+# If floating-point output is ever added: set this back to n, otherwise
+# garbage appears instead of the number.
 CONFIG_LIBC_NEWLIB_NANO_FORMAT=y
 
-# WPA2-Enterprise (802.1X / EAP) wird hier nie gebraucht - die Bridge haengt
-# an einem WLAN mit normalem PSK. Abschalten wirft den kompletten EAP-Stack
-# raus UND dessen mbedTLS-Abhaengigkeit (TLS-Handshake plus X.509-Parser).
-# Der Kconfig-Hilfetext beziffert das selbst mit rund 60 kB.
-# ACHTUNG: Soll die Bridge je in ein Firmennetz mit 802.1X, muss das zurueck
-# auf y - die esp_wifi_sta_wpa2_ent_*-APIs existieren sonst nicht.
+# WPA2-Enterprise (802.1X / EAP) is never needed here - the bridge connects
+# to a Wi-Fi with a normal PSK. Disabling it removes the whole EAP stack AND
+# its mbedTLS dependency (TLS handshake plus X.509 parser). The Kconfig help
+# text itself puts that at about 60 kB.
+# NOTE: if the bridge ever has to join a corporate network with 802.1X, this
+# must go back to y - the esp_wifi_sta_wpa2_ent_* APIs do not exist otherwise.
 CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=n
 
-# Kein IPv6. Die Management-Schnittstelle hat eine feste IPv4-Adresse, und der
-# gebridgte Verkehr laeuft als rohe Frames komplett an lwIP vorbei - der Client
-# hinter der Bridge kann also weiterhin ungestoert IPv6 sprechen, das beruehrt
-# diese Einstellung nicht.
+# No IPv6. The management interface has a fixed IPv4 address, and the bridged
+# traffic passes lwIP entirely as raw frames - so the client behind the bridge
+# can still speak IPv6 undisturbed, this setting does not affect it.
 CONFIG_LWIP_IPV6=n
 
-# Die WLAN-Zugangsdaten liegen in unserem eigenen NVS-Blob, und bridge.cpp
-# ruft esp_wifi_set_storage(WIFI_STORAGE_RAM) - die separate WiFi-eigene
-# NVS-Ablage der IDF ist damit toter Code.
+# The Wi-Fi credentials live in our own NVS blob, and bridge.cpp calls
+# esp_wifi_set_storage(WIFI_STORAGE_RAM) - IDF's separate Wi-Fi NVS storage
+# is dead code.
 CONFIG_ESP_WIFI_NVS_ENABLED=n
 
-# Asserts bleiben scharf (Absturz statt stillem Weiterlaufen -> der OTA-
-# Rollback greift), aber ohne die eingebetteten Datei- und Zeilen-Strings.
-# Bei einem Board ohne seriellen Zugang liest den Assert-Text ohnehin niemand.
+# Asserts stay active (crash instead of silently continuing -> the OTA
+# rollback kicks in), but without the embedded file and line strings.
+# On a board without serial access nobody reads the assert text anyway.
 CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
 
-# NICHT setzen: CONFIG_MBEDTLS_TLS_DISABLED=y
-# Verlockend, weil im Projekt nirgends TLS laeuft (MQTT im Klartext, Portal
-# per HTTP, OTA roh per POST) und der mbedTLS-Handshake trotzdem rund 30 kB
-# im Image belegt. Getestet am 2026-08-11: bricht beim Linken ab.
-# Grund: die Komponente esp-tls kompiliert esp_tls_mbedtls.c bedingungslos
-# und referenziert mbedtls_ssl_* hart; sie haengt ueber tcp_transport an
-# esp-mqtt. Der Linker kann die Pfade deshalb auch mit --gc-sections nicht
-# wegwerfen. Loesbar waere das nur, indem man esp-mqtt/tcp_transport aus dem
-# Abhaengigkeitsgraph nimmt (also MQTT-Telemetrie opfert) oder eine
-# IDF-Komponente patcht - beides den Platz aktuell nicht wert.
+# DO NOT set: CONFIG_MBEDTLS_TLS_DISABLED=y
+# Tempting, because no TLS runs anywhere in the project (plain-text MQTT,
+# portal over HTTP, raw OTA via POST) and the mbedTLS handshake still takes
+# about 30 kB in the image. It breaks at link time: the esp-tls component
+# compiles esp_tls_mbedtls.c unconditionally and references mbedtls_ssl_*
+# hard; it hangs off esp-mqtt via tcp_transport. So the linker cannot drop
+# those paths even with --gc-sections. Solvable only by removing
+# esp-mqtt/tcp_transport from the dependency graph (i.e. sacrificing MQTT
+# telemetry) or by patching an IDF component - neither worth the space.
 
-# Coredump ins Flash. Die alte Begruendung fuer "aus" ("koennen wir ohne
-# seriellen Zugang ohnehin nicht auswerten") war ein Trugschluss: gerade
-# WEIL das Board im Betrieb keinen seriellen Zugang hat, ist ein Absturz
-# sonst genau eine Information - "es hat neu gestartet". Mit Coredump liegt
-# der Stacktrace in der dafuer vorgesehenen Partition und ist spaeter
-# auslesbar (esp_core_dump_image_get() im Betrieb, espcoredump.py am Kabel).
-# Abgeschaltet war es urspruenglich wegen der 960-KB-Slots - bei 8 MB Flash
-# und 3-MB-Slots ist das kein Argument mehr.
+# Coredump to flash. Precisely BECAUSE the board has no serial access in
+# operation, a crash would otherwise be exactly one piece of information -
+# "it rebooted". With a coredump the stack trace sits in the dedicated
+# partition and can be read later (esp_core_dump_image_get() at runtime,
+# espcoredump.py via cable).
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
 CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
-# Nur die abgestuerzte Task sichern statt aller - passt bequem in 64 KB und
-# haelt den Schreibvorgang im Panic-Handler kurz.
+# Upper limit for the number of tasks in the dump - fits comfortably into
+# 64 KB and keeps the write in the panic handler short.
 CONFIG_ESP_COREDUMP_MAX_TASKS_NUM=32
 
-# Log-Strings der IDF-Treiber auf WARN. Unsere eigenen printf-Ausgaben sind
-# davon nicht betroffen, die bleiben immer sichtbar.
+# Log strings of the IDF drivers at WARN. Our own printf output is not
+# affected by this and always stays visible.
 CONFIG_LOG_DEFAULT_LEVEL_WARN=y
 CONFIG_LOG_DEFAULT_LEVEL=2

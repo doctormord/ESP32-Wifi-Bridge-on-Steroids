@@ -1,29 +1,29 @@
 # PlatformIO
 .pio/
 
-# Generierter, vollstaendig aufgeloester sdkconfig-Cache.
-# Wird aus sdkconfig.defaults erzeugt; einchecken fuehrt zu genau der Drift,
-# die in docs/content/history.md mehrfach Zeit gekostet hat.
+# Generated, fully resolved sdkconfig cache.
+# Produced from sdkconfig.defaults; committing it causes exactly the drift
+# that is described in CLAUDE.md ("sdkconfig drift").
 sdkconfig.wt32-eth01
 sdkconfig.wt32-eth01-minimal
-sdkconfig.nicemcu-c5-w5500
 sdkconfig.*.old
 
-# Build-Artefakte und Vergleichs-Images.
-# Die Rust-Vergleichsfirmware wurde mit einkompilierten WLAN-Zugangsdaten
-# gebaut - gehoert unter keinen Umstaenden in ein oeffentliches Repo.
+# Build artifacts and comparison images.
+# The comparison firmware in this folder was built with Wi-Fi credentials
+# compiled in - it must never end up in a public repository. (The folder
+# name is kept as is so the existing local directory stays ignored.)
 vergleich/
 *.bin
 *.elf
 
-# Von scripts/gen_build_info.py vor jedem Build neu geschrieben.
+# Rewritten by scripts/gen_build_info.py before every build.
 src/build_info.h
 
-# Von scripts/ota_flash.sh archivierte firmware.elf-Dateien (siehe *.elf
-# oben - hier nur der Ordner, aus Dokumentationsgruenden explizit).
+# firmware.elf files archived by scripts/ota_flash.sh (already covered by
+# *.elf above - the folder is listed explicitly for documentation).
 elf_archive/
 
-# Aus der Arduino-Zeit uebrig, wird nicht mehr gelesen
+# Leftover from the Arduino era, no longer read
 dependencies.lock
 
 .DS_Store

@@ -1,9 +1,15 @@
 /*
- * telemetry.cpp - MQTT-Anbindung inkl. Home-Assistant-Autodiscovery
+ * telemetry.cpp - MQTT connection including Home Assistant autodiscovery
  *
- * Laeuft erst, wenn das Management-Netif eine IP hat. Der MQTT-Client nutzt
- * denselben lwIP-Stack, den wir ueber die Selektivzustellung in bridge.cpp
- * mit Paketen versorgen.
+ * Only runs once the management netif has an IP. The MQTT client uses the
+ * same lwIP stack that the selective delivery in bridge.cpp feeds with
+ * packets.
+ *
+ * Topics (<node> = last three bytes of the STA MAC, hex):
+ *   bridge/<node>/state         periodic JSON state
+ *   bridge/<node>/availability  "online" / "offline" (last will)
+ *   bridge/<node>/watchdog      discrete watchdog events
+ *   homeassistant/...           retained discovery entries
  */
 
 #include "telemetry.h"
@@ -23,6 +29,8 @@ static char  s_base[48];
 static char  s_avail[64];
 static char  s_state[64];
 
+/* MQTT event handler: tracks the connection state, publishes "online" on
+ * connect and schedules a fresh discovery announcement after a reconnect. */
 static void mqtt_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
   (void)arg; (void)base;
   esp_mqtt_event_handle_t e = (esp_mqtt_event_handle_t)data;
@@ -30,13 +38,13 @@ static void mqtt_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
   switch ((esp_mqtt_event_id_t)id) {
     case MQTT_EVENT_CONNECTED:
       s_connected = true;
-      printf("[MQTT] Verbunden\n");
+      printf("[MQTT] Connected\n");
       esp_mqtt_client_publish(s_mqtt, s_avail, "online", 0, 1, 1);
       break;
     case MQTT_EVENT_DISCONNECTED:
       s_connected = false;
-      s_announced = false;      /* nach Reconnect neu ankuendigen */
-      printf("[MQTT] Getrennt\n");
+      s_announced = false;      /* announce again after reconnecting */
+      printf("[MQTT] Disconnected\n");
       break;
     default:
       (void)e;
@@ -44,7 +52,9 @@ static void mqtt_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
   }
 }
 
-/* Ein Discovery-Eintrag. Kurz gehalten, damit alles in einen Puffer passt. */
+/* Publish one Home Assistant sensor discovery entry (retained). `key` is the
+ * field in the state JSON; unit/devclass/stateclass/icon are optional (NULL).
+ * Kept short so everything fits into one buffer. */
 static void announce_one(const char *key, const char *name, const char *unit,
                          const char *devclass, const char *stateclass,
                          const char *icon) {
@@ -71,32 +81,45 @@ static void announce_one(const char *key, const char *name, const char *unit,
   esp_mqtt_client_publish(s_mqtt, topic, payload, 0, 1, 1);
 }
 
+/* Publish all discovery entries (sensors plus the Ethernet link binary
+ * sensor). Called on the first telemetry tick after each (re)connect. */
 static void announce_all(void) {
-  announce_one("rssi",     "Signalstaerke",       "dBm", "signal_strength", "measurement", NULL);
-  announce_one("ch",       "WLAN-Kanal",          NULL,  NULL, NULL, "mdi:wifi");
-  announce_one("kbps_up",  "Durchsatz LAN-WLAN",  "kbit/s", "data_rate", "measurement", NULL);
-  announce_one("kbps_down","Durchsatz WLAN-LAN",  "kbit/s", "data_rate", "measurement", NULL);
-  announce_one("drop_up",  "Verworfen LAN-WLAN",  "pkt", NULL, "total_increasing", "mdi:alert");
-  announce_one("drop_down","Verworfen WLAN-LAN",  "pkt", NULL, "total_increasing", "mdi:alert");
-  announce_one("uptime",   "Laufzeit",            "s",   "duration", "total_increasing", NULL);
-  announce_one("heap",     "Freier Heap",         "B",   NULL, "measurement", "mdi:memory");
-  /* Die IP des gebridgten Geraets. Fuer eine Kamera ohne eigenes Display ist
-   * das oft die einzige Moeglichkeit herauszufinden, unter welcher Adresse
-   * sie zu erreichen ist - die Bridge sieht sie im Datenpfad ohnehin. */
-  announce_one("client_ip","IP des Clients",      NULL,  NULL, NULL, "mdi:ip-network");
-  /* Steigen bei jeder Watchdog-Eskalation (Ethernet- bzw. WLAN-Stufe) - allein
-   * die Tendenz ist das Signal, nicht der Absolutwert. Der erzwungene
-   * Neustart (letzte Stufe) ist hier NICHT gesondert sichtbar - dafuer gibt
-   * es telemetry_note_watchdog_event() und den Coredump. */
-  announce_one("wd_reconnects","Watchdog-WLAN-Reconnects",NULL, NULL, "total_increasing", "mdi:wifi-refresh");
-  announce_one("wd_eth_resets","Watchdog-Ethernet-Resets",NULL, NULL, "total_increasing", "mdi:lan-connect");
-  announce_one("roam_count","Aktive AP-Wechsel",NULL, NULL, "total_increasing", "mdi:wifi-arrow-left-right");
+  announce_one("rssi",     "Signal strength",     "dBm", "signal_strength", "measurement", NULL);
+  announce_one("ch",       "Wi-Fi channel",       NULL,  NULL, NULL, "mdi:wifi");
+  announce_one("kbps_up",  "Throughput LAN to Wi-Fi", "kbit/s", "data_rate", "measurement", NULL);
+  announce_one("kbps_down","Throughput Wi-Fi to LAN", "kbit/s", "data_rate", "measurement", NULL);
+  announce_one("drop_up",  "Dropped LAN to Wi-Fi", "pkt", NULL, "total_increasing", "mdi:alert");
+  announce_one("drop_down","Dropped Wi-Fi to LAN", "pkt", NULL, "total_increasing", "mdi:alert");
+  announce_one("uptime",   "Uptime",              "s",   "duration", "total_increasing", NULL);
+  announce_one("heap",     "Free heap",           "B",   NULL, "measurement", "mdi:memory");
+  /* IP of the bridged device. For a camera without its own display this is
+   * often the only way to find out under which address it is reachable - the
+   * bridge sees it in the data path anyway. */
+  announce_one("client_ip","Client IP",           NULL,  NULL, NULL, "mdi:ip-network");
+  /* Increase with every watchdog escalation (Ethernet or Wi-Fi level) - the
+   * trend is the signal, not the absolute value. The forced reboot (highest
+   * level) is NOT visible here separately - telemetry_note_watchdog_event()
+   * and the coredump cover that. */
+  announce_one("wd_reconnects","Watchdog Wi-Fi reconnects",NULL, NULL, "total_increasing", "mdi:wifi-refresh");
+  announce_one("wd_eth_resets","Watchdog Ethernet resets",NULL, NULL, "total_increasing", "mdi:lan-connect");
+  announce_one("roam_count","Active AP switches",NULL, NULL, "total_increasing", "mdi:wifi-arrow-left-right");
+  /* All Wi-Fi disconnects since boot and the reason of the last one - the
+   * history with RSSI/AP/duration is available at /api/disconnects. */
+  announce_one("wifi_disc","Wi-Fi disconnects total",NULL, NULL, "total_increasing", "mdi:wifi-off");
+  /* Only real drops of an existing connection, without the failed attempts
+   * that follow - this is the meaningful curve. */
+  announce_one("wifi_kicks","Wi-Fi drops",NULL, NULL, "total_increasing", "mdi:wifi-alert");
+  announce_one("disc_reason","Last drop reason",NULL, NULL, NULL, "mdi:wifi-alert");
+  /* Uplink health: how long frames wait in the driver's TX queue (rises long
+   * before frames get lost) and frames the MAC gave up on, on the air. */
+  announce_one("txq_ms",   "TX queue delay",      "ms",  "duration", "measurement", NULL);
+  announce_one("air_fail", "Frames lost on air",  NULL,  NULL, "total_increasing", "mdi:wifi-strength-alert-outline");
 
   char topic[160], payload[512];
   snprintf(topic, sizeof(topic),
            "homeassistant/binary_sensor/bridge_%s/eth/config", s_node);
   snprintf(payload, sizeof(payload),
-    "{\"name\":\"Ethernet-Link\",\"uniq_id\":\"bridge_%s_eth\","
+    "{\"name\":\"Ethernet link\",\"uniq_id\":\"bridge_%s_eth\","
     "\"stat_t\":\"%s\",\"avty_t\":\"%s\","
     "\"val_tpl\":\"{{ 'ON' if value_json.eth == 1 else 'OFF' }}\","
     "\"dev_cla\":\"connectivity\","
@@ -105,12 +128,15 @@ static void announce_all(void) {
   esp_mqtt_client_publish(s_mqtt, topic, payload, 0, 1, 1);
 
   s_announced = true;
-  printf("[MQTT] Discovery gesendet\n");
+  printf("[MQTT] Discovery sent\n");
 }
 
+/* See telemetry.h. Derives the node id and topics from the STA MAC (= the
+ * cloned client MAC), configures the last will on the availability topic and
+ * starts the client asynchronously. */
 bool telemetry_start(void) {
   if (g_cfg.mqtt_host[0] == '\0') {
-    printf("[MQTT] Kein Broker konfiguriert - uebersprungen\n");
+    printf("[MQTT] No broker configured - skipped\n");
     return false;
   }
 
@@ -138,14 +164,16 @@ bool telemetry_start(void) {
   }
 
   s_mqtt = esp_mqtt_client_init(&cfg);
-  if (!s_mqtt) { printf("[MQTT] Init fehlgeschlagen\n"); return false; }
+  if (!s_mqtt) { printf("[MQTT] Init failed\n"); return false; }
 
   esp_mqtt_client_register_event(s_mqtt, MQTT_EVENT_ANY, mqtt_evt, NULL);
   esp_mqtt_client_start(s_mqtt);
-  printf("[MQTT] Verbinde zu %s\n", uri);
+  printf("[MQTT] Connecting to %s\n", uri);
   return true;
 }
 
+/* See telemetry.h. Sends the discovery entries first if needed, then the
+ * state JSON (QoS 0, not retained). */
 void telemetry_tick(void) {
   if (!s_mqtt || !s_connected) return;
 
@@ -159,24 +187,29 @@ void telemetry_tick(void) {
   BridgeStats st;
   bridge_get_stats(&st);
 
-  char payload[500];
+  char payload[600];
   snprintf(payload, sizeof(payload),
     "{\"rssi\":%d,\"ch\":%u,\"kbps_up\":%lu,\"kbps_down\":%lu,"
     "\"pkt_up\":%lu,\"pkt_down\":%lu,\"drop_up\":%lu,\"drop_down\":%lu,"
+    "\"wifi_disc\":%lu,\"wifi_kicks\":%lu,\"disc_reason\":\"%s\","
     "\"wd_reconnects\":%lu,\"wd_eth_resets\":%lu,\"roam_count\":%lu,"
     "\"eth\":%d,\"uptime\":%lu,\"heap\":%lu,\"bssid\":\"%s\","
-    "\"client_ip\":\"%s\"}",
+    "\"client_ip\":\"%s\",\"txq_ms\":%lu,\"air_fail\":%lu}",
     (int)st.rssi, (unsigned)st.channel,
     (unsigned long)st.kbps_eth2wifi, (unsigned long)st.kbps_wifi2eth,
     (unsigned long)st.pkt_eth2wifi,  (unsigned long)st.pkt_wifi2eth,
     (unsigned long)st.drop_eth2wifi, (unsigned long)st.drop_wifi2eth,
+    (unsigned long)st.wifi_disc_count, (unsigned long)st.wifi_kicks,
+    st.disc_last_reason ? bridge_wifi_reason_str(st.disc_last_reason) : "-",
     (unsigned long)st.wd_reconnects, (unsigned long)st.wd_eth_resets, (unsigned long)st.roam_count,
     st.eth_link ? 1 : 0, (unsigned long)(millis() / 1000),
-    (unsigned long)esp_get_free_heap_size(), st.bssid, st.client_ip);
+    (unsigned long)esp_get_free_heap_size(), st.bssid, st.client_ip,
+    (unsigned long)st.txq_delay_ms, (unsigned long)st.air_fail);
 
   esp_mqtt_client_publish(s_mqtt, s_state, payload, 0, 0, 0);
 }
 
+/* See telemetry.h. */
 void telemetry_note_watchdog_event(const char *action, const char *reason) {
   if (!s_mqtt || !s_connected) return;
 
@@ -187,10 +220,10 @@ void telemetry_note_watchdog_event(const char *action, const char *reason) {
   snprintf(payload, sizeof(payload), "{\"action\":\"%s\",\"reason\":\"%s\",\"uptime\":%lu}",
            action, reason ? reason : "", (unsigned long)(millis() / 1000));
 
-  /* qos 1, nicht retained - ein Ereignis, kein Dauerzustand. Wird bewusst
-   * synchron/blockierend aus der Watchdog-Eskalation heraus aufgerufen (auch
-   * kurz vor einem erzwungenen Neustart) - esp_mqtt_client_publish() selbst
-   * kehrt sofort zurueck, den Versand muss der Aufrufer mit einer kurzen
-   * Pause abwarten, siehe watchdog_tick() in bridge.cpp. */
+  /* QoS 1, not retained - an event, not a persistent state. Called
+   * synchronously from the watchdog escalation (also right before a forced
+   * reboot) - esp_mqtt_client_publish() itself returns immediately, so the
+   * caller has to wait briefly for it to go out, see watchdog_tick() in
+   * bridge.cpp. */
   esp_mqtt_client_publish(s_mqtt, topic, payload, 0, 1, 0);
 }

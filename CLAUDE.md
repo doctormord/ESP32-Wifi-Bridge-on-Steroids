@@ -27,10 +27,7 @@ The pioarduino `platform-espressif32` rejects Python ≥ 3.14 outright in its `p
 
 Moving `~/.platformio/platforms/espressif32` out of the way does *not* work as a dodge: PlatformIO re-downloads it from the URL in `platformio.ini`, and the current release carries the same check.
 
-There are two environments, built from the same sources; no separate test suite (this is embedded firmware — verification is build success + on-device serial log behavior):
-
-- `wt32-eth01` — ESP32 + internal EMAC + LAN8720A (the original target, 8 MB flash).
-- `nicemcu-c5-w5500` — NiceMCU ESP32-C5_MINI_V1.0 (ESP32-C5HF4: single-core RISC-V, dual-band Wi-Fi 6, 4 MB in-package flash, no PSRAM, native USB) + a W5500 over SPI. See "Second target" below.
+There is only one environment (`wt32-eth01`); no separate test suite (this is embedded firmware — verification is build success + on-device serial log behavior).
 
 ### Flash budget
 
@@ -49,6 +46,15 @@ The same split applies to flash *frequency*: `CONFIG_ESPTOOLPY_FLASHFREQ` may st
 ### sdkconfig drift
 
 `sdkconfig.wt32-eth01` is a generated, fully-resolved cache of `sdkconfig.defaults` + component Kconfig defaults. PlatformIO/ESP-IDF only fills in options *missing* from it — an explicit value already present (e.g. from a previous build with different settings) silently wins over a later change to `sdkconfig.defaults`. If build behavior doesn't match what `sdkconfig.defaults` says it should (wrong flash size, unexpectedly large binary, a Kconfig-gated header suddenly missing), suspect drift first: delete `sdkconfig.wt32-eth01` and let it regenerate from `sdkconfig.defaults` on the next `pio run`, rather than hand-editing the cached file.
+
+## Language and comment conventions
+
+These rules are binding for every change, in every file (C/C++, headers, CMake, `platformio.ini`, `sdkconfig.defaults`, partition tables, scripts):
+
+- **English only.** All code comments, identifiers, serial log messages, MQTT/Home Assistant names, API error strings and the entire web portal UI (`PAGE[]` in `web.cpp`: labels, hints, buttons, status texts, JS messages) are English. No German anywhere in the code base. New text in `docs/content/` is English as well; `history.md` is append-only, so its existing (partly German) entries are not rewritten.
+- **Every function gets a comment** explaining what it does, how it works and why it exists — written so that someone new to the project can follow it without reading the git log. Non-obvious constraints (buffer ownership, IRAM, task context, ordering requirements) belong there.
+- **Comments describe the code as it is, not how it got there.** No dates, no incident narratives ("seen on 2026-08-14 in the lab"), no "previously this was X", no "I first tried …", no field-appended-on markers. Keep the *reason* a design decision was made (e.g. "retries default to 8 because dropped UDP frames are lost for good"), drop the story. History belongs in `docs/content/history.md`, open work in `docs/content/backlog.md`.
+- **Nothing personal in the code**: no personal names, home/lab locations, specific personal devices, private network details. Use neutral wording ("the bridged client", "an IP camera", "a second site").
 
 ## Architecture
 
@@ -98,14 +104,3 @@ Optional MQTT client (only starts if `mqtt_host` is configured), publishes state
 ### Partition layout
 
 `partitions_8mb_ota.csv` is the live table: 24 KB NVS, 8 KB otadata, two 3 MB OTA app slots, a 64 KB coredump partition, ~1.8 MB unallocated reserve. The partition table cannot be changed via OTA, hence the generous slots. App partitions must start on 64 KB boundaries, hence the gap after otadata. (`partitions_2mb_ota.csv` is the obsolete leftover from the mistaken 2 MB belief — not referenced by the build.)
-
-### Second target: ESP32-C5 + W5500 (`nicemcu-c5-w5500`)
-
-Target differences are compile-time switches, not a fork: `CONFIG_ETH_USE_ESP32_EMAC` vs `CONFIG_ETH_SPI_ETHERNET_W5500` (Ethernet init and pins in `bridge.cpp`), `CONFIG_SOC_WIFI_SUPPORT_5G` (dual-band: `esp_wifi_set_band_mode(AUTO)` + the plural `esp_wifi_set_protocols`/`_bandwidths`, because the singular APIs return `ESP_ERR_NOT_SUPPORTED` in auto-band mode), `CONFIG_IDF_TARGET_ESP32C5` (factory-reset pin IO4), and `CONFIG_IDF_TARGET_ARCH_XTENSA` (`/api/coredump`: RISC-V has no on-device backtrace, it reports `ra`/`mcause`/`mtval` instead). C5-only Kconfig lives in `sdkconfig.defaults.esp32c5`, which ESP-IDF loads automatically on top of `sdkconfig.defaults` for that target; partitions are `partitions_4mb_ota.csv` (2 × 1920 KB).
-
-Wiring (all four SPI lines on the SPI2 IO_MUX pins, so the GPIO matrix is bypassed): SCLK IO6, MOSI IO7, MISO IO2, CS IO10, INT IO9, RST IO8. IO2/IO7 are strapping pins but harmless in these roles. The BOOT button (IO28) can't be the factory reset — held at reset it enters download mode.
-
-W5500 specifics that matter for the data path:
-- The IDF W5500 driver sets "block multicast" in MACRAW mode; `eth_set_bridge_filters()` clears it via `ETH_CMD_S_ALL_MULTICAST` alongside promiscuous. Keep both whenever the driver is (re)started.
-- 80 MHz SPI is the W5500's *theoretical* max; only 33.3 MHz is guaranteed. `bridge_eth_init()` steps down 80 → 40 → 20 MHz if the chip-version check at init fails, but that only catches gross failures, not marginal bit errors later.
-- `emac_w5500_transmit()` busy-polls SEND_OK for every frame, and it runs inside `wifi_rx_cb`. Wi-Fi→Ethernet is therefore serialized at roughly SPI-transfer + wire time per frame (~0.3 ms per 1500 B at 80 MHz), and the Wi-Fi RX path is blocked meanwhile. The C5 is also single-core, so Wi-Fi, the W5500 task and lwIP share one CPU. Don't expect WT32-EMAC numbers without measuring.

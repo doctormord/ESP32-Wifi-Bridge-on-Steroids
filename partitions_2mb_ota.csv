@@ -1,22 +1,21 @@
 # ============================================================================
-#  Partitionstabelle fuer WT32-ETH01 mit 2 MB Flash, mit OTA
+#  OBSOLETE - not referenced by the build. The live table is
+#  partitions_8mb_ota.csv; the board has 8 MB of flash, not 2 MB.
+#
+#  Partition table for the WT32-ETH01 with 2 MB flash, with OTA
 # ============================================================================
-#  Die Espressif-Standardtabellen (min_spiffs.csv, default_16MB.csv etc.)
-#  sind fuer 4 MB+ ausgelegt und passen nicht in 2 MB. Diese Tabelle ist
-#  von Hand auf exakt 2 MB (0x200000 Byte) zugeschnitten:
+#  The Espressif standard tables (min_spiffs.csv, default_16MB.csv etc.) are
+#  designed for 4 MB+ and do not fit into 2 MB. This table is cut by hand to
+#  exactly 2 MB (0x200000 bytes):
 #
-#    nvs      24 KB   - Konfiguration (BridgeConfig) + WiFi-Kalibrierung
-#    otadata   8 KB   - merkt sich, welcher App-Slot aktiv ist
-#    app0    960 KB   - OTA-Slot 0
-#    app1    960 KB   - OTA-Slot 1
+#    nvs      24 KB   - configuration (BridgeConfig) + Wi-Fi calibration
+#    otadata   8 KB   - remembers which app slot is active
+#    app0    960 KB   - OTA slot 0
+#    app1    960 KB   - OTA slot 1
 #
-#  App-Partitionen muessen auf 64-KB-Grenzen beginnen (mmap-Anforderung der
-#  MMU) - deshalb die Luecke zwischen otadata-Ende (0x11000) und app0-Start
-#  (0x20000). Ergebnis nutzt die 2 MB bis auf das letzte Byte aus.
-#
-#  960 KB pro Slot ist mit lwIP + HTTP-Server + MQTT + WiFi + Ethernet-Treiber
-#  eng, aber machbar. Falls der Build zu gross wird, siehe Kommentar in
-#  platformio.ini unter [env:wt32-eth01].
+#  App partitions must start on 64 KB boundaries (MMU mmap requirement) -
+#  hence the gap between the end of otadata (0x11000) and the start of app0
+#  (0x20000). The result uses the 2 MB down to the last byte.
 # ----------------------------------------------------------------------------
 # Name,     Type, SubType,  Offset,   Size,     Flags
 nvs,        data, nvs,      0x9000,   0x6000,
