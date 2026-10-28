@@ -432,10 +432,10 @@ Home Assistant creates one device with sensors for signal strength, Wi-Fi channe
 | RST | IO3 |
 
 - **SPI clock:** 80 MHz is the W5500's theoretical maximum (33.3 MHz guaranteed). The firmware tries 80 → 53.3 → 40 → 20 MHz and keeps the first clock at which the chip identifies itself; with SCLK/MOSI routed through the GPIO matrix (these are not the SPI2 IO_MUX pins) the reference wiring ends up at **53 MHz** (`spi` in `/api/status`). That check only catches gross failures — marginal wiring shows up later as TCP retransmissions.
-- **Keep INT off IO12** (UART0 RX): the W5500 keeps running through a reset and holds INT low, which can keep the ROM's serial download from working.
+- **INT is on IO15, not IO12** (UART0 RX) as a precaution: the W5500 keeps running through a reset and holds INT low, and the ROM's download mode also listens on UART0 RX. This is *not* why the automatic reset into download mode over USB fails (see below) — that happens with INT on IO15 as well.
 - **Own W5500 MAC driver** (`src/w5500_mac.c`) instead of ESP-IDF's: transmit only queues the frame (16-slot ring), the next frame is written to the chip while the previous one is still on the wire, received frames are fetched several per SPI transfer, and large transfers run interrupt-driven so the single core stays free for Wi-Fi. About 4 SPI transactions per frame instead of ~10. IDF's driver is still used for the W5500's PHY.
 - **Factory reset is GPIO4**, not the BOOT button (IO28): held at reset, BOOT enters download mode.
-- **Console and flashing over the USB-C port** (USB-Serial/JTAG, `/dev/cu.usbmodem*`). On macOS the port only delivers output while the host asserts DTR. Automatic reset into download mode is unreliable on this board — after the first flash, use OTA.
+- **Console and flashing over the USB-C port** (USB-Serial/JTAG, `/dev/cu.usbmodem*`). On macOS the port only delivers output while the host asserts DTR. esptool's automatic reset into download mode does not work on this board: it fails with "No serial data received" and leaves the board hung until it is power-cycled. Flash the first time with BOOT held while plugging in USB, then use OTA.
 
 ### Wiring for flashing
 
