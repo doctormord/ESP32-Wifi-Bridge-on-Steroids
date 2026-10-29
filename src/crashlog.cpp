@@ -212,10 +212,26 @@ void crashlog_boot(bool watchdog_restart) {
       } else {
         r.flags |= CRASH_F_STALE_DUMP;
       }
+      /* No new dump and no heartbeat of the previous boot: that boot did not
+       * get as far as the first heartbeat (~1 s), and the panic left nothing
+       * behind. That is what a supply that bounces while being plugged in
+       * produces - the chip starts, faults in the voltage dip and restarts
+       * itself, so this boot reports a panic instead of a power-on. */
+      if ((r.flags & CRASH_F_STALE_DUMP) && !prev_valid) r.flags |= CRASH_F_SUPPLY;
     }
-    log_prepend(&r);
+    /* Repeated supply glitches of the same build would push every real
+     * crash out of the short history: count them in the newest entry. */
+    crash_rec_t *top = s_log.n ? &s_log.r[0] : NULL;
+    if ((r.flags & CRASH_F_SUPPLY) && top && (top->flags & CRASH_F_SUPPLY) &&
+        top->rst == r.rst && strcmp(top->build, r.build) == 0) {
+      if (top->repeat < 255) top->repeat++;
+      if (r.epoch) top->epoch = r.epoch;
+    } else {
+      log_prepend(&r);
+    }
     log_save();
-    printf("[CRSH] Unexpected reset (reason %d) recorded\n", (int)rr);
+    printf("[CRSH] Unexpected reset (reason %d%s) recorded\n", (int)rr,
+           (r.flags & CRASH_F_SUPPLY) ? ", probably a supply glitch at power-on" : "");
   } else if (!exists) {
     /* Very first boot with the history: an existing coredump predates it -
      * import it once, time unknown. */

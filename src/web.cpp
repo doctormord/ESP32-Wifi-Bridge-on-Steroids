@@ -743,10 +743,12 @@ async function checkCrashes(){
     $('crtab').innerHTML='<tr>'+['When','Kind','Task / reason','Build'].map(t=>TD(t,1)).join('')+'</tr>'+
       j.recs.map(c=>{
         const when=c.e?ts(c.e):(c.f&4?'unknown (before history existed)':'unknown (clock not set)');
-        let kind=(c.f&2)?'Watchdog reboot (intended)':(RST[c.rst]||('Reset '+c.rst));
+        let kind=(c.f&2)?'Watchdog reboot (intended)':(c.f&32)?'Power-on glitch':(RST[c.rst]||('Reset '+c.rst));
+        if(c.n>1)kind+=' <span class="hint">&times;'+c.n+'</span>';
         const det=(c.f&1)?'<b>'+esc(c.task)+'</b> @ 0x'+c.pc+(c.reason?'<br>'+esc(c.reason):'')+
             (c.bt.length?'<br><span class="hint">BT: '+c.bt.map(a=>'0x'+a).join(' ')+(c.f&8?' (incomplete)':'')+'</span>':'')
-          :(c.f&16?'<span class="hint">no new dump written</span>':'<span class="hint">no dump (reset without coredump)</span>');
+          :(c.f&32?'<span class="hint">panic right after power-on, no dump, no heartbeat - usually the supply bouncing while plugged in</span>'
+          :c.f&16?'<span class="hint">no new dump written</span>':'<span class="hint">no dump (reset without coredump)</span>');
         return '<tr>'+TD(when+(c.up>=0?'<br><span class="hint">after '+sdur(c.up)+' uptime</span>':''))+
           TD(kind)+TD(det)+TD(esc(c.build))+'</tr>';
       }).join('');
@@ -2197,11 +2199,11 @@ static esp_err_t h_crashes_get(httpd_req_t *r) {
     for (uint8_t k = 0; k < c->bt_n && k < 8; k++)
       b += snprintf(bt + b, sizeof(bt) - b, "%s\"%08lx\"", k ? "," : "", (unsigned long)c->bt[k]);
     o += snprintf(buf + o, cap - o,
-      "%s{\"e\":%lu,\"up\":%ld,\"rst\":%u,\"f\":%u,\"build\":\"%s\",\"task\":\"%s\","
+      "%s{\"e\":%lu,\"up\":%ld,\"rst\":%u,\"f\":%u,\"n\":%u,\"build\":\"%s\",\"task\":\"%s\","
       "\"pc\":\"%08lx\",\"reason\":\"%s\",\"bt\":[%s]}",
       i ? "," : "", (unsigned long)c->epoch,
       c->uptime_s == 0xFFFFFFFFu ? -1L : (long)c->uptime_s,
-      (unsigned)c->rst, (unsigned)c->flags, build, task,
+      (unsigned)c->rst, (unsigned)c->flags, (unsigned)c->repeat + 1u, build, task,
       (unsigned long)c->pc, reason, bt);
   }
   if (o < cap) o += snprintf(buf + o, cap - o, "]}");

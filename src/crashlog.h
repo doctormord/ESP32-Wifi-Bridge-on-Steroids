@@ -24,6 +24,9 @@
 #define CRASH_F_IMPORTED  0x04u   /* written before the history existed */
 #define CRASH_F_BT_CORRUPT 0x08u  /* backtrace incomplete according to the coredump */
 #define CRASH_F_STALE_DUMP 0x10u  /* panic, but no new image was written */
+#define CRASH_F_SUPPLY    0x20u   /* panic without a new dump and without the RTC
+                                   * heartbeat: most likely the supply bouncing
+                                   * at power-on, not a firmware fault */
 
 typedef struct {
   uint32_t epoch;        /* crash time UTC, 0 = unknown (clock not set) */
@@ -31,7 +34,8 @@ typedef struct {
   uint8_t  rst;          /* esp_reset_reason_t, 0xFF = unknown (import) */
   uint8_t  flags;        /* CRASH_F_* */
   uint8_t  bt_n;
-  uint8_t  _pad;
+  uint8_t  repeat;       /* further identical CRASH_F_SUPPLY resets merged into
+                          * this entry (see crashlog_boot()) */
   char     build[12];    /* GIT_REV of the crashed image */
   char     task[16];
   uint32_t pc;
