@@ -35,6 +35,7 @@
 #include "build_info.h"
 #include "crashlog.h"
 #include "conlog.h"
+#include "cpustat.h"
 
 #define AP_PASSWORD   "bridgesetup"   /* at least 8 characters, otherwise open */
 
@@ -1236,7 +1237,7 @@ static esp_err_t h_status(httpd_req_t *r) {
   bridge_get_stats(&st);
   uint32_t lr_el, lr_tot;
   bridge_long_tune_progress(&lr_el, &lr_tot);
-  uint32_t ethd[4];
+  uint32_t ethd[5];
   bridge_get_eth_drv_stats(ethd);
 
   char buf[1450];
@@ -1256,7 +1257,7 @@ static esp_err_t h_status(httpd_req_t *r) {
     "\"pt\":%d,\"pt_s\":%u,\"pt_k\":%d,\"pt_r\":%d,"
     "\"drop_cap\":%lu,\"txq_cap\":%u,\"qc\":%d,\"qc_s\":%u,\"qc_k\":%u,\"qc_r\":%d,\"all\":%d,"
     "\"lr\":%d,\"lr_k\":%u,\"lr_el\":%lu,\"lr_tot\":%lu,\"lr_r\":%u,"
-    "\"spi\":%u,\"w5\":[%lu,%lu,%lu,%lu],\"rst\":%u,\"rtc\":%d,\"time\":%lu,\"build\":\"" GIT_REV "\"}",
+    "\"spi\":%u,\"w5\":[%lu,%lu,%lu,%lu,%lu],\"rst\":%u,\"rtc\":%d,\"time\":%lu,\"build\":\"" GIT_REV "\"}",
     s_provisioning ? 1 : 0, st.wifi_up ? 1 : 0, st.eth_link ? 1 : 0,
     (int)st.rssi, (unsigned)st.channel,
     (unsigned long)st.kbps_eth2wifi, (unsigned long)st.kbps_wifi2eth,
@@ -1315,9 +1316,10 @@ static esp_err_t h_status(httpd_req_t *r) {
     (unsigned long)lr_el, (unsigned long)lr_tot, bridge_long_tune_result(),
     /* W5500 SPI clock in MHz, 0 = internal EMAC. */
     (unsigned)bridge_get_eth_spi_mhz(),
-    /* Ethernet driver drops: TX ring full, SEND timeout, RX resync, RX no
-     * heap (see bridge_get_eth_drv_stats()). */
+    /* Ethernet driver: drops (TX ring full, SEND timeout, RX resync, RX no
+     * heap) and incomplete RX rounds (see bridge_get_eth_drv_stats()). */
     (unsigned long)ethd[0], (unsigned long)ethd[1], (unsigned long)ethd[2], (unsigned long)ethd[3],
+    (unsigned long)ethd[4],
     /* Why this boot happened (esp_reset_reason_t) and whether RTC memory
      * survived it - see crashlog.h. */
     (unsigned)crashlog_reset_reason(), crashlog_rtc_retained() ? 1 : 0,
@@ -2221,6 +2223,90 @@ static esp_err_t h_log(httpd_req_t *r) {
   return httpd_resp_send(r, buf, n);
 }
 
+/* GET /api/cpu - CPU load per task over the last and the busiest window
+ * (see cpustat.h); ?reset=1 forgets the busiest one first, so a new load
+ * test starts clean. Admin key, like the other diagnostics. */
+static esp_err_t h_cpu(httpd_req_t *r) {
+  if (!admin_key_ok(r)) {
+    httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "wrong key");
+    return ESP_FAIL;
+  }
+  char q[16], v[4];
+  if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK &&
+      httpd_query_key_value(q, "reset", v, sizeof(v)) == ESP_OK && atoi(v)) {
+    cpustat_reset_peak();
+  }
+  char buf[900];
+  const size_t n = cpustat_json(buf, sizeof(buf));
+  httpd_resp_set_type(r, "application/json");
+  httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+  return httpd_resp_send(r, buf, n);
+}
+
+/* Largest test transfer GET/POST /api/speed accepts, in MiB. */
+#define SPEED_MAX_MB 200
+
+/* GET /api/speed?mb=N - send N MiB (default 20) of zeros from the management
+ * stack. Together with POST it measures what the bridge's own Wi-Fi link
+ * carries at its location, without the Ethernet side involved: if this is
+ * no faster than traffic through the bridge, the radio link is the limit,
+ * not the Ethernet driver. Admin key; occupies the HTTP server while it
+ * runs. */
+static esp_err_t h_speed_get(httpd_req_t *r) {
+  if (!admin_key_ok(r)) {
+    httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "wrong key");
+    return ESP_FAIL;
+  }
+  uint32_t mb = 20;
+  char q[16], v[8];
+  if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK &&
+      httpd_query_key_value(q, "mb", v, sizeof(v)) == ESP_OK) {
+    mb = (uint32_t)strtoul(v, NULL, 10);
+  }
+  if (mb < 1) mb = 1;
+  if (mb > SPEED_MAX_MB) mb = SPEED_MAX_MB;
+
+  static const uint8_t zeros[4096] = {};
+  httpd_resp_set_type(r, "application/octet-stream");
+  httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+  const uint32_t chunks = mb * (1024 * 1024 / sizeof(zeros));
+  for (uint32_t i = 0; i < chunks; i++) {
+    if (httpd_resp_send_chunk(r, (const char *)zeros, sizeof(zeros)) != ESP_OK) return ESP_FAIL;
+  }
+  return httpd_resp_send_chunk(r, NULL, 0);
+}
+
+/* POST /api/speed - read and discard the request body, reply with its size
+ * and the time it took: the upload half of the Wi-Fi-only measurement (see
+ * h_speed_get()). Admin key. */
+static esp_err_t h_speed_post(httpd_req_t *r) {
+  if (!admin_key_ok(r)) {
+    httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "wrong key");
+    return ESP_FAIL;
+  }
+  if (r->content_len > (size_t)SPEED_MAX_MB * 1024 * 1024) {
+    httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "too large");
+    return ESP_FAIL;
+  }
+  static char sink[4096];
+  const int64_t t0 = esp_timer_get_time();
+  size_t left = r->content_len, got = 0;
+  while (left > 0) {
+    const int n = httpd_req_recv(r, sink, left < sizeof(sink) ? left : sizeof(sink));
+    if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;
+    if (n <= 0) return ESP_FAIL;
+    left -= (size_t)n;
+    got += (size_t)n;
+  }
+  const uint32_t ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+  char out[96];
+  snprintf(out, sizeof(out), "{\"bytes\":%lu,\"ms\":%lu,\"kbps\":%lu}",
+           (unsigned long)got, (unsigned long)ms,
+           (unsigned long)(ms ? (uint64_t)got * 8 / ms : 0));
+  httpd_resp_set_type(r, "application/json");
+  return httpd_resp_sendstr(r, out);
+}
+
 #ifdef BRIDGE_PANIC_TEST
 /* POST /api/panic_test - deliberately crash, to verify on real hardware that
  * a panic writes a coredump and that RTC and .noinit RAM (crash heartbeat,
@@ -2247,7 +2333,7 @@ bool web_start(bool provisioning) {
 
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.stack_size       = 6144;
-  cfg.max_uri_handlers = 18;    /* currently 16 routes (uris[] below) - if this
+  cfg.max_uri_handlers = 24;    /* currently 21 routes (uris[] below) - if this
                                  * is too small, registration fails silently */
   cfg.recv_wait_timeout = 20;   /* the OTA upload needs patience */
   cfg.lru_purge_enable = true;
@@ -2290,6 +2376,9 @@ bool web_start(bool provisioning) {
     { "/api/crashes", HTTP_GET,    h_crashes_get,     NULL },
     { "/api/crashes", HTTP_DELETE, h_crashes_delete,  NULL },
     { "/api/log",     HTTP_GET,    h_log,             NULL },
+    { "/api/cpu",     HTTP_GET,    h_cpu,             NULL },
+    { "/api/speed",   HTTP_GET,    h_speed_get,       NULL },
+    { "/api/speed",   HTTP_POST,   h_speed_post,      NULL },
 #ifdef BRIDGE_PANIC_TEST
     { "/api/panic_test", HTTP_POST, h_panic_test,     NULL },
 #endif

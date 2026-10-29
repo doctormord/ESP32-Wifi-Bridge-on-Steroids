@@ -44,6 +44,8 @@ typedef struct {
   uint32_t tx_timeout;     /* a SEND did not complete in time             */
   uint32_t rx_bad_len;     /* corrupt frame header, RX buffer resynced    */
   uint32_t rx_no_mem;      /* no heap for a received frame                */
+  uint32_t rx_stall;       /* RX round found only an incomplete frame (not
+                            * a drop - the frame is taken on a later round) */
 } w5500_mac_stats_t;
 
 /* Copy the counters of 'mac' (created by w5500_mac_new()) into 'out'. */

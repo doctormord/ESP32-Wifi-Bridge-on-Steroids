@@ -34,6 +34,7 @@
 #include "esp_wifi.h"
 #include "esp_log.h"
 #include "nvs.h"
+#include "cpustat.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -854,8 +855,8 @@ static esp_eth_mac_t *s_w5500_mac = NULL;
 #endif
 
 /* See bridge.h. */
-void bridge_get_eth_drv_stats(uint32_t out[4]) {
-  out[0] = out[1] = out[2] = out[3] = 0;
+void bridge_get_eth_drv_stats(uint32_t out[5]) {
+  out[0] = out[1] = out[2] = out[3] = out[4] = 0;
 #if CONFIG_ETH_SPI_ETHERNET_W5500
   if (!s_w5500_mac) return;
   w5500_mac_stats_t st;
@@ -864,6 +865,7 @@ void bridge_get_eth_drv_stats(uint32_t out[4]) {
   out[1] = st.tx_timeout;
   out[2] = st.rx_bad_len;
   out[3] = st.rx_no_mem;
+  out[4] = st.rx_stall;
 #endif
 }
 
@@ -3378,6 +3380,7 @@ void bridge_tick(void) {
   roam_tick();
   last_ap_tick();
   failover_tick();
+  cpustat_tick(s_by_e2w, s_by_w2e);
 
   static uint32_t last = 0;
   static uint64_t le = 0, lw = 0;

@@ -39,6 +39,7 @@
 #include "esp_cpu.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -91,10 +92,17 @@ static const char *TAG = "w5500m";
 
 #define SPI_LOCK_TIMEOUT_MS 50
 
-/* Rounds (1 tick each) a frame may stay incomplete in RX memory before the
- * buffer is assumed corrupt and resynced. A frame is stored in well under a
- * millisecond, so this only triggers on a genuinely broken length. */
-#define RX_STALL_MAX       50
+/* An RX round that finds only an incomplete frame waits this long before
+ * looking again - a full frame is stored in ~120 us at 100 Mbit/s. A
+ * scheduler tick (10 ms at CONFIG_FREERTOS_HZ=100) would stall reception
+ * far longer than the frame needs. */
+#define RX_STALL_WAIT_US   30
+
+/* Consecutive incomplete rounds before the buffer is assumed corrupt and
+ * resynced: ~RX_STALL_MAX * (RX_STALL_WAIT_US + one register read), several
+ * milliseconds - far more than any frame needs, so this only triggers on a
+ * genuinely broken length. */
+#define RX_STALL_MAX       200
 
 typedef struct {
   uint8_t  data[TX_SLOT_SIZE];
@@ -419,11 +427,16 @@ static void w5500m_task(void *arg) {
     }
     xSemaphoreGive(m->op_lock);
 
-    /* Data announced but not complete yet, or INT stuck low with nothing to
-     * read: give the chip (and lower-priority tasks) a tick instead of
-     * spinning. */
+    /* Data announced but not complete yet: the rest of the frame arrives
+     * within microseconds, so wait briefly and look again. INT stuck low
+     * with nothing to read: give the chip (and lower-priority tasks) a tick
+     * instead of spinning. */
+    if (rx == RX_STALLED) {
+      m->stats.rx_stall++;
+      esp_rom_delay_us(RX_STALL_WAIT_US);
+    }
     idle_low = (int_low && rx == RX_IDLE) ? idle_low + 1 : 0;
-    if (rx == RX_STALLED || idle_low > 8) vTaskDelay(1);
+    if (idle_low > 8) vTaskDelay(1);
   }
 }
 
