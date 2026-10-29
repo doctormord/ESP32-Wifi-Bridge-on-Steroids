@@ -64,6 +64,14 @@ typedef struct {
                             * room (not a drop unless tx_ring_full counts) */
 } w5500_mac_stats_t;
 
+/* Move queued TX frames to the chip now. Only has an effect when called
+ * from within the driver's own receive path (the esp_eth input callback):
+ * a callback that has to wait there - e.g. for a Wi-Fi TX buffer - calls it
+ * meanwhile, so the TX ring keeps draining. Otherwise the Wi-Fi task, held
+ * in transmit() waiting for ring room, could not free the very buffer the
+ * callback waits for. */
+void w5500_mac_pump_tx(esp_eth_mac_t *mac);
+
 /* Copy the counters of 'mac' (created by w5500_mac_new()) into 'out'. */
 void w5500_mac_get_stats(esp_eth_mac_t *mac, w5500_mac_stats_t *out);
 

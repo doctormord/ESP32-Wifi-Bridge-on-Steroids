@@ -757,6 +757,16 @@ static esp_err_t w5500m_del(esp_eth_mac_t *mac) {
   return ESP_OK;
 }
 
+/* See w5500_mac.h. Runs tx_service() directly: the caller is the driver task
+ * itself (inside the esp_eth input callback), which already holds op_lock
+ * and owns the TX side, so no locking is needed - and from any other task
+ * it does nothing. */
+void w5500_mac_pump_tx(esp_eth_mac_t *mac) {
+  w5500m_t *m = __containerof(mac, w5500m_t, parent);
+  if (xTaskGetCurrentTaskHandle() != m->task || !m->running) return;
+  if (m->tx_tail != m->tx_head) tx_service(m);
+}
+
 /* See w5500_mac.h. */
 void w5500_mac_get_stats(esp_eth_mac_t *mac, w5500_mac_stats_t *out) {
   *out = __containerof(mac, w5500m_t, parent)->stats;

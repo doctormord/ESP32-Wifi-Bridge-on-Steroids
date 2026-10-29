@@ -567,6 +567,10 @@ IRAM_ATTR static inline bool is_for_mgmt(const uint8_t *f, uint16_t len);
 #if CONFIG_ETH_SPI_ETHERNET_W5500
 /* Longest wait for a Wi-Fi TX buffer between two retries in eth_rx_cb(). */
 #define ETH_TX_RETRY_WAIT_US 2000
+
+/* The W5500 MAC instance: for its driver counters, and so eth_rx_cb() can
+ * keep its TX ring draining while it waits (eth_tx_retry_wait()). */
+static esp_eth_mac_t *s_w5500_mac = NULL;
 #endif
 
 /* The "real" wait between later retries in eth_rx_cb(), once yielding did
@@ -576,17 +580,19 @@ IRAM_ATTR static inline bool is_for_mgmt(const uint8_t *f, uint16_t len);
  * EMAC's own RX task, and the measured retry results are based on it.
  *
  * With the W5500 the same task also moves Wi-Fi -> Ethernet frames to the
- * chip, and a tick is 10 ms (CONFIG_FREERTOS_HZ=100): a few retries per
- * frame stall the download direction for tens of milliseconds and overflow
- * the driver's TX ring. Instead, wait only until the Wi-Fi MAC reports any
- * frame finished (s_air_done moves, i.e. a TX buffer was freed), at most
- * ETH_TX_RETRY_WAIT_US. The Wi-Fi task has the higher priority, so it runs
- * while this one polls. */
+ * chip, and a tick is 10 ms (CONFIG_FREERTOS_HZ=100). Worse, the Wi-Fi task
+ * may itself be waiting in the driver's transmit() for TX ring room - then
+ * it cannot free the Wi-Fi buffer this task waits for, and both sit until a
+ * timeout (8 retries collapsed the download to 5-6 Mbit/s). So instead:
+ * keep draining the driver's TX ring (w5500_mac_pump_tx()) while waiting
+ * for the Wi-Fi MAC to report a finished frame (s_air_done moves, i.e. a TX
+ * buffer was freed), at most ETH_TX_RETRY_WAIT_US. */
 IRAM_ATTR static void eth_tx_retry_wait(void) {
 #if CONFIG_ETH_SPI_ETHERNET_W5500
   const uint32_t done0 = s_air_done;
   const int64_t t0 = esp_timer_get_time();
   while (s_air_done == done0 && esp_timer_get_time() - t0 < ETH_TX_RETRY_WAIT_US) {
+    if (s_w5500_mac) w5500_mac_pump_tx(s_w5500_mac);
     esp_rom_delay_us(20);
   }
 #else
@@ -893,10 +899,6 @@ static uint8_t s_eth_spi_mhz = 0;
 /* See bridge.h. */
 uint8_t bridge_get_eth_spi_mhz(void) { return s_eth_spi_mhz; }
 
-#if CONFIG_ETH_SPI_ETHERNET_W5500
-/* The W5500 MAC instance, for its driver counters. */
-static esp_eth_mac_t *s_w5500_mac = NULL;
-#endif
 
 /* See bridge.h. */
 void bridge_get_eth_drv_stats(uint32_t out[BRIDGE_ETH_DRV_STATS]) {
