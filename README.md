@@ -158,7 +158,7 @@ Detects a bridge the driver still reports as "connected" but that has stopped de
 ### Crash forensics
 
 - **Core dumps** to a dedicated 64 KB flash partition, retrievable over HTTP (`/api/coredump`: panic reason, task, PC, backtrace).
-- **Timestamped crash history** (`/api/crashes`, last 8 entries in NVS): every unexpected reset — panic, interrupt/task/hardware watchdog, brownout — is recorded on the next boot with its **wall-clock time** (SNTP, gateway first, `pool.ntp.org` as fallback), the uptime it crashed at and the build it was running. A heartbeat in RTC memory, updated every second, survives the crash and tells the next boot when it happened. A stale core dump (panic without a new image) is detected by its CRC fingerprint and not attributed to the wrong crash.
+- **Timestamped crash history** (`/api/crashes`, last 8 entries in NVS): every unexpected reset — panic, interrupt/task/hardware watchdog, brownout — is recorded on the next boot with its **wall-clock time** (SNTP, gateway first, `pool.ntp.org` as fallback), the uptime it crashed at and the build it was running. A heartbeat in RTC memory, updated every second, survives the crash and tells the next boot when it happened. A stale core dump (panic without a new image) is detected by its CRC fingerprint and not attributed to the wrong crash. A panic that left neither a new dump nor the previous boot's heartbeat is shown as a *power-on glitch*: a supply that bounces while being plugged in starts the chip, which faults in the dip and restarts itself, so the boot that follows reports a panic instead of a power-on. Repeats of it are counted in one entry, so they do not push real crashes out of the history.
 - **Previous boot's log**: the console output lives in a ring buffer in RAM that survives every reset but a power loss; after a crash, watchdog or software reset the last 2 KB of the previous boot are stored in NVS together with the reset reason (`/api/log?prev=1`, *Previous boot* in the portal).
 - **Build identification**: every build embeds its git revision (`"build"` in `/api/status`), and `scripts/ota_flash.sh` archives the matching `firmware.elf` so a later core dump can be resolved with `addr2line` against the exact binary.
 
@@ -454,7 +454,7 @@ Home Assistant creates one device with sensors for signal strength, Wi-Fi channe
   | 38 Mbit/s **Wi-Fi → LAN** (download) | stable for 3 min |
 
   Reset reason power-on (sometimes panic) with RTC memory lost, never brownout, no core dump: the regulator gives up, not the firmware. The time to reset shrinks with load and when already warm — heat in the regulator, which heats far faster than the ESP32-C5 itself (the chip read 67 °C at a reset under heavy load and 83–84 °C under moderate load). Downloads are unaffected because the bridge then mostly *receives* over Wi-Fi and only transmits small TCP ACKs. Lower TX power (down to 8.5 dBm) does not help: what matters is how long the transmitter is on. Two things follow:
-  - **Hardware fix — verified:** feed the board from an external 3.3 V DC/DC buck instead of the module's LDO (tested: buck mounted directly at the pins, ~3 mm to the board, 10 µF ceramic at its output, ≥ 400 kHz switching). Afterwards: a ramp to 40 Mbit/s LAN → Wi-Fi without a reset (39.5 Mbit/s forwarded), **5 min at 30 Mbit/s without a reset or drop**, `networkQuality` 31.8 up / 32.5 down Mbit/s, 80 MHz SPI unaffected. The chip idles ~15 °C cooler (51 instead of 65–67 °C) and settles at ~81 °C under sustained full load — normal for the chip, so raise `thr_temp_c` to ~90 and set `e2w_max_mbit` to 0 on such a board.
+  - **Hardware fix — verified:** feed the board from an external 3.3 V DC/DC buck instead of the module's LDO (tested: buck mounted directly at the pins, ~3 mm to the board, 10 µF ceramic at its output, ≥ 400 kHz switching). Afterwards: a ramp to 40 Mbit/s LAN → Wi-Fi without a reset (39.5 Mbit/s forwarded), **5 min at 30 Mbit/s without a reset or drop**, 80 MHz SPI unaffected; throughput on such a board is under *Performance*. The chip idles ~15 °C cooler (51 instead of 65–67 °C) and settles at ~81 °C under sustained full load — normal for the chip, so raise `thr_temp_c` to ~90 and set `e2w_max_mbit` to 0 on such a board.
   - **On the unmodified module, the firmware protects itself:** `e2w_max_mbit` caps LAN → Wi-Fi (12 is the measured safe value on this hardware), and the temperature throttle (`thr_off` = 0, default) lowers the cap further in steps while the chip runs at or above `thr_temp_c` (default 79 °C) and lifts it again once it is 3 °C cooler. Every change is logged (`[THR ] Ethernet->Wi-Fi limited to … kbit/s`), the portal shows the chip temperature and the limit in force. The temperature alone reacts too late at high rates, hence the fixed cap. Verified: 30 Mbit/s offered for 3 min with a 12 Mbit/s cap — no reset; the throttle held the chip at 78 °C at 7.9 Mbit/s and returned to 12 once it cooled.
   - A new firmware image confirms itself only after 30 s of network reachability; a supply reset before that rolls it back. Flash with the LAN side idle.
 - **Console and flashing over the USB-C port** (USB-Serial/JTAG, `/dev/cu.usbmodem*`). On macOS the port only delivers output while the host asserts DTR. esptool's automatic reset into download mode does not work on this board: it fails with "No serial data received" and leaves the board hung until it is power-cycled. Flash the first time with BOOT held while plugging in USB, then use OTA.
@@ -546,42 +546,26 @@ In a direct A/B against the Rust original on the same board and spot, both lande
 
 ### ESP32-C5 + W5500
 
-Measured LAN → Wi-Fi with four parallel HTTP downloads from a bridged IP camera to a Wi-Fi client, 15 s, 5 GHz channel 40 at −66 dBm, SPI at 53 MHz:
+Current firmware, board on an external 3.3 V buck (see *Power supply limit* in the hardware section), W5500 at 80 MHz SPI, 5 GHz channel 36 at −50 to −60 dBm. A laptop is plugged into the bridge's Ethernet port; the counterpart is on the Wi-Fi side.
 
-| W5500 MAC driver | 4 streams | 1 stream |
+| Direction | Test | Result |
 |---|---|---|
-| ESP-IDF's | 11.6 Mbit/s | 9.0 Mbit/s |
-| own (`w5500_mac.c`) | **14.4–14.8 Mbit/s** | 9.8 Mbit/s |
+| Upload (LAN → Wi-Fi) | UDP, 70 Mbit/s offered by the laptop | **54–59 Mbit/s** forwarded |
+| Upload | TCP, `networkQuality` upload | 34–38 Mbit/s |
+| Upload | bursts of N back-to-back full frames at 100 Mbit/s | 15: no loss · 40: 6–8 lost · 60: 14–16 lost |
+| Download (Wi-Fi → LAN) | TCP, `networkQuality` download | 32–33 Mbit/s |
+| Download | web speed test (`speedtest-cli`, Ookla) | 36–37 Mbit/s |
+| Both at once | UDP up + `networkQuality` down | ~28 up + 31–34 down |
+| For comparison | the same laptop on its own Wi-Fi, same spot | 72 down / 87 up |
 
-The single stream is limited by the camera's web server. Later, with the RX stall fix and the packed TX ring, 8 streams sustained 18.9 Mbit/s over 60 s without a single drop. A speed test from a laptop behind the bridge: ~17.5 down / ~13 up Mbit/s, against 48/31 for the laptop's own Wi-Fi at the same spot.
+**What limits each direction.** The radio is not the limit: 1 m from the AP (−17 dBm) the bridge was as fast as at −55 dBm. Every frame crosses the SPI bus, and Wi-Fi, the W5500 driver and lwIP share one CPU core.
+- *Download* is limited by the SPI transmit path: a full frame costs ~205 µs of SPI at 80 MHz, 151 µs of it payload.
+- *Upload with UDP* (a camera's RTP stream) gets the most. It is limited by the SPI receive path (~150 µs per full frame) and by delivering the frames to Wi-Fi.
+- *Upload with TCP* is lower because of the sender, not the bridge. A laptop with TSO sends 64 KB segments as bursts of 44 frames at line rate. The W5500 holds only 16 KB of received frames (10.8 full frames), so 5–7 % of such a burst is lost before the driver can take it, and TCP backs off. Senders that pace their packets, like most cameras, or bursts of up to ~15 full frames get through without loss. The W5500 does not count these losses; compare the sender's interface counter with `w5x[0]` in `/api/status`.
 
-**With all driver changes** (80 MHz SPI, TX ring with backpressure, the TX pump during retries, 8 retries, SEND_OK shortcut), laptop behind the bridge at a second site (5 GHz ch 36, −53 dBm):
+The receive path is the part tuned furthest: RX memory is released piece by piece within one queued SPI chain, while frames already go to Wi-Fi. The technique, the measurements behind it and what did not help (PAUSE frames, half-duplex backpressure, the SPI peripheral's segmented transfer mode) are written up in [`docs/content/w5500-macraw-rx.md`](docs/content/w5500-macraw-rx.md), for anyone maintaining a W5500 MACRAW driver elsewhere. How the numbers developed driver change by driver change is in [`docs/content/history.md`](docs/content/history.md).
 
-| | Download | Upload |
-|---|---|---|
-| Web speed test (`speedtest-cli`, Ookla servers) | **36.1–36.8 Mbit/s** | 26.6 Mbit/s¹ |
-| `networkQuality` (Apple) | 32.2–32.7 Mbit/s | 28.3–33.5 Mbit/s¹ |
-| 3 min sustained HTTP download | **36.5 Mbit/s** average, 38 peak | — |
-| Laptop's own Wi-Fi, same spot | 71.8 Mbit/s | 87.1 Mbit/s |
-
-¹ Short tests only: sustained uploads above ~12 Mbit/s reset the unmodified module (see *Power supply limit* in the hardware section). With an external 3.3 V buck: `networkQuality` 31.8 up / 32.5 down, web 32.7 down / 18.7 up, and 30 Mbit/s sustained for 5 min.
-
-The download is limited by the SPI path: ~205 µs of SPI per full frame at 80 MHz, 151 µs of it payload. The W5500's 16 KB TX + 16 KB RX buffers are already all on socket 0 (the only one that does MACRAW), and the fixed-length (FDM) mode would be slower than the variable-length bursts used.
-
-**Upload (LAN → Wi-Fi) - what a camera needs.** The W5500 holds at most 16 KB of received frames (10.8 full frames), and a sender at 100 Mbit/s fills that in 1.3 ms. What counts is therefore how fast the driver empties it *during* a burst - an I-frame or a TCP send window arrives at line rate. The chained RX rounds (release per 3 KB piece, see the hardware section) measured against the previous driver, same board and link (external 3.3 V supply):
-
-| LAN → Wi-Fi | Previous driver | Chained RX |
-|---|---|---|
-| UDP, 70 Mbit/s offered | 42.9 Mbit/s | **55.7–59.1 Mbit/s** |
-| Burst of 15 full frames at line rate | ~1 frame lost | **none lost** |
-| Burst of 40 full frames | 14.4 lost | 5.5–7.8 lost |
-| Burst of 60 full frames | 24.8 lost | 14–16 lost |
-| Download (Wi-Fi → LAN), `networkQuality` | 32.8 Mbit/s | 32.6–32.9 Mbit/s |
-| TCP upload, `networkQuality` | 37–41 Mbit/s | 34–38 Mbit/s |
-
-TCP uploads from a laptop did not gain: its adapter sends 64 KB segment bursts (44 frames) at line rate, and 5–7 % of those frames overflow the W5500's memory before the driver can take them - TCP then backs off. The W5500 has no counter for this; compare the sender's interface counter with `w5x[0]`. A sender that paces its packets, or bursts of ≤ ~15 full frames, gets through without loss. Two ways to stop a sender did not work with the W5500: PAUSE frames (it cannot negotiate flow control, so the partner ignores them), and half-duplex backpressure (the mode could not be forced through ESP-IDF). Under heavy load in both directions the minimum free heap now drops to 6–14 KB (was ~33 KB): frames move into the Wi-Fi driver faster. `dynamic_tx_buf` and `txq_cap` bound that if needed.
-
-The radio link is not what limits it: placed 1 m from the AP (−17 dBm) the bridge was exactly as fast as at −55 dBm. The SPI path is — with the clock raised from 53 to 80 MHz (half-duplex read compensation, see the hardware section) the same test went from 17.4 / 18.6 to **20.0 / 22.1 Mbit/s** (4 / 8 streams), every download byte-identical, no RX resyncs, the SPI bus then busy 46 % of the time instead of 64 %. CPU is ~60 % idle throughout. On 2.4 GHz the bridge got a 7 dB stronger signal (about the free-space difference between the bands) but less throughput (14–15 Mbit/s, busier band) — keep it on 5 GHz. Expect less than the WT32-ETH01's internal EMAC: every frame crosses the SPI bus, and Wi-Fi, the W5500 task and lwIP share one CPU core.
+Under heavy load in both directions the minimum free heap drops to 6–14 KB, because frames move into the Wi-Fi driver faster. `dynamic_tx_buf` and `txq_cap` bound that if needed. On 2.4 GHz the bridge gets a stronger signal but less throughput (14–15 Mbit/s, busier band), so keep it on 5 GHz.
 
 ### Retry counts matter more than anything else
 
@@ -639,7 +623,8 @@ partitions_8mb_ota.csv   live partition table (2 × 3 MB OTA + 64 KB core dump)
 partitions_4mb_ota.csv   ESP32-C5 target (2 × 1920 KB OTA + 64 KB core dump)
 sdkconfig.defaults       single source of truth for driver and buffer settings
 sdkconfig.defaults.esp32c5  ESP32-C5 additions (W5500, USB console, 4 MB flash)
-docs/content/       development history, backlog, handoff notes
+docs/content/       development history, backlog, handoff notes,
+                    w5500-macraw-rx.md (W5500 MACRAW receive path, technical note)
 ```
 
 ---

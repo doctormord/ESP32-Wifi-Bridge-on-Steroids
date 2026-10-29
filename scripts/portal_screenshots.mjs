@@ -16,16 +16,23 @@ const src = fs.readFileSync(SRC, 'utf8');
 const PAGE = src.slice(src.indexOf('R"HTML(') + 7, src.indexOf(')HTML"'));
 
 const now = Math.floor(Date.UTC(2026, 9, 17, 12, 0, 0) / 1000);
+// Modeled on the ESP32-C5 + W5500 target (dual-band, chip temperature, W5500
+// counters); every name, address and MAC is made up.
 const status = {
-  prov: 0, wifi: 1, eth: 1, rssi: -58, ch: 6, kbps_up: 3870, kbps_down: 112,
-  pkt_up: 1843210, pkt_down: 912455, drop_up: 212, drop_down: 3,
+  prov: 0, wifi: 1, eth: 1, rssi: -57, ch: 36, kbps_up: 7840, kbps_down: 164,
+  pkt_up: 48213377, pkt_down: 9120455, drop_up: 41, drop_down: 3,
   wifi_disc: 9, wifi_kicks: 2, disc_r: 8, disc_rs: 'ASSOC_LEAVE', disc_src: 0, disc_ago: 5420,
-  wd_probe: 1, wd_reconnects: 1, wd_eth_resets: 0, wd_last_reason: 0, roam_count: 1,
-  uptime: 266400, client_mac: '02:1a:2b:3c:4d:5e', client_ip: '192.168.1.88',
+  wd_probe: 1, wd_reconnects: 0, wd_eth_resets: 0, wd_last_reason: 0, roam_count: 0,
+  uptime: 266400, net: 1, fo: 0, client_mac: '02:1a:2b:3c:4d:5e', client_ip: '192.168.1.88',
   client_name: 'ipcam-garden', ssid: 'HomeNetwork', bssid: '02:aa:bb:cc:dd:01',
-  at: 0, at_s: 0, at_n: 10, at_r: 0, at_k: 8,
-  heap: 91172, heap_min: 32064, heap_dma: 91172, heap_blk: 53248,
-  txp: 66, bw: 20, time: now, build: 'b1e6aac',
+  at: 0, at_s: 0, at_n: 10, at_r: 0, at_k: 2,
+  heap: 98304, heap_min: 61440, heap_dma: 90112, heap_blk: 81920,
+  txp: 72, bw: 20, air_ok: 48190210, air_fail: 37, cc: '01', cc_max: 20,
+  txq: 3, txq_x10: 28, txq_ms: 2, pt: 0, pt_s: 0, pt_k: 52, pt_r: 0, drop_cap: 0, txq_cap: 0,
+  qc: 0, qc_s: 0, qc_k: 0, qc_r: -1, all: 0, lr: 0, lr_k: 0, lr_el: 0, lr_tot: 0, lr_r: 0,
+  spi: 80, temp: 642, temp_max: 812, thr: 0, drop_thr: 0,
+  w5: [0, 0, 0, 0, 0], w5x: [48213377, 10544120, 6120334, 1460215, 1211002, 98114, 0],
+  rst: 3, rtc: 1, time: now, build: '72e00e8',
 };
 const def = { eth_tx_retries: 8, wifi_tx_retries: 1, static_rx_buf: 16, dynamic_rx_buf: 32,
   dynamic_tx_buf: 32, rx_ba_win: 32, wifi_connect_timeout_s: 20, wifi_connect_retries: 3,
@@ -36,10 +43,11 @@ const config = {
   ip: '192.168.1.250', mask: '255.255.255.0', gw: '192.168.1.1',
   ip2: '10.0.8.250', mask2: '255.255.255.0', gw2: '10.0.8.1', ip3: '', mask3: '', gw3: '',
   mqtt_host: '192.168.1.10', mqtt_port: 1883, mqtt_user: 'bridge', telemetry_s: 10,
-  tx_power: 66, eth_tx_retries: 8, wifi_tx_retries: 1, static_rx_buf: 16, dynamic_rx_buf: 32,
+  tx_power: 0, eth_tx_retries: 8, wifi_tx_retries: 1, static_rx_buf: 16, dynamic_rx_buf: 32,
   dynamic_tx_buf: 32, rx_ba_win: 32, ht40: 0, no_11b: 1, wd_enable: 1, wd_actions: 7,
   wd_bad_windows: 3, wifi_connect_timeout_s: 20, wifi_connect_retries: 3, ap_idle_reboot_s: 900,
-  roam_enable: 1, roam_check_s: 300, roam_rssi_threshold: -70, roam_margin_db: 6,
+  roam_enable: 0, roam_check_s: 300, roam_rssi_threshold: -70, roam_margin_db: 6,
+  txq_cap: 0, band5g: 1, wifi_band: 0, e2w_max_mbit: 0, thr_off: 0, thr_temp_c: 90,
   def, eff: { static_rx_buf: 16, dynamic_rx_buf: 32, dynamic_tx_buf: 32, rx_ba_win: 32 },
 };
 const ap = '02:aa:bb:cc:dd:01', none = '00:00:00:00:00:00';
@@ -56,13 +64,14 @@ const disconnects = {
   ],
 };
 const crashes = { now, recs: [
-  { e: now - 266500, up: 604800, rst: 4, f: 3, build: 'abb24ce', task: 'main', pc: '400d3a1c',
-    reason: 'abort() was called at PC 0x400d3a19 on core 0', bt: ['400d3a19', '400d6f2e', '40089c3d'] },
+  { e: now - 266500, up: 604800, rst: 4, f: 1, build: '9df4d8d', task: 'w5500_tsk', pc: '42008a3c',
+    reason: 'Load access fault (mcause 5, mtval 0x00000000)', bt: ['42008a12'] },
 ] };
 
 const routes = {
   '/api/status': status, '/api/config': config, '/api/disconnects': disconnects,
   '/api/crashes': crashes, '/api/coredump': { present: false },
+  '/api/autotune': { retries: [], txp: [], cap: [], long: [] },
 };
 
 async function open(browser, ctxOpts) {
