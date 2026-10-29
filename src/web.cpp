@@ -241,6 +241,8 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
     <div class="m"><div class="k">TX queue</div><div class="v" id="txq">-</div></div>
     <div class="m"><div class="k">Lost on air</div><div class="v" id="airf">-</div></div>
     <div class="m" id="spim" style="display:none"><div class="k">Ethernet SPI</div><div class="v" id="spi">-</div></div>
+    <div class="m" id="tempm" style="display:none"><div class="k">Chip temperature</div><div class="v" id="temp">-</div></div>
+    <div class="m"><div class="k">LAN&rarr;Wi-Fi limit</div><div class="v" id="thr">-</div></div>
   </div>
   <div class="sub" style="margin:12px 0 0" id="detail"></div>
   <div id="cdbox" style="display:none;margin-top:10px;padding:10px;background:rgba(255,107,107,.08);
@@ -372,6 +374,25 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
     invisibly in the DMA. So: as small as possible, as large as necessary.
     <br>The opposite direction rarely needs more than 1 &ndash; Ethernet
     practically always accepts.
+  </div>
+
+  <label>Temperature throttle LAN&rarr;Wi-Fi</label>
+  <select id="thr_off">
+    <option value="0">on (default)</option>
+    <option value="1">off</option>
+  </select>
+  <label>Max rate LAN&rarr;Wi-Fi
+    <span class="hint">Mbit/s, 0 = no limit</span></label>
+  <input id="e2w_max_mbit">
+  <div class="sub" style="margin:6px 0 0">
+    The temperature throttle lowers the LAN&rarr;Wi-Fi rate step by step while
+    the chip runs hot (from 79&nbsp;&deg;C) and lifts it again as it cools
+    (below 76&nbsp;&deg;C); tile <i>LAN&rarr;Wi-Fi limit</i> shows what is in
+    force, the console log every change. The fixed maximum is for hardware
+    whose power supply cannot carry sustained Wi-Fi transmission: an
+    ESP32-C5 module feeding a W5500 from its own regulator resets above
+    roughly 12&ndash;16&nbsp;Mbit/s, and the chip temperature rises too late to
+    catch that. Both act within seconds, no reboot.
   </div>
 
   <label>TX queue cap LAN&rarr;Wi-Fi
@@ -779,6 +800,10 @@ async function tick(){
     $('bw').textContent=(s.wifi&&s.bw)?s.bw+' MHz':'-';
     /* Only SPI Ethernet (W5500) has a bus clock to show; the EMAC reports 0. */
     if(s.spi){$('spim').style.display='';$('spi').textContent=s.spi+' MHz'}
+    if(s.temp>-32768){$('tempm').style.display='';
+      $('temp').textContent=(s.temp/10).toFixed(1)+' \u00b0C (max '+(s.temp_max/10).toFixed(1)+')'}
+    $('thr').textContent=(s.thr?(s.thr/1000).toFixed(1)+' Mbit/s':'none')+
+      (s.drop_thr?' \u00b7 '+s.drop_thr+' dropped':'');
     /* Calibration progress. at: 0=idle 1=running 2=done 3=too little traffic */
     /* The number of steps is not known in advance (up first, then down,
        stop at the first outlier) - so no remaining time, only the progress. */
@@ -881,7 +906,7 @@ const CFG=['name','ssid1','ssid2','ssid3','ip','mask','gw','ip2','mask2','gw2','
            'ht40','no_11b','wd_enable','wd_actions','wd_bad_windows',
            'wifi_connect_timeout_s','wifi_connect_retries','ap_idle_reboot_s',
            'roam_enable','roam_check_s','roam_rssi_threshold','roam_margin_db','txq_cap',
-           'wifi_band'];
+           'wifi_band','thr_off','e2w_max_mbit'];
 /* Fill the form from /api/config and take the unsaved-changes snapshot. */
 async function load(){
   const c=await(await fetch('/api/config')).json();
@@ -945,6 +970,8 @@ function defaults(){
   for(const k in DEF) if($(k)) $(k).value=DEF[k];
   $('tx_power').value='0';
   $('txq_cap').value='0';
+  $('thr_off').value='0';
+  $('e2w_max_mbit').value='0';
   $('tmsg').textContent='Defaults filled in - save to apply.';
   dirtyCheck();   /* set by script - does not fire an input event */
 }
@@ -1043,7 +1070,7 @@ const PW=['pass1','pass2','pass3','mqtt_pass','admin_pass'];
    bridge_apply_live_tuning()). Everything else only after a reboot. */
 const LIVE=['tx_power','eth_tx_retries','wifi_tx_retries','wd_enable','wd_actions','wd_bad_windows',
             'roam_enable','roam_check_s','roam_rssi_threshold','roam_margin_db',
-            'ap_idle_reboot_s','telemetry_s','admin_pass','txq_cap'];
+            'ap_idle_reboot_s','telemetry_s','admin_pass','txq_cap','thr_off','e2w_max_mbit'];
 let SNAP=null;
 function snapshot(){SNAP={};for(const k of CFG)SNAP[k]=$(k).value;dirtyCheck()}
 /* Names of all fields that differ from the baseline. */
@@ -1257,7 +1284,7 @@ static esp_err_t h_status(httpd_req_t *r) {
     "\"pt\":%d,\"pt_s\":%u,\"pt_k\":%d,\"pt_r\":%d,"
     "\"drop_cap\":%lu,\"txq_cap\":%u,\"qc\":%d,\"qc_s\":%u,\"qc_k\":%u,\"qc_r\":%d,\"all\":%d,"
     "\"lr\":%d,\"lr_k\":%u,\"lr_el\":%lu,\"lr_tot\":%lu,\"lr_r\":%u,"
-    "\"spi\":%u,\"w5\":[%lu,%lu,%lu,%lu,%lu],\"w5x\":[%lu,%lu,%lu,%lu,%lu,%lu,%lu],\"rst\":%u,\"rtc\":%d,\"time\":%lu,\"build\":\"" GIT_REV "\"}",
+    "\"spi\":%u,\"temp\":%d,\"temp_max\":%d,\"thr\":%lu,\"drop_thr\":%lu,\"w5\":[%lu,%lu,%lu,%lu,%lu],\"w5x\":[%lu,%lu,%lu,%lu,%lu,%lu,%lu],\"rst\":%u,\"rtc\":%d,\"time\":%lu,\"build\":\"" GIT_REV "\"}",
     s_provisioning ? 1 : 0, st.wifi_up ? 1 : 0, st.eth_link ? 1 : 0,
     (int)st.rssi, (unsigned)st.channel,
     (unsigned long)st.kbps_eth2wifi, (unsigned long)st.kbps_wifi2eth,
@@ -1316,6 +1343,12 @@ static esp_err_t h_status(httpd_req_t *r) {
     (unsigned long)lr_el, (unsigned long)lr_tot, bridge_long_tune_result(),
     /* W5500 SPI clock in MHz, 0 = internal EMAC. */
     (unsigned)bridge_get_eth_spi_mhz(),
+    /* SoC temperature now and its maximum since boot, 0.1 degC (-32768 = no
+     * sensor), see cpustat.h. */
+    (int)cpustat_temp_x10(), (int)cpustat_temp_max_x10(),
+    /* Thermal throttle: Ethernet -> Wi-Fi limit in kbit/s (0 = none) and
+     * its drops (see bridge_thermal_limit_kbps()). */
+    (unsigned long)bridge_thermal_limit_kbps(), (unsigned long)bridge_thermal_drops(),
     /* Ethernet driver: drops (TX ring full, SEND timeout, RX resync, RX no
      * heap) and incomplete RX rounds (see bridge_get_eth_drv_stats()). */
     (unsigned long)ethd[0], (unsigned long)ethd[1], (unsigned long)ethd[2], (unsigned long)ethd[3],
@@ -1462,7 +1495,7 @@ static esp_err_t h_config_get(httpd_req_t *r) {
     "\"wifi_connect_timeout_s\":%u,\"wifi_connect_retries\":%u,"
     "\"ap_idle_reboot_s\":%u,"
     "\"roam_enable\":%u,\"roam_check_s\":%u,\"roam_rssi_threshold\":%d,"
-    "\"roam_margin_db\":%u,\"txq_cap\":%u,\"wifi_band\":%u,\"band5g\":%d,"
+    "\"roam_margin_db\":%u,\"txq_cap\":%u,\"wifi_band\":%u,\"band5g\":%d,\"thr_off\":%u,\"e2w_max_mbit\":%u,"
     "\"def\":{\"eth_tx_retries\":%u,\"wifi_tx_retries\":%u,"
     "\"static_rx_buf\":%u,\"dynamic_rx_buf\":%u,\"dynamic_tx_buf\":%u,"
     "\"rx_ba_win\":%u,\"wifi_connect_timeout_s\":%u,"
@@ -1497,6 +1530,7 @@ static esp_err_t h_config_get(httpd_req_t *r) {
 #else
     0,
 #endif
+    g_cfg.thr_off, g_cfg.e2w_max_mbit,
     def.eth_retries, def.wifi_retries,
     def.static_rx, def.dyn_rx, def.dyn_tx, def.ba_win,
     def.wifi_connect_timeout_s, def.wifi_connect_retries, def.ap_idle_reboot_s,
@@ -1634,6 +1668,13 @@ static esp_err_t h_config_post(httpd_req_t *r) {
   if (form_get(body, "wifi_band", v, sizeof(v))) {
     int t = atoi(v);
     g_cfg.wifi_band = (uint8_t)((t < 0 || t > (int)WIFI_BAND_MAX) ? WIFI_BAND_PREFER_5G : t);
+  }
+  /* Throttle LAN -> Wi-Fi (see config.h); read by thermal_tick(), no
+   * reboot needed. */
+  if (form_get(body, "thr_off", v, sizeof(v))) g_cfg.thr_off = (uint8_t)(atoi(v) ? 1 : 0);
+  if (form_get(body, "e2w_max_mbit", v, sizeof(v))) {
+    int t = atoi(v);
+    g_cfg.e2w_max_mbit = (uint8_t)(t < 0 ? 0 : t > 200 ? 200 : t);
   }
 
   /* Take effect at the next connect (bridge_wifi_start()), not immediately -

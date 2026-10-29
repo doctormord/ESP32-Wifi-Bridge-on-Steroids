@@ -8,6 +8,42 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "compat.h"
+#include "soc/soc_caps.h"
+#if SOC_TEMP_SENSOR_SUPPORTED
+#include "driver/temperature_sensor.h"
+#endif
+
+static int16_t s_temp_x10 = CPUSTAT_NO_TEMP;
+static int16_t s_temp_max_x10 = CPUSTAT_NO_TEMP;
+
+/* Read the internal temperature sensor into s_temp_x10 / s_temp_max_x10.
+ * The sensor is installed on first use with the -10..80 degC range, the one
+ * with the best accuracy for a board indoors. If it cannot be started the
+ * values stay CPUSTAT_NO_TEMP and it is not retried. */
+static void temp_sample(void) {
+#if SOC_TEMP_SENSOR_SUPPORTED
+  static temperature_sensor_handle_t h = NULL;
+  static bool failed = false;
+  if (failed) return;
+  if (!h) {
+    temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
+    if (temperature_sensor_install(&cfg, &h) != ESP_OK || temperature_sensor_enable(h) != ESP_OK) {
+      failed = true;
+      return;
+    }
+  }
+  float c = 0;
+  if (temperature_sensor_get_celsius(h, &c) != ESP_OK) return;
+  s_temp_x10 = (int16_t)(c * 10.0f + (c >= 0 ? 0.5f : -0.5f));
+  if (s_temp_max_x10 == CPUSTAT_NO_TEMP || s_temp_x10 > s_temp_max_x10) s_temp_max_x10 = s_temp_x10;
+#endif
+}
+
+/* See cpustat.h. */
+int16_t cpustat_temp_x10(void) { return s_temp_x10; }
+
+/* See cpustat.h. */
+int16_t cpustat_temp_max_x10(void) { return s_temp_max_x10; }
 
 #if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
 
@@ -53,6 +89,7 @@ void cpustat_tick(uint64_t bytes_e2w, uint64_t bytes_w2e) {
   static uint64_t last_e = 0, last_w = 0;
   const uint32_t now = millis();
   if (last_ms && now - last_ms < CPUSTAT_WINDOW_MS) return;
+  temp_sample();
 
   configRUN_TIME_COUNTER_TYPE total = 0;
   const UBaseType_t n = uxTaskGetSystemState(s_cur, CPUSTAT_MAX_TASKS, &total);
@@ -123,8 +160,16 @@ size_t cpustat_json(char *out, size_t max) {
 
 #else  /* !CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS */
 
-/* Stubs: run-time statistics are not compiled into FreeRTOS. */
-void cpustat_tick(uint64_t bytes_e2w, uint64_t bytes_w2e) { (void)bytes_e2w; (void)bytes_w2e; }
+/* Stubs: run-time statistics are not compiled into FreeRTOS. The
+ * temperature is still sampled, once per window. */
+void cpustat_tick(uint64_t bytes_e2w, uint64_t bytes_w2e) {
+  (void)bytes_e2w; (void)bytes_w2e;
+  static uint32_t last_ms = 0;
+  const uint32_t now = millis();
+  if (last_ms && now - last_ms < CPUSTAT_WINDOW_MS) return;
+  last_ms = now;
+  temp_sample();
+}
 void cpustat_reset_peak(void) {}
 size_t cpustat_json(char *out, size_t max) {
   return (size_t)snprintf(out, max, "{\"enabled\":0}");

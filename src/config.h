@@ -177,6 +177,18 @@ struct BridgeConfig {
    * WIFI_BAND_* values in bridge.h; 0 = both bands, 5 GHz preferred. Ignored
    * on 2.4 GHz-only chips. Takes effect at the next boot. */
   uint8_t  wifi_band;
+
+  /* --- Ethernet -> Wi-Fi throttle (see bridge.cpp: thermal_tick()) --------
+   * thr_off: 0 = temperature throttle on (default), 1 = off. It lowers the
+   * Ethernet -> Wi-Fi rate step by step while the SoC runs hot and lifts it
+   * again as it cools. Only acts on chips with a temperature sensor.
+   * e2w_max_mbit: fixed upper limit for Ethernet -> Wi-Fi in Mbit/s, 0 = no
+   * limit. For hardware whose supply cannot carry sustained Wi-Fi
+   * transmission (the ESP32-C5 module with a W5500 on its regulator resets
+   * above ~12-16 Mbit/s); the temperature sensor reacts too late for that
+   * at high rates. Both take effect within a few seconds, no reboot. */
+  uint8_t  thr_off;
+  uint8_t  e2w_max_mbit;
 };
 
 extern BridgeConfig g_cfg;

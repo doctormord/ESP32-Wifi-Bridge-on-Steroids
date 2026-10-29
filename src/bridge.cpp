@@ -269,6 +269,17 @@ static uint32_t s_q_delay_ms = 0;    /* matching queue delay                 */
 static volatile uint8_t  s_txq_cap  = 0;
 static volatile uint32_t s_drop_cap = 0;
 
+/* Ethernet -> Wi-Fi throttle (see thermal_tick()): the rate limit in force
+ * in kbit/s (0 = none) - the lower of the temperature limit s_thr_temp_kbps
+ * and the fixed g_cfg.e2w_max_mbit - and the frames it dropped (also in
+ * s_drop_e2w). s_thr_tokens is the token bucket in bytes, refilled by
+ * eth_rx_cb() from the time since s_thr_last_us. */
+static volatile uint32_t s_thr_kbps  = 0;
+static uint32_t          s_thr_temp_kbps = 0;
+static volatile uint32_t s_drop_thr  = 0;
+static int32_t           s_thr_tokens = 0;
+static int64_t           s_thr_last_us = 0;
+
 /* Frames up to this size bypass the cap: TCP ACKs, ARP, ICMP, DNS. They cost
  * next to no airtime, and dropping a camera's ACKs or the gateway's ARP
  * would hurt far more than queueing them. */
@@ -691,6 +702,28 @@ IRAM_ATTR static esp_err_t eth_rx_cb(esp_eth_handle_t h, uint8_t *buffer,
     s_drop_e2w = s_drop_e2w + 1;
     free(buffer);
     return ESP_OK;
+  }
+
+  /* Thermal throttle: while thermal_tick() has set a limit, a token bucket
+   * (refilled at the limit, at most 50 ms worth) decides whether the frame
+   * may go out. Small frames (ACKs, ARP) always pass - they cost little air
+   * time and keep the client's TCP clocked so it backs off cleanly. */
+  const uint32_t thr = s_thr_kbps;
+  if (thr && len > TXQ_CAP_MIN_LEN) {
+    const int64_t now = esp_timer_get_time();
+    const int32_t bucket_max = (int32_t)(thr * 1000 / 8 / 20);   /* 50 ms */
+    int64_t add = (now - s_thr_last_us) * (int64_t)thr / 8000;   /* bytes */
+    s_thr_last_us = now;
+    int64_t t = (int64_t)s_thr_tokens + add;
+    if (t > bucket_max) t = bucket_max;
+    if (t < (int64_t)len) {
+      s_thr_tokens = (int32_t)t;
+      s_drop_thr = s_drop_thr + 1;
+      s_drop_e2w = s_drop_e2w + 1;
+      free(buffer);
+      return ESP_OK;
+    }
+    s_thr_tokens = (int32_t)(t - len);
   }
 
   esp_err_t err = ESP_FAIL;
@@ -3435,6 +3468,73 @@ uint32_t bridge_get_failovers(void) { return s_fo_count; }
  * Statistics
  * ========================================================================= */
 
+/* Thermal throttle limits (SoC temperature, 0.1 degC) and rates (kbit/s).
+ * On the ESP32-C5 module with a W5500 the board resets (power-on, the
+ * module's regulator gives up) when sustained Wi-Fi transmission heats it;
+ * the chip temperature then reads 83-84 degC, from ~65 degC idle. Above
+ * THR_HOT the limit drops quickly, above THR_WARM gently; below THR_COOL it
+ * is raised again until it no longer limits and is removed. */
+#define THR_HOT       800
+#define THR_WARM      790
+#define THR_COOL      760
+#define THR_MIN_KBPS  4000
+#define THR_OFF_KBPS  60000
+
+/* Update the Ethernet -> Wi-Fi rate limit, once per temperature sample
+ * (CPUSTAT_WINDOW_MS):
+ *   - Temperature part (unless g_cfg.thr_off): dynamic - lowered by 10 %
+ *     per sample above THR_WARM and by 30 % above THR_HOT, raised by 20 %
+ *     per sample below THR_COOL until it no longer limits and is dropped.
+ *     Between THR_COOL and THR_WARM it is held. The first limit starts below
+ *     the rate flowing at that moment, so it bites at once.
+ *   - Fixed part: g_cfg.e2w_max_mbit, if set.
+ * The lower of both is enforced in eth_rx_cb(); every change is logged with
+ * a "[THR ]" line. Only this direction is limited: it is the one that keeps
+ * the Wi-Fi transmitter on - the opposite direction ran at 38 Mbit/s for
+ * minutes without trouble on the hardware that needs this. */
+static void thermal_tick(void) {
+  static uint32_t last_ms = 0;
+  const uint32_t now = millis();
+  if (now - last_ms < CPUSTAT_WINDOW_MS) return;
+  last_ms = now;
+  const int16_t t = cpustat_temp_x10();
+
+  uint32_t tl = s_thr_temp_kbps;
+  if (g_cfg.thr_off || t == CPUSTAT_NO_TEMP) {
+    tl = 0;
+  } else {
+    const uint32_t base = tl ? tl : (s_kbps_e2w > THR_MIN_KBPS ? s_kbps_e2w : THR_MIN_KBPS);
+    if (t >= THR_HOT)              tl = base * 7 / 10;
+    else if (t >= THR_WARM)        tl = base * 9 / 10;
+    else if (t <= THR_COOL && tl)  tl = tl * 12 / 10;
+    if (tl && tl < THR_MIN_KBPS) tl = THR_MIN_KBPS;
+    if (tl >= THR_OFF_KBPS) tl = 0;
+  }
+  s_thr_temp_kbps = tl;
+
+  const uint32_t fixed = (uint32_t)g_cfg.e2w_max_mbit * 1000;
+  uint32_t lim = tl;
+  if (fixed && (!lim || fixed < lim)) lim = fixed;
+  if (lim == s_thr_kbps) return;
+
+  if (!s_thr_kbps && lim) s_thr_last_us = esp_timer_get_time();
+  if (lim) {
+    printf("[THR ] Ethernet->Wi-Fi limited to %lu kbit/s (%s, chip %d.%d degC)\n",
+           (unsigned long)lim, lim == tl ? "temperature" : "fixed limit",
+           t == CPUSTAT_NO_TEMP ? 0 : t / 10, t == CPUSTAT_NO_TEMP ? 0 : t % 10);
+  } else {
+    printf("[THR ] Ethernet->Wi-Fi limit lifted (chip %d.%d degC)\n",
+           t == CPUSTAT_NO_TEMP ? 0 : t / 10, t == CPUSTAT_NO_TEMP ? 0 : t % 10);
+  }
+  s_thr_kbps = lim;
+}
+
+/* See bridge.h. */
+uint32_t bridge_thermal_limit_kbps(void) { return s_thr_kbps; }
+
+/* See bridge.h. */
+uint32_t bridge_thermal_drops(void) { return s_drop_thr; }
+
 /* Periodic work, called from the main loop: run the autotune, watchdog and
  * roaming state machines, and once per second recompute the throughput in
  * kbit/s from the byte counters. */
@@ -3449,6 +3549,7 @@ void bridge_tick(void) {
   last_ap_tick();
   failover_tick();
   cpustat_tick(s_by_e2w, s_by_w2e);
+  thermal_tick();
 
   static uint32_t last = 0;
   static uint64_t le = 0, lw = 0;

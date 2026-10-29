@@ -62,3 +62,9 @@ CONFIG_LOG_MAXIMUM_LEVEL_INFO=y
 # whether a throughput limit is CPU-bound has to be measured, not guessed.
 # Costs one timer read per context switch.
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+
+# --- Unused radios -----------------------------------------------------------
+# The C5 also has an 802.15.4 (Thread/Zigbee) radio. The bridge never starts
+# it, so it draws no power either way; disabled to keep its driver out of the
+# image.
+CONFIG_IEEE802154_ENABLED=n

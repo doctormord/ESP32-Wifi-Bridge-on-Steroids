@@ -89,6 +89,12 @@ uint8_t bridge_get_eth_spi_mhz(void);
  * Ethernet -> Wi-Fi path, [11] times a send waited for room in the full TX
  * ring. */
 #define BRIDGE_ETH_DRV_STATS 12
+
+/* Thermal throttle (bridge.cpp: thermal_tick()): the Ethernet -> Wi-Fi rate
+ * limit in force in kbit/s (0 = none), and the frames it dropped since boot
+ * (also counted in drop_up). */
+uint32_t bridge_thermal_limit_kbps(void);
+uint32_t bridge_thermal_drops(void);
 void bridge_get_eth_drv_stats(uint32_t out[BRIDGE_ETH_DRV_STATS]);
 
 /* Start Ethernet and wait for the first frame from the client to learn its

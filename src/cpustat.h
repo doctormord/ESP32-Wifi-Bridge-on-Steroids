@@ -28,3 +28,14 @@ void cpustat_reset_peak(void);
 
 /* Write the last and the peak window as JSON into 'out'; returns the length. */
 size_t cpustat_json(char *out, size_t max);
+
+/* Die temperature of the SoC's internal sensor, sampled by cpustat_tick()
+ * once per window, in 0.1 degC; CPUSTAT_NO_TEMP if the chip has no sensor
+ * or it could not be started. The sensor measures the chip, not the voltage
+ * regulator next to it - on a small module both heat the same board, so the
+ * trend is what tells. */
+#define CPUSTAT_NO_TEMP (-32768)
+int16_t cpustat_temp_x10(void);
+
+/* Highest value of cpustat_temp_x10() since boot. */
+int16_t cpustat_temp_max_x10(void);
