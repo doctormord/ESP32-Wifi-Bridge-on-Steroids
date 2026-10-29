@@ -140,6 +140,7 @@ typedef struct {
   uint32_t            rx_have;
   uint16_t            rx_rd;
 
+  bool                half_duplex; /* SPI device in half-duplex mode         */
   w5500_mac_stats_t   stats;
 } w5500m_t;
 
@@ -164,6 +165,13 @@ static esp_err_t w_xfer(w5500m_t *m, uint32_t address, bool write, void *data, u
     t.tx_buffer = data;
   } else {
     t.rx_buffer = data;
+  }
+  if (!write && m->half_duplex) {
+    /* Half-duplex: a read has no MOSI data phase, only the MISO one - this
+     * is what lets the SPI driver put its compensation dummy clocks in
+     * front of it (see SPI_DEVICE_HALFDUPLEX in w5500_mac.h). */
+    t.length   = 0;
+    t.rxlength = 8 * len;
   }
 
   if (xSemaphoreTake(m->spi_lock, pdMS_TO_TICKS(SPI_LOCK_TIMEOUT_MS)) != pdTRUE) {
@@ -779,6 +787,7 @@ esp_eth_mac_t *w5500_mac_new(const eth_w5500_config_t *w5500_config,
   spi_device_interface_config_t dev = *w5500_config->spi_devcfg;
   dev.command_bits = 16;
   dev.address_bits = 8;
+  m->half_duplex = (dev.flags & SPI_DEVICE_HALFDUPLEX) != 0;
   if (spi_bus_add_device(w5500_config->spi_host_id, &dev, &m->spi) != ESP_OK) {
     ESP_LOGE(TAG, "adding device to SPI host #%d failed", w5500_config->spi_host_id + 1);
     m->spi = NULL;

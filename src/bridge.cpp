@@ -104,18 +104,31 @@ extern "C" esp_err_t esp_wifi_set_tx_done_cb(
 #define W5500_CS_GPIO       10
 #define W5500_INT_GPIO      15
 #define W5500_RST_GPIO      3
-/* SPI clock steps tried in order by bridge_eth_init(). 80 MHz is the W5500's
+/* SPI settings tried in order by bridge_eth_init(). 80 MHz is the W5500's
  * theoretical design maximum; its datasheet only guarantees 33.3 MHz. The
- * driver verifies the chip version register at init, so a clock that is
- * grossly too fast fails there and the next step is tried. Marginal bit
- * errors during operation are NOT caught by this (the SPI link has no
- * checksum) - if they show up as TCP retransmissions or corrupted UDP
- * payloads, pin the list to 40 MHz.
- * The steps are whole divisors of the C5's 160 MHz SPI clock source
- * (PLL_F160M): /2, /3, /4, /8. 53.3 MHz sits between the 80 MHz that the
- * GPIO-matrix routing above cannot read reliably and the safe 40 MHz. */
-static const int W5500_SPI_HZ[] = { 160 * 1000 * 1000 / 2, 160 * 1000 * 1000 / 3,
-                                    160 * 1000 * 1000 / 4, 160 * 1000 * 1000 / 8 };
+ * driver verifies the chip version register at init, so a setting that is
+ * grossly wrong fails there and the next step is tried. Marginal bit errors
+ * during operation are NOT caught by this (the SPI link has no checksum) -
+ * if they show up as TCP retransmissions, corrupted UDP payloads or RX
+ * resyncs (w5[2] in /api/status), drop the faster steps.
+ * The clocks are whole divisors of the C5's 160 MHz SPI clock source
+ * (PLL_F160M): /2, /3, /4, /8. At 80 MHz the MISO data arrives too late to
+ * be sampled in the same clock through the GPIO-matrix routing above, so
+ * 80 MHz is first tried in half-duplex mode with input_delay_ns set: the SPI
+ * driver then inserts one dummy clock before every read phase and samples
+ * one clock later. (The finer per-sample MISO delay of other chips is not
+ * implemented on the C5, so whole clocks are the only compensation.) */
+typedef struct {
+  int hz;
+  int input_delay_ns;   /* > 0: half-duplex with read compensation */
+} w5500_spi_step_t;
+static const w5500_spi_step_t W5500_SPI_STEPS[] = {
+  { 160 * 1000 * 1000 / 2, 15 },
+  { 160 * 1000 * 1000 / 2, 0 },
+  { 160 * 1000 * 1000 / 3, 0 },
+  { 160 * 1000 * 1000 / 4, 0 },
+  { 160 * 1000 * 1000 / 8, 0 },
+};
 #else
 #error "No supported Ethernet driver configured (ESP32 EMAC or W5500)"
 #endif
@@ -957,12 +970,18 @@ bool bridge_eth_init(void) {
   phy_cfg.reset_gpio_num = W5500_RST_GPIO;
 
   int hz_used = 0;
-  for (size_t i = 0; i < sizeof(W5500_SPI_HZ) / sizeof(W5500_SPI_HZ[0]); i++) {
+  bool compensated = false;
+  for (size_t i = 0; i < sizeof(W5500_SPI_STEPS) / sizeof(W5500_SPI_STEPS[0]); i++) {
+    const w5500_spi_step_t *step = &W5500_SPI_STEPS[i];
     spi_device_interface_config_t dev = {};
     dev.mode           = 0;
-    dev.clock_speed_hz = W5500_SPI_HZ[i];
+    dev.clock_speed_hz = step->hz;
     dev.queue_size     = 20;
     dev.spics_io_num   = W5500_CS_GPIO;
+    if (step->input_delay_ns > 0) {
+      dev.flags         |= SPI_DEVICE_HALFDUPLEX;
+      dev.input_delay_ns = step->input_delay_ns;
+    }
 
     eth_w5500_config_t w5500 = ETH_W5500_DEFAULT_CONFIG(W5500_SPI_HOST, &dev);
     w5500.int_gpio_num = W5500_INT_GPIO;
@@ -978,10 +997,15 @@ bool bridge_eth_init(void) {
 
     esp_eth_config_t cfg = ETH_DEFAULT_CONFIG(mac, phy);
     err = esp_eth_driver_install(&cfg, &s_eth);
-    if (err == ESP_OK) { hz_used = W5500_SPI_HZ[i]; s_w5500_mac = mac; break; }
+    if (err == ESP_OK) {
+      hz_used = step->hz;
+      compensated = step->input_delay_ns > 0;
+      s_w5500_mac = mac;
+      break;
+    }
 
-    printf("[ETH ] W5500 not responding at %d MHz (%s)\n",
-           W5500_SPI_HZ[i] / 1000000, esp_err_to_name(err));
+    printf("[ETH ] W5500 not responding at %d MHz%s (%s)\n", step->hz / 1000000,
+           step->input_delay_ns > 0 ? " with read compensation" : "", esp_err_to_name(err));
     /* deinit removes the INT handler in case mac->init succeeded and only the
      * PHY failed - otherwise it would point into freed memory after del(). */
     mac->deinit(mac);
@@ -991,7 +1015,8 @@ bool bridge_eth_init(void) {
   }
   if (!s_eth) return false;
   s_eth_spi_mhz = (uint8_t)(hz_used / 1000000);
-  printf("[ETH ] W5500 on SPI at %u MHz\n", (unsigned)s_eth_spi_mhz);
+  printf("[ETH ] W5500 on SPI at %u MHz%s\n", (unsigned)s_eth_spi_mhz,
+         compensated ? " (half-duplex, read compensation)" : "");
 
   /* The W5500 has no factory MAC. In promiscuous mode its own address plays
    * no role in the data path (frames are sent with the client's source MAC),

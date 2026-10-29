@@ -33,6 +33,11 @@ extern "C" {
 /* Create the MAC instance. Takes the same configuration as
  * esp_eth_mac_new_w5500(), except that int_gpio_num is mandatory
  * (poll_period_ms must be 0) and custom SPI drivers are not supported.
+ * The SPI device may be half-duplex (SPI_DEVICE_HALFDUPLEX in
+ * spi_devcfg->flags): the W5500 protocol never sends and receives data in
+ * the same transaction, and only in half-duplex mode does the SPI driver
+ * apply input_delay_ns as dummy clocks before a read - the way to read
+ * reliably at clocks where MISO arrives a clock late.
  * Returns NULL on invalid arguments or out of memory. */
 esp_eth_mac_t *w5500_mac_new(const eth_w5500_config_t *w5500_config,
                              const eth_mac_config_t *mac_config);
