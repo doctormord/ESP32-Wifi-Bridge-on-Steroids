@@ -504,3 +504,11 @@ INT was soldered to IO12 (UART0 RX) so that the W5500-Lite and the C5 module for
 - A power cycle with the Ethernet cable unplugged booted at once; one with an active port did not answer within ~90 s.
 - Open: whether IO12 low during a C5 reset (W5500 holding INT with received frames) prevents booting, or whether this is a management reachability problem of the test setup (the bridge clones the MAC of the laptop's Ethernet port while the same laptop is on the Wi-Fi). Next step: reboot tests with the USB console attached, and no power cycle until the uptime shows whether the board had booted.
 - Side observation: this board reports a power-on as reset reason 4 (`ESP_RST_PANIC`) without a coredump and without RTC data, so the crash history fills with identical entries after every power cycle.
+
+## 2026-10-29 (evening): cause found - the reboot tests tripped the boot-loop protection
+
+With the USB console logged during the reboot tests (DTR asserted, RTS off, so opening the port does not reset the chip), the next "not back" case showed a normal boot in 0.3 s, then `[BOOT] Several boots without stable operation` and the provisioning AP. The boot-loop protection counts every boot that does not reach 60 s of uptime, and after three it enters the portal. Requested reboots counted too: OTA and `/api/reboot` only a few tens of seconds apart were enough. The portal leaves on its own only after `ap_idle_reboot_s` (15 min), and nobody waited that long. This explains all three episodes, including the one without an Ethernet cable. INT on IO12 boots normally every time and stays.
+
+- Fix (`72e00e8`): `bridge_restart_requested()` sets an RTC marker of its own before `esp_restart()` for `/api/reboot` and OTA, and the next boot leaves the failed-boot counter unchanged. This is separate from the watchdog's planned-restart marker, so the crash history and `wd_last_reason` do not see such reboots as watchdog restarts.
+- Verified: 5 reboots via `/api/reboot`, each 10 s after the previous boot came up, all back (34 s each without Ethernet: ~30 s waiting for a client frame, then the stored MAC). The portal was never entered.
+- The other open point of the previous entry stands: a power-on is reported as reset reason 4 on this board.
