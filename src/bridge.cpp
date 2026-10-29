@@ -93,19 +93,18 @@ extern "C" esp_err_t esp_wifi_set_tx_done_cb(
  * IO2 is a strapping pin; as MISO it is only driven by the W5500 while CS is
  * low, so it cannot disturb the boot strapping. IO3 is JTAG MTDI, not a
  * strapping pin, and is free to use as the W5500 reset output.
- * INT is on IO15: free, not a strapping pin and not a UART pin. It must not
- * be IO12 (UART0 RX): the W5500 keeps running while the ESP32-C5 resets and
- * holds INT low whenever it has received frames, and with INT on IO12 the
- * C5 then often does not boot - after software resets as well as after
- * power-on with traffic on the Ethernet port. INT on IO15 is not what breaks
- * esptool's automatic reset into download mode over USB: that fails either
- * way. */
+ * INT is on IO12, the pin next to the W5500-Lite's INT when the two boards
+ * are soldered together as one block. IO12 is UART0 RX, but not a strapping
+ * pin, and the console runs on USB-Serial/JTAG only, so nothing in the
+ * firmware uses UART0. The W5500 keeps running and may hold INT low while
+ * the ESP32-C5 is in reset; that only matters to the ROM's UART download
+ * mode, which is entered by strapping (BOOT held), not by UART0 RX. */
 #define W5500_SPI_HOST      SPI2_HOST
 #define W5500_SCLK_GPIO     9
 #define W5500_MOSI_GPIO     8
 #define W5500_MISO_GPIO     2
 #define W5500_CS_GPIO       10
-#define W5500_INT_GPIO      15
+#define W5500_INT_GPIO      12
 #define W5500_RST_GPIO      3
 /* SPI settings tried in order by bridge_eth_init(). 80 MHz is the W5500's
  * theoretical design maximum; its datasheet only guarantees 33.3 MHz. The
