@@ -493,3 +493,12 @@ Branch `esp32c5-sct` (not merged). Goal: run each RX piece (read + RX_RD write +
 
   Bursts (40 x N frames, 40 ms gap) lost per burst with SCT: 15: 0, 20: 1.4-1.6, 40: 6.5-7.8, 60: 14.8-15.5, the same as without.
 - **Conclusion:** the per-transaction ISR time was not on the critical path. It overlapped the Wi-Fi delivery work, which runs on the same single core. The earlier estimate of "~10 us per transaction with the bus idle" was wrong in the part that mattered: the bus stays almost fully used (~145-154 us per 1516-byte frame against 152 us of raw transfer at 80 MHz). Burst loss is set by the 16 KB RX memory and the raw SPI rate. SCT is not merged: a patched framework package for no measurable gain is not worth its maintenance. The IDF bug is in `backlog.md` for a report.
+
+## 2026-10-29 (evening): W5500 INT on IO12 - boot failures, back to IO15
+
+INT was soldered to IO12 (UART0 RX) so that the W5500-Lite and the C5 module form one block, with the firmware switched accordingly (`b0e0ecc`, reverted).
+
+- **Outcome:** of ~9 starts, 3 did not come back. Two followed `/api/reboot` (after 1-2 good ones each time), and one was a power cycle with the laptop's Ethernet port active. No ARP answer for minutes, no provisioning AP. A power cycle with the Ethernet cable unplugged booted at once; after re-plugging, the data path ran normally.
+- **Explanation (consistent with all observations, no console capture):** the W5500 keeps running through a C5 reset and holds INT low as soon as it has received frames. With INT on UART0 RX the C5 then often does not start. Whether it fails depends on whether a frame arrived just before, hence the intermittency. Once, a start failed without an Ethernet cable, which this does not explain. It was not investigated further, because the other failures were enough to rule IO12 out.
+- **Side observation:** this board reports a power-on as reset reason 4 (`ESP_RST_PANIC`) without a coredump and without RTC data, so the crash history fills with identical entries after every power cycle.
+- **Decision:** INT back on IO15 (firmware and wiring). The one-block soldering needs a jumper wire for INT.
