@@ -33,6 +33,7 @@
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"
 #include "nvs.h"
 #include "cpustat.h"
 
@@ -563,6 +564,36 @@ IRAM_ATTR static inline bool is_for_mgmt(const uint8_t *f, uint16_t len);
  * short: waiting stalls Ethernet reception, and whatever arrives meanwhile
  * is lost by the DMA in bursts.
  */
+#if CONFIG_ETH_SPI_ETHERNET_W5500
+/* Longest wait for a Wi-Fi TX buffer between two retries in eth_rx_cb(). */
+#define ETH_TX_RETRY_WAIT_US 2000
+#endif
+
+/* The "real" wait between later retries in eth_rx_cb(), once yielding did
+ * not free a Wi-Fi TX buffer.
+ *
+ * With the ESP32 EMAC this is one scheduler tick: eth_rx_cb() runs in the
+ * EMAC's own RX task, and the measured retry results are based on it.
+ *
+ * With the W5500 the same task also moves Wi-Fi -> Ethernet frames to the
+ * chip, and a tick is 10 ms (CONFIG_FREERTOS_HZ=100): a few retries per
+ * frame stall the download direction for tens of milliseconds and overflow
+ * the driver's TX ring. Instead, wait only until the Wi-Fi MAC reports any
+ * frame finished (s_air_done moves, i.e. a TX buffer was freed), at most
+ * ETH_TX_RETRY_WAIT_US. The Wi-Fi task has the higher priority, so it runs
+ * while this one polls. */
+IRAM_ATTR static void eth_tx_retry_wait(void) {
+#if CONFIG_ETH_SPI_ETHERNET_W5500
+  const uint32_t done0 = s_air_done;
+  const int64_t t0 = esp_timer_get_time();
+  while (s_air_done == done0 && esp_timer_get_time() - t0 < ETH_TX_RETRY_WAIT_US) {
+    esp_rom_delay_us(20);
+  }
+#else
+  vTaskDelay(1);
+#endif
+}
+
 IRAM_ATTR static esp_err_t eth_rx_cb(esp_eth_handle_t h, uint8_t *buffer,
                                      uint32_t len, void *priv) {
   (void)h; (void)priv;
@@ -681,7 +712,7 @@ IRAM_ATTR static esp_err_t eth_rx_cb(esp_eth_handle_t h, uint8_t *buffer,
        * vTaskDelay(1) a residual loss of about 1.5 % remained that neither
        * more buffers nor HT40 could reduce. */
       if (i < 3) taskYIELD();
-      else       vTaskDelay(1);
+      else       eth_tx_retry_wait();
     }
   }
 
