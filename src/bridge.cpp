@@ -1645,15 +1645,18 @@ bool bridge_wifi_start(void) {
   esp_log_level_set("wifi", ESP_LOG_INFO);
 
   /* Fast path: straight to the AP of the last successful connection, no
-   * scan. Only if it is still allowed under the band setting; the attempt
-   * ends early on the first disconnect (AP not found, rejected) instead of
-   * waiting out the full timeout. */
+   * scan. Only if it is still allowed under the band setting - and with
+   * "prefer 5 GHz" only if it is a 5 GHz AP: a stored 2.4 GHz AP would
+   * otherwise keep the bridge on 2.4 GHz after every boot until roaming
+   * moves it. The attempt ends early on the first disconnect (AP not found,
+   * rejected) instead of waiting out the full timeout. */
   last_ap_t la;
   if (last_ap_load(&la) && net_in_use(la.slot)) {
     wifi_ap_record_t rec = {};
     memcpy(rec.bssid, la.bssid, 6);
     rec.primary = la.channel;
-    if (ap_allowed(&rec)) {
+    if (ap_allowed(&rec) &&
+        !(band_setting() == WIFI_BAND_PREFER_5G && !ap_is_5g(&rec))) {
       s_last_ap = la;   /* known, so an identical connect does not rewrite NVS */
       sta_lock_ap(la.slot, &rec, false);
       printf("[WIFI] Connecting to '%s' via last AP %02x:%02x:%02x:%02x:%02x:%02x, channel %u (no scan)...\n",
