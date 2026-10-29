@@ -24,11 +24,11 @@
 extern "C" {
 #endif
 
-/* Largest single SPI transfer the driver issues (a batch of received
- * frames). Pass it as max_transfer_sz to spi_bus_initialize(): the bus
+/* Largest RX batch the driver reads per round: the whole 16 KB socket RX
+ * memory. Pass it as max_transfer_sz to spi_bus_initialize(): the bus
  * default (4092 bytes with DMA) is smaller. With a smaller bus limit the
  * driver still works, just with smaller batches. */
-#define W5500_MAC_MAX_TRANSFER 6144
+#define W5500_MAC_MAX_TRANSFER 16384
 
 /* Create the MAC instance. Takes the same configuration as
  * esp_eth_mac_new_w5500(), except that int_gpio_num is mandatory
@@ -71,8 +71,10 @@ typedef struct {
  * a callback that has to wait there - e.g. for a Wi-Fi TX buffer - calls it
  * meanwhile, so the TX ring keeps draining. Otherwise the Wi-Fi task, held
  * in transmit() waiting for ring room, could not free the very buffer the
- * callback waits for. */
-void w5500_mac_pump_tx(esp_eth_mac_t *mac);
+ * callback waits for. Returns false while the driver is in the middle of a
+ * pipelined RX read and cannot touch the SPI bus: the caller must then not
+ * wait for Wi-Fi at all, because nothing drains the ring meanwhile. */
+bool w5500_mac_pump_tx(esp_eth_mac_t *mac);
 
 /* Copy the counters of 'mac' (created by w5500_mac_new()) into 'out'. */
 void w5500_mac_get_stats(esp_eth_mac_t *mac, w5500_mac_stats_t *out);

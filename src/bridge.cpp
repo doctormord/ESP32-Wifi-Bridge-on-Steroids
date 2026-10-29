@@ -603,7 +603,7 @@ IRAM_ATTR static void eth_tx_retry_wait(void) {
   const uint32_t done0 = s_air_done;
   const int64_t t0 = esp_timer_get_time();
   while (s_air_done == done0 && esp_timer_get_time() - t0 < ETH_TX_RETRY_WAIT_US) {
-    if (s_w5500_mac) w5500_mac_pump_tx(s_w5500_mac);
+    if (s_w5500_mac && !w5500_mac_pump_tx(s_w5500_mac)) return;   /* ring cannot drain */
     esp_rom_delay_us(20);
   }
 #else

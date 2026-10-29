@@ -68,11 +68,21 @@ static const char *TAG = "w5500m";
  * loss. Only the wait for a hung chip is bounded by this. */
 #define TX_FULL_WAIT_MS    20
 
-/* Bytes fetched from RX memory per SPI read: room for four full frames plus
- * the 2-byte headers. Larger reads save transactions, but delay the first
- * frame of a batch and cost RAM. Multiple of 4 (DMA alignment). Capped at
- * runtime to what the SPI bus was set up for (rx_chunk). */
+/* Bytes fetched from RX memory per round at most: the whole socket RX
+ * memory, so a backlog is taken in one round and the per-round register
+ * accesses (RSR, RX_RD, RECV, IR) are shared by up to ten full frames.
+ * Multiple of 4 (DMA alignment). Capped at runtime to what the SPI bus was
+ * set up for (rx_chunk). */
 #define RX_CHUNK           W5500_MAC_MAX_TRANSFER
+
+/* A round's read is split into pieces of this size, all queued to the SPI
+ * driver at once: while the DMA fetches the later pieces, the frames of the
+ * pieces already in are handed to Wi-Fi, so the Wi-Fi task's work on them
+ * overlaps the SPI transfer instead of following it. Two full frames per
+ * piece; each extra piece costs one W5500 header (3 bytes + dummy clock) and
+ * one transaction set-up in the SPI ISR. Multiple of 4. */
+#define RX_PIECE           3040
+#define RX_PIECES_MAX      ((RX_CHUNK + RX_PIECE - 1) / RX_PIECE)
 
 /* Transfers above this size wait for the SPI interrupt instead of spinning,
  * so the CPU is free for the Wi-Fi stack while the DMA runs. Small register
@@ -154,6 +164,8 @@ typedef struct {
   uint32_t            rx_chunk;    /* bytes per read: RX_CHUNK or the bus limit */
   uint32_t            rx_have;
   uint16_t            rx_rd;
+  volatile bool       rx_inflight; /* queued RX pieces pending, see rx_fetch() */
+  spi_transaction_t   rx_t[RX_PIECES_MAX];
 
   bool                half_duplex; /* SPI device in half-duplex mode         */
   w5500_mac_stats_t   stats;
@@ -166,28 +178,36 @@ typedef struct {
  * phase), then 'len' data bytes. Up to 4 bytes travel in the transaction
  * itself; longer buffers go by DMA. Reads into 'data' with len > 4 need a
  * 4-byte aligned buffer, or the SPI driver allocates a bounce buffer. */
-static esp_err_t w_xfer(w5500m_t *m, uint32_t address, bool write, void *data, uint32_t len) {
-  spi_transaction_t t = {0};
-  t.cmd    = (uint16_t)(address >> W5500_ADDR_OFFSET);
-  t.addr   = (address & 0xFFFF) |
-             ((write ? W5500_ACCESS_MODE_WRITE : W5500_ACCESS_MODE_READ) << W5500_RWB_OFFSET) |
-             W5500_SPI_OP_MODE_VDM;
-  t.length = 8 * len;
+static void w_setup(const w5500m_t *m, spi_transaction_t *t, uint32_t address, bool write,
+                    void *data, uint32_t len) {
+  memset(t, 0, sizeof(*t));
+  t->cmd    = (uint16_t)(address >> W5500_ADDR_OFFSET);
+  t->addr   = (address & 0xFFFF) |
+              ((write ? W5500_ACCESS_MODE_WRITE : W5500_ACCESS_MODE_READ) << W5500_RWB_OFFSET) |
+              W5500_SPI_OP_MODE_VDM;
+  t->length = 8 * len;
   if (len <= 4) {
-    if (write) { t.flags = SPI_TRANS_USE_TXDATA; memcpy(t.tx_data, data, len); }
-    else       { t.flags = SPI_TRANS_USE_RXDATA; }
+    if (write) { t->flags = SPI_TRANS_USE_TXDATA; memcpy(t->tx_data, data, len); }
+    else       { t->flags = SPI_TRANS_USE_RXDATA; }
   } else if (write) {
-    t.tx_buffer = data;
+    t->tx_buffer = data;
   } else {
-    t.rx_buffer = data;
+    t->rx_buffer = data;
   }
   if (!write && m->half_duplex) {
     /* Half-duplex: a read has no MOSI data phase, only the MISO one - this
      * is what lets the SPI driver put its compensation dummy clocks in
      * front of it (see SPI_DEVICE_HALFDUPLEX in w5500_mac.h). */
-    t.length   = 0;
-    t.rxlength = 8 * len;
+    t->length   = 0;
+    t->rxlength = 8 * len;
   }
+}
+
+/* Run one W5500 SPI frame (see w_setup()) under spi_lock. Transfers above
+ * BIG_XFER wait for the SPI interrupt, smaller ones are polled. */
+static esp_err_t w_xfer(w5500m_t *m, uint32_t address, bool write, void *data, uint32_t len) {
+  spi_transaction_t t;
+  w_setup(m, &t, address, write, data, len);
 
   if (xSemaphoreTake(m->spi_lock, pdMS_TO_TICKS(SPI_LOCK_TIMEOUT_MS)) != pdTRUE) {
     return ESP_ERR_TIMEOUT;
@@ -404,6 +424,75 @@ static void rx_resync(w5500m_t *m, uint16_t rd, uint32_t rsr) {
 
 typedef enum { RX_IDLE, RX_PROGRESS, RX_STALLED } rx_result_t;
 
+/* Deliver every complete frame in rx_buf[*off..avail) and advance *off past
+ * them. Returns false on an implausible length header (the caller must
+ * resync), true otherwise - including when the last frame is still cut off
+ * at 'avail'. */
+static bool rx_take(w5500m_t *m, uint32_t *off, uint32_t avail) {
+  while (*off + 2 <= avail) {
+    const uint32_t flen = ((uint32_t)m->rx_buf[*off] << 8) | m->rx_buf[*off + 1];  /* incl. header */
+    if (flen < 2 + ETH_MIN_PACKET_SIZE - ETH_CRC_LEN || flen > 2 + ETH_MAX_PACKET_SIZE) return false;
+    if (*off + flen > avail) break;
+    rx_deliver(m, m->rx_buf + *off + 2, flen - 2);
+    *off += flen;
+  }
+  return true;
+}
+
+/* Fetch RX memory [from, want) (offsets from 'rd') into rx_buf and deliver
+ * the complete frames as the data comes in, advancing *off. The read is
+ * queued as RX_PIECE-sized SPI transactions in one go; after each finished
+ * piece but the last its frames go to Wi-Fi while the DMA continues with
+ * the next ones; a read that fits one piece therefore delivers nothing here.
+ * spi_lock is held throughout, and rx_inflight tells w5500_mac_pump_tx() not
+ * to start its own transfers meanwhile (the SPI driver allows no polled
+ * transaction while queued ones are pending on the device). *bad is set on
+ * an implausible header; delivery stops there, but all pieces are still
+ * collected. Returns ESP_OK once all data is in rx_buf. */
+static esp_err_t rx_fetch(w5500m_t *m, uint16_t rd, uint32_t from, uint32_t want,
+                          uint32_t *off, bool *bad) {
+  if (xSemaphoreTake(m->spi_lock, pdMS_TO_TICKS(SPI_LOCK_TIMEOUT_MS)) != pdTRUE) {
+    return ESP_ERR_TIMEOUT;
+  }
+  const int64_t t0 = esp_timer_get_time();
+  const uint32_t d0 = m->stats.deliver_us;
+  esp_err_t e = ESP_OK;
+  uint32_t queued = 0;
+  for (uint32_t pos = from; pos < want && queued < RX_PIECES_MAX; pos += RX_PIECE) {
+    const uint32_t n = want - pos < RX_PIECE ? want - pos : RX_PIECE;
+    w_setup(m, &m->rx_t[queued], W5500_MEM_SOCK_RX(0, (uint32_t)(uint16_t)(rd + pos)), false,
+            m->rx_buf + pos, n);
+    m->rx_t[queued].user = (void *)(uintptr_t)(pos + n);
+    e = spi_device_queue_trans(m->spi, &m->rx_t[queued], portMAX_DELAY);
+    if (e != ESP_OK) break;
+    queued++;
+  }
+  m->rx_inflight = queued > 0;
+  for (uint32_t i = 0; i < queued; i++) {
+    spi_transaction_t *done;
+    const esp_err_t r = spi_device_get_trans_result(m->spi, &done, portMAX_DELAY);
+    if (r != ESP_OK) { e = r; continue; }
+    if (done->flags & SPI_TRANS_USE_RXDATA) {   /* <= 4 bytes came in rx_data */
+      const uint32_t n = (done->rxlength ? done->rxlength : done->length) / 8;
+      memcpy(m->rx_buf + (uint32_t)(uintptr_t)done->user - n, done->rx_data, n);
+    }
+    /* The last piece's frames are left to the caller, which delivers them
+     * after spi_lock is released - then w5500_mac_pump_tx() can work again
+     * if Wi-Fi makes the delivery wait. Earlier pieces are delivered only
+     * while the TX ring is empty: with Wi-Fi -> Ethernet frames waiting, a
+     * delivery that has to wait for Wi-Fi would hold up the ring, and the
+     * Wi-Fi task may be blocked in transmit() on exactly that ring. */
+    if (i + 1 < queued && e == ESP_OK && !*bad && m->tx_tail == m->tx_head) {
+      *bad = !rx_take(m, off, (uint32_t)(uintptr_t)done->user);
+    }
+  }
+  m->rx_inflight = false;
+  m->stats.spi_us += (uint32_t)(esp_timer_get_time() - t0) - (m->stats.deliver_us - d0);
+  xSemaphoreGive(m->spi_lock);
+  if (e != ESP_OK) ESP_LOGE(TAG, "SPI RX transfer failed: %s", esp_err_to_name(e));
+  return e;
+}
+
 /* One reception round: read Sn_RX_RSR and Sn_RX_RD together, fetch up to
  * RX_CHUNK bytes (minus what is still buffered), deliver every complete
  * frame, then release them all with one RX_RD write and one RECV. A frame
@@ -423,28 +512,25 @@ static rx_result_t rx_service(w5500m_t *m) {
   if (rsr == 0) return RX_IDLE;
 
   const uint32_t want = rsr < m->rx_chunk ? rsr : m->rx_chunk;
+  uint32_t off = 0;
+  bool bad = false;
   if (want > m->rx_have) {
     /* Re-read up to 3 already buffered bytes so the DMA target stays
      * 4-byte aligned; they read back identical. */
     const uint32_t from = m->rx_have & ~3u;
-    if (w_read(m, W5500_MEM_SOCK_RX(0, (uint32_t)(uint16_t)(rd + from)), m->rx_buf + from,
-               want - from) != ESP_OK) {
+    if (rx_fetch(m, rd, from, want, &off, &bad) == ESP_OK) {
+      m->rx_have = want;
+    } else if (off == 0) {
       m->rx_have = 0;
       return RX_IDLE;
+    } else {
+      m->rx_have = off;   /* release what was delivered, re-read the rest */
     }
-    m->rx_have = want;
   }
-
-  uint32_t off = 0;
-  while (off + 2 <= m->rx_have) {
-    const uint32_t flen = ((uint32_t)m->rx_buf[off] << 8) | m->rx_buf[off + 1];  /* incl. header */
-    if (flen < 2 + ETH_MIN_PACKET_SIZE - ETH_CRC_LEN || flen > 2 + ETH_MAX_PACKET_SIZE) {
-      rx_resync(m, rd, rsr);
-      return RX_PROGRESS;
-    }
-    if (off + flen > m->rx_have) break;
-    rx_deliver(m, m->rx_buf + off + 2, flen - 2);
-    off += flen;
+  if (!bad) bad = !rx_take(m, &off, m->rx_have);
+  if (bad) {
+    rx_resync(m, rd, rsr);
+    return RX_PROGRESS;
   }
   if (off == 0) return RX_STALLED;
   m->stats.rx_batches++;
@@ -798,10 +884,12 @@ static esp_err_t w5500m_del(esp_eth_mac_t *mac) {
  * itself (inside the esp_eth input callback), which already holds op_lock
  * and owns the TX side, so no locking is needed - and from any other task
  * it does nothing. */
-void w5500_mac_pump_tx(esp_eth_mac_t *mac) {
+bool w5500_mac_pump_tx(esp_eth_mac_t *mac) {
   w5500m_t *m = __containerof(mac, w5500m_t, parent);
-  if (xTaskGetCurrentTaskHandle() != m->task || !m->running) return;
+  if (xTaskGetCurrentTaskHandle() != m->task || !m->running) return true;
+  if (m->rx_inflight) return false;
   if (m->tx_tail != m->tx_head) tx_service(m);
+  return true;
 }
 
 /* See w5500_mac.h. */
