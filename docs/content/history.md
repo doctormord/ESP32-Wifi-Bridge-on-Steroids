@@ -476,3 +476,20 @@ ESP32-C5 + W5500, upload direction (LAN -> Wi-Fi), external 3.3 V supply. Measur
   - SCT (segmented transfer) mode is not offered for the C5 in ESP-IDF 5.5.1 (it is for C6/S3/C3).
   - SPI mode 0 vs 3: both sample on the rising edge - no effect expected, not flashed.
 - Online search (GitHub, esp32.com, WIZnet docs, Raspberry Pi forum): no published W5500 MACRAW figure above ~35 Mbit/s found. WIZnet's "55 Mbps" headline has no stated method. Espressif's own C5 iperf figures: UDP TX 63-64 Mbit/s, TCP TX 49-50 in a shield box.
+
+## 2026-10-29 (later): SCT backport for the C5 - works, no gain
+
+Branch `esp32c5-sct` (not merged). Goal: run each RX piece (read + RX_RD write + RECV, plus the size read on the last piece) as one segmented SPI transfer (SCT) with a single interrupt instead of three.
+
+- **Backport onto IDF 5.5.1:** the SPI master driver and the HAL already contain the whole SCT implementation, compiled in only where `soc_caps.h` sets `SOC_SPI_SCT_SUPPORTED`. Missing for the C5 were the five `SOC_SPI_SCT_*` caps and the LL functions in `hal/esp32c5/include/hal/spi_ll.h`. The C6 functions fit unchanged: same 14-register conf list and magic value as in IDF master's C5 port (`2d811702f3`, which reworked the API into `spi_sct_ll_*`, so it cannot be copied directly). `scripts/idf_sct_backport.py` inserts both into the framework package as a pre-build step, between marker comments.
+- **Driver specifics:** SCT ignores `SPI_TRANS_USE_TXDATA`/`RXDATA` and does not copy into bounce buffers, so all small register accesses need their own DMA-capable buffers. It does not apply the device's timing either: the read compensation dummy clock is set per segment (computed with `spi_hal_cal_timing()`). The host can run nothing but SCTs while in SCT mode, so the mode is switched on and off around each chain. The DMA descriptor pool must hold a whole chain (`max_transfer_sz` 24 x 4092). `spi_bus_get_max_transaction_len()` caps its answer at 32767, so it cannot be used to check the pool size.
+- **Hang found:** the first build stalled the driver task after ~25 RX rounds, the Ethernet side went dead, and the Mac dropped the link. A diagnostic task logged the stage and the SPI2 registers: stuck in `spi_device_transmit()` of a TX frame, transaction never started (`cmd` 0, `dma_int_raw` 0). Cause: `spi_hal_sct_deinit()` clears the trans-done interrupt, which the SPI master needs pending to enter its ISR for the next queued transaction (`spi_hal_init()` sets it for exactly that). IDF master has the same code. Workaround: `spi_ll_set_int_stat()` after leaving SCT mode. Since then no stalls, no drops.
+- **Measured** (interleaved A/B, same code with SCT on/off, 2 runs per deployment, SoC below 72 C before each run, UDP 70 Mbit/s offered):
+
+| | runs (Mbit/s) | mean | SPI time per frame |
+|---|---|---|---|
+| without SCT | 58.4, 53.3, 58.7, 57.6 | 57.0 | 154 us |
+| with SCT | 54.4, 53.3, 58.5, 58.9 | 56.3 | 145 us |
+
+  Bursts (40 x N frames, 40 ms gap) lost per burst with SCT: 15: 0, 20: 1.4-1.6, 40: 6.5-7.8, 60: 14.8-15.5, the same as without.
+- **Conclusion:** the per-transaction ISR time was not on the critical path. It overlapped the Wi-Fi delivery work, which runs on the same single core. The earlier estimate of "~10 us per transaction with the bus idle" was wrong in the part that mattered: the bus stays almost fully used (~145-154 us per 1516-byte frame against 152 us of raw transfer at 80 MHz). Burst loss is set by the 16 KB RX memory and the raw SPI rate. SCT is not merged: a patched framework package for no measurable gain is not worth its maintenance. The IDF bug is in `backlog.md` for a report.

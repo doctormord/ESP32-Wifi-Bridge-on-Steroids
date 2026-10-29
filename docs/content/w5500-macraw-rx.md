@@ -132,9 +132,8 @@ All figures on the same board and link:
 
 From the marginal loss of long bursts, the drain rate during a line-rate burst
 is ~66–68 % of 100 Mbit/s, against the ~80 % that 80 MHz SPI allows
-theoretically. The rest is per-transaction cost in the SPI driver's interrupt
-handler. Inferred from the timing, not measured directly: roughly 10 µs per
-transaction on this chip, with the bus idle in that time.
+theoretically. Removing most of the per-transaction interrupt work (SCT, see
+below) did not change it, so the gap is not in the SPI driver.
 
 ## What limits it now, and what did not help
 
@@ -153,11 +152,17 @@ transaction on this chip, with the bus idle in that time.
   set before `esp_eth_start()` did not survive the PHY's initialisation. The
   link stayed full duplex. Not pursued further: on a half-duplex link both
   directions also share one medium.
-- **SCT mode is not available on the C5.** SCT is the SPI peripheral's
-  segmented transfer, which runs several transactions from one DMA list without
-  an interrupt in between. ESP-IDF 5.5.1 provides it on ESP32-C6, -S3 and
-  others, but not on the C5. It would remove most of the remaining
-  per-transaction cost.
+- **SCT mode does not help.** SCT is the SPI peripheral's segmented
+  transfer: several transactions run from one DMA list, with one interrupt at
+  the end. ESP-IDF 5.5.1 does not enable it on the C5; with a backport (the
+  C6's code, the same hardware) the chain ran as one SCT per piece. SPI time
+  per frame fell from ~154 to ~145 µs, but in an interleaved A/B test
+  throughput was the same (57.0 vs 56.3 Mbit/s, run-to-run spread ±3) and
+  burst loss unchanged. The per-transaction cost was already hidden behind
+  the delivery work on the CPU, and burst loss is set by RX memory size and
+  the raw SPI rate. Leaving SCT mode also exposed an ESP-IDF bug: the master
+  driver's ISR trigger is cleared, and the next interrupt-driven transaction
+  never starts.
 - **Raising the driver task above the Wi-Fi task** gained only noise-level
   improvements (bursts of 40: 6.1 instead of 7.2 lost). It needs care: a busy
   wait in the driver task then starves Wi-Fi.
