@@ -80,11 +80,15 @@ bool bridge_eth_init(void);
  * bridge_eth_init(). 0 = no SPI Ethernet (internal EMAC) or not initialized. */
 uint8_t bridge_get_eth_spi_mhz(void);
 
-/* Ethernet driver counters since boot. Drops: [0] TX ring full, [1] SEND
- * timeout, [2] corrupt RX header (RX buffer resynced), [3] no heap for a
- * received frame. Not a drop: [4] RX rounds that found only an incomplete
- * frame. All 0 with the internal EMAC. */
-void bridge_get_eth_drv_stats(uint32_t out[5]);
+/* Ethernet driver counters since boot (all 0 with the internal EMAC).
+ * Drops: [0] TX ring full, [1] SEND timeout, [2] corrupt RX header (RX
+ * buffer resynced), [3] no heap for a received frame. Activity: [4] RX
+ * rounds that found only an incomplete frame, [5] frames received, [6] RX
+ * rounds that delivered frames, [7] frames sent, [8] driver-task rounds,
+ * [9] ms in SPI transactions, [10] ms handing received frames to the
+ * Ethernet -> Wi-Fi path. */
+#define BRIDGE_ETH_DRV_STATS 11
+void bridge_get_eth_drv_stats(uint32_t out[BRIDGE_ETH_DRV_STATS]);
 
 /* Start Ethernet and wait for the first frame from the client to learn its
  * MAC. timeout_ms = 0 -> wait forever. Returns false on timeout. */

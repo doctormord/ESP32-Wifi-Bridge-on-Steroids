@@ -855,8 +855,8 @@ static esp_eth_mac_t *s_w5500_mac = NULL;
 #endif
 
 /* See bridge.h. */
-void bridge_get_eth_drv_stats(uint32_t out[5]) {
-  out[0] = out[1] = out[2] = out[3] = out[4] = 0;
+void bridge_get_eth_drv_stats(uint32_t out[BRIDGE_ETH_DRV_STATS]) {
+  for (int i = 0; i < BRIDGE_ETH_DRV_STATS; i++) out[i] = 0;
 #if CONFIG_ETH_SPI_ETHERNET_W5500
   if (!s_w5500_mac) return;
   w5500_mac_stats_t st;
@@ -866,6 +866,12 @@ void bridge_get_eth_drv_stats(uint32_t out[5]) {
   out[2] = st.rx_bad_len;
   out[3] = st.rx_no_mem;
   out[4] = st.rx_stall;
+  out[5] = st.rx_frames;
+  out[6] = st.rx_batches;
+  out[7] = st.tx_frames;
+  out[8] = st.wakes;
+  out[9] = st.spi_us / 1000;
+  out[10] = st.deliver_us / 1000;
 #endif
 }
 

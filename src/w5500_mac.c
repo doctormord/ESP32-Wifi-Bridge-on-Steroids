@@ -169,8 +169,10 @@ static esp_err_t w_xfer(w5500m_t *m, uint32_t address, bool write, void *data, u
   if (xSemaphoreTake(m->spi_lock, pdMS_TO_TICKS(SPI_LOCK_TIMEOUT_MS)) != pdTRUE) {
     return ESP_ERR_TIMEOUT;
   }
+  const int64_t t0 = esp_timer_get_time();
   const esp_err_t e = len > BIG_XFER ? spi_device_transmit(m->spi, &t)
                                      : spi_device_polling_transmit(m->spi, &t);
+  m->stats.spi_us += (uint32_t)(esp_timer_get_time() - t0);
   xSemaphoreGive(m->spi_lock);
 
   if (e != ESP_OK) ESP_LOGE(TAG, "SPI transfer failed: %s", esp_err_to_name(e));
@@ -267,7 +269,7 @@ static void tx_service(w5500m_t *m) {
       static const uint8_t send[2] = { W5500_SCR_SEND, W5500_SIR_SEND };
       ok = w_write16(m, W5500_REG_SOCK_TX_WR(0), wr) == ESP_OK &&
            w_cmd_fast(m, send, sizeof(send)) == ESP_OK;
-      if (ok) { m->tx_wr = wr; m->tx_pending = true; }
+      if (ok) { m->tx_wr = wr; m->tx_pending = true; m->stats.tx_frames++; }
     }
     __sync_synchronize();          /* entry consumed before its space is released */
     m->tx_tail = m->tx_tail + 4 + ((len + 3u) & ~3u);
@@ -317,7 +319,10 @@ static void rx_deliver(w5500m_t *m, const uint8_t *frame, uint32_t len) {
   uint8_t *buf = malloc(len);
   if (!buf) { m->stats.rx_no_mem++; return; }
   memcpy(buf, frame, len);
+  const int64_t t0 = esp_timer_get_time();
   m->eth->stack_input(m->eth, buf, len);
+  m->stats.deliver_us += (uint32_t)(esp_timer_get_time() - t0);
+  m->stats.rx_frames++;
 }
 
 /* Discard everything in RX memory - used when a length header is implausible
@@ -377,6 +382,7 @@ static rx_result_t rx_service(w5500m_t *m) {
     off += flen;
   }
   if (off == 0) return RX_STALLED;
+  m->stats.rx_batches++;
 
   static const uint8_t recv = W5500_SCR_RECV;
   m->rx_rd = (uint16_t)(rd + off);
@@ -415,6 +421,7 @@ static void w5500m_task(void *arg) {
 
     rx_result_t rx = RX_IDLE;
     bool int_low = false;
+    m->stats.wakes++;
     xSemaphoreTake(m->op_lock, portMAX_DELAY);
     if (m->running) {
       if (gpio_get_level(m->int_gpio) == 0) {

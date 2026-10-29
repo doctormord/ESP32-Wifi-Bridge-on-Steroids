@@ -37,8 +37,10 @@ extern "C" {
 esp_eth_mac_t *w5500_mac_new(const eth_w5500_config_t *w5500_config,
                              const eth_mac_config_t *mac_config);
 
-/* Counters for frames the driver itself had to give up on, for the status
- * API. All counts since boot. */
+/* Driver counters for the status API, all since boot: first the frames the
+ * driver had to give up on, then activity counters for finding where the
+ * time per frame goes (compare two readings taken under load). The
+ * microsecond totals wrap after ~71 minutes; use differences. */
 typedef struct {
   uint32_t tx_ring_full;   /* transmit() found no room in the TX ring     */
   uint32_t tx_timeout;     /* a SEND did not complete in time             */
@@ -46,6 +48,13 @@ typedef struct {
   uint32_t rx_no_mem;      /* no heap for a received frame                */
   uint32_t rx_stall;       /* RX round found only an incomplete frame (not
                             * a drop - the frame is taken on a later round) */
+  uint32_t rx_frames;      /* frames delivered to esp_eth                 */
+  uint32_t rx_batches;     /* RX rounds that delivered at least one frame */
+  uint32_t tx_frames;      /* frames handed to the chip with SEND         */
+  uint32_t wakes;          /* driver-task rounds                          */
+  uint32_t spi_us;         /* time spent in SPI transactions              */
+  uint32_t deliver_us;     /* time spent handing frames to esp_eth, i.e.
+                            * in the bridge's Ethernet -> Wi-Fi callback  */
 } w5500_mac_stats_t;
 
 /* Copy the counters of 'mac' (created by w5500_mac_new()) into 'out'. */
