@@ -45,6 +45,22 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "w5500_regs.h"
+#include "soc/soc_caps.h"
+
+/* Segmented transfers (SCT): the SPI master runs several transactions from
+ * one DMA list, reloading the peripheral's configuration between them
+ * itself, with a single interrupt at the end. The RX chain uses it (see
+ * rx_fetch()). ESP-IDF provides it through a private API on chips whose
+ * soc_caps.h enables it - on the ESP32-C5 only with the backport applied by
+ * scripts/idf_sct_backport.py. */
+#if SOC_SPI_SCT_SUPPORTED
+#define W5500_SCT 1
+#include "esp_clk_tree.h"
+#include "esp_private/spi_master_internal.h"
+#include "hal/spi_hal.h"
+#else
+#define W5500_SCT 0
+#endif
 
 static const char *TAG = "w5500m";
 
@@ -150,6 +166,15 @@ static const char *TAG = "w5500m";
  * genuinely broken length. */
 #define RX_STALL_MAX       200
 
+/* SCT: per RX piece one segmented transfer of up to four segments (read,
+ * RX_RD write, RECV, and on the last piece the size read). */
+#define SCT_SEGS_MAX       4
+
+/* SPI clocks with CS inactive between two segments of an SCT, on top of the
+ * time the peripheral needs to load the next segment's configuration by
+ * DMA. The W5500 only needs CS high for a few ns between frames. */
+#define SCT_GAP_CLOCKS     0
+
 typedef struct {
   esp_eth_mac_t       parent;
   esp_eth_mediator_t *eth;
@@ -199,6 +224,19 @@ typedef struct {
   volatile uint32_t   tx_blocked;  /* producers waiting in transmit() for room */
 
   bool                half_duplex; /* SPI device in half-duplex mode         */
+#if W5500_SCT
+  /* SCT mode for the RX chain (see rx_fetch()): usable at all, the dummy
+   * clocks a read needs (the SPI driver adds them itself only outside SCT),
+   * the segments, and the DMA source/target buffers of the small register
+   * accesses - SCT takes buffers as given, so they must be in RAM and stay
+   * valid until the chain is done. */
+  bool                sct;
+  uint8_t             sct_dummy;
+  spi_multi_transaction_t sct_t[RX_PIECES_MAX][SCT_SEGS_MAX];
+  uint8_t             sct_rd[RX_PIECES_MAX][2];
+  uint8_t             sct_recv[2];
+  uint8_t             sct_rsr[4] __attribute__((aligned(4)));
+#endif
   w5500_mac_stats_t   stats;
 } w5500m_t;
 
@@ -541,13 +579,182 @@ static esp_err_t rx_queue(w5500m_t *m, uint32_t *queued, uint32_t address, bool 
   return e;
 }
 
+#if W5500_SCT
+/* Fill one SCT segment with a W5500 SPI frame - the same frame as
+ * w_setup(), but always with a DMA buffer, and with the read compensation
+ * dummy clocks set explicitly (SCT does not apply the device's timing). */
+static void sct_seg(const w5500m_t *m, spi_multi_transaction_t *s, uint32_t address, bool write,
+                    void *data, uint32_t len) {
+  memset(s, 0, sizeof(*s));
+  s->base.cmd  = (uint16_t)(address >> W5500_ADDR_OFFSET);
+  s->base.addr = (address & 0xFFFF) |
+                 ((write ? W5500_ACCESS_MODE_WRITE : W5500_ACCESS_MODE_READ) << W5500_RWB_OFFSET) |
+                 W5500_SPI_OP_MODE_VDM;
+  s->sct_gap_len = SCT_GAP_CLOCKS;
+  if (write) {
+    s->base.length    = 8 * len;
+    s->base.tx_buffer = data;
+  } else {
+    s->base.rxlength  = 8 * len;
+    s->base.rx_buffer = data;
+    s->seg_trans_flags = SPI_MULTI_TRANS_DUMMY_LEN_UPDATED;
+    s->dummy_bits      = m->sct_dummy;
+  }
+}
+
+/* Queue the RX chain of rx_fetch() as one SCT per piece: read, RX_RD write,
+ * RECV - and on the last piece also the size read into sct_rsr. Each SCT
+ * costs one SPI interrupt instead of one per transaction, and the pieces
+ * still complete one by one, so their frames can be delivered while the
+ * later pieces transfer. The first segment's user field holds the end of
+ * the piece in rx_buf. Counts the queued SCTs in *queued; *size_read tells
+ * whether the last one includes the size read. */
+static esp_err_t rx_queue_sct(w5500m_t *m, uint16_t rd, uint32_t dst, uint32_t want,
+                              uint32_t *queued, bool *size_read) {
+  m->sct_recv[0] = W5500_SCR_RECV;
+  m->sct_recv[1] = W5500_SIR_RECV;
+  esp_err_t e = ESP_OK;
+  for (uint32_t pos = 0; pos < want && e == ESP_OK; pos += RX_PIECE) {
+    const uint32_t k = *queued;
+    const uint32_t n = want - pos < RX_PIECE ? want - pos : RX_PIECE;
+    const bool last = pos + n >= want;
+    const uint16_t nrd = (uint16_t)(rd + pos + n);
+    spi_multi_transaction_t *s = m->sct_t[k];
+    m->sct_rd[k][0] = (uint8_t)(nrd >> 8);
+    m->sct_rd[k][1] = (uint8_t)nrd;
+    sct_seg(m, &s[0], W5500_MEM_SOCK_RX(0, (uint32_t)(uint16_t)(rd + pos)), false,
+            m->rx_buf + dst + pos, n);
+    s[0].base.user = (void *)(uintptr_t)(dst + pos + n);
+    sct_seg(m, &s[1], W5500_REG_SOCK_RX_RD(0), true, m->sct_rd[k], 2);
+    sct_seg(m, &s[2], W5500_REG_SOCK_CR(0), true, m->sct_recv, last ? 2 : 1);
+    uint32_t segs = 3;
+    if (last) sct_seg(m, &s[segs++], W5500_REG_SOCK_RX_RSR(0), false, m->sct_rsr, 4);
+    e = spi_device_queue_multi_trans(m->spi, s, segs, portMAX_DELAY);
+    if (e == ESP_OK) {
+      (*queued)++;
+      *size_read = last;
+    }
+  }
+  return e;
+}
+
+/* Check once whether the RX chain can run in SCT mode, and work out the
+ * dummy clocks a read needs: the same number the SPI driver puts in front
+ * of a half-duplex read for the device's input_delay_ns. SCT requires a
+ * half-duplex device, and a descriptor pool large enough for a whole chain
+ * (W5500_MAC_BUS_MAX_TRANSFER). */
+static bool sct_probe(w5500m_t *m, const spi_device_interface_config_t *dev, size_t bus_max) {
+  const uint32_t descs_needed = 5 * RX_PIECES_MAX + 1;   /* TX side: conf + data per segment */
+  if (!m->half_duplex || bus_max / LLDESC_MAX_NUM_PER_DESC < descs_needed) return false;
+  int khz = 0;
+  uint32_t src_hz = 0;
+  const soc_module_clk_t src = dev->clock_source ? (soc_module_clk_t)dev->clock_source
+                                                 : (soc_module_clk_t)SPI_CLK_SRC_DEFAULT;
+  if (spi_device_get_actual_freq(m->spi, &khz) != ESP_OK ||
+      esp_clk_tree_src_get_freq_hz(src, ESP_CLK_TREE_SRC_FREQ_PRECISION_CACHED, &src_hz) != ESP_OK ||
+      khz <= 0) {
+    return false;
+  }
+  int dummy = 0, miso_delay = 0;
+  spi_hal_cal_timing((int)src_hz, khz * 1000, true, dev->input_delay_ns, &dummy, &miso_delay);
+  if (dummy < 0 || dummy > 4) return false;
+  if (spi_bus_multi_trans_mode_enable(m->spi, true) != ESP_OK) return false;
+  spi_bus_multi_trans_mode_enable(m->spi, false);
+  m->sct_dummy = (uint8_t)dummy;
+  ESP_LOGI(TAG, "RX chain in SCT mode (%d dummy clock(s) per read)", dummy);
+  return true;
+}
+#endif
+
+/* The RX chain of rx_fetch() as single queued transactions: per piece a
+ * read, an RX_RD write and a RECV, then the size read into r. Delivers
+ * frames while the chain runs (see rx_fetch()). */
+static esp_err_t rx_chain_trans(w5500m_t *m, uint16_t rd, uint32_t dst, uint32_t want,
+                                uint32_t *off, bool *bad, int64_t t0, uint8_t r[4],
+                                bool *size_read) {
+  esp_err_t e = ESP_OK;
+  uint32_t queued = 0, pieces = 0;
+  for (uint32_t pos = 0; pos < want && e == ESP_OK; pos += RX_PIECE) {
+    const uint32_t n = want - pos < RX_PIECE ? want - pos : RX_PIECE;
+    const bool last = pos + n >= want;
+    const uint16_t nrd = (uint16_t)(rd + pos + n);
+    const uint8_t be[2] = { (uint8_t)(nrd >> 8), (uint8_t)nrd };
+    const uint8_t recv[2] = { W5500_SCR_RECV, W5500_SIR_RECV };
+    e = rx_queue(m, &queued, W5500_MEM_SOCK_RX(0, (uint32_t)(uint16_t)(rd + pos)), false,
+                 m->rx_buf + dst + pos, n);
+    if (e == ESP_OK) {
+      m->rx_t[queued - 1].user = (void *)(uintptr_t)(dst + pos + n);
+      pieces++;
+      e = rx_queue(m, &queued, W5500_REG_SOCK_RX_RD(0), true, (void *)be, 2);
+    }
+    if (e == ESP_OK) e = rx_queue(m, &queued, W5500_REG_SOCK_CR(0), true, (void *)recv, last ? 2 : 1);
+  }
+  *size_read = e == ESP_OK &&
+               rx_queue(m, &queued, W5500_REG_SOCK_RX_RSR(0), false, r, 4) == ESP_OK;
+  m->rx_inflight = queued > 0;
+  if (queued) rx_flush(m, true, t0);
+  uint32_t piece = 0;
+  for (uint32_t i = 0; i < queued; i++) {
+    spi_transaction_t *done;
+    const esp_err_t res = spi_device_get_trans_result(m->spi, &done, portMAX_DELAY);
+    if (res != ESP_OK) { e = res; continue; }
+    if (done->user == NULL) {                   /* register write, or the size read */
+      if (*size_read && i + 1 == queued) memcpy(r, done->rx_data, 4);
+      continue;
+    }
+    const uint32_t pend = (uint32_t)(uintptr_t)done->user;
+    if (done->flags & SPI_TRANS_USE_RXDATA) {   /* <= 4 bytes came in rx_data */
+      const uint32_t n = (done->rxlength ? done->rxlength : done->length) / 8;
+      memcpy(m->rx_buf + pend - n, done->rx_data, n);
+    }
+    if (++piece < pieces && e == ESP_OK && !*bad) {
+      *bad = !rx_take(m, off, pend, TAKE_INFLIGHT, t0);
+    }
+  }
+  return e;
+}
+
+#if W5500_SCT
+/* The same chain as rx_chain_trans(), as one SCT per piece (see
+ * rx_queue_sct()). The host is switched into SCT mode only for the chain:
+ * in SCT mode it can run nothing else, and every other access of this
+ * driver is a polled or single transaction. Switching costs a few register
+ * writes, no bus time. */
+static esp_err_t rx_chain_sct(w5500m_t *m, uint16_t rd, uint32_t dst, uint32_t want,
+                              uint32_t *off, bool *bad, int64_t t0, uint8_t r[4],
+                              bool *size_read) {
+  esp_err_t e = spi_bus_multi_trans_mode_enable(m->spi, true);
+  if (e != ESP_OK) return e;
+  uint32_t queued = 0;
+  e = rx_queue_sct(m, rd, dst, want, &queued, size_read);
+  *size_read = *size_read && e == ESP_OK;
+  m->rx_inflight = queued > 0;
+  if (queued) rx_flush(m, true, t0);
+  for (uint32_t i = 0; i < queued; i++) {
+    spi_multi_transaction_t *done;
+    const esp_err_t res = spi_device_get_multi_trans_result(m->spi, &done, portMAX_DELAY);
+    if (res != ESP_OK) { e = res; continue; }
+    if (i + 1 < queued && e == ESP_OK && !*bad) {
+      *bad = !rx_take(m, off, (uint32_t)(uintptr_t)done->base.user, TAKE_INFLIGHT, t0);
+    }
+  }
+  if (*size_read) memcpy(r, m->sct_rsr, 4);
+  spi_bus_multi_trans_mode_enable(m->spi, false);
+  return e;
+}
+#endif
+
 /* Fetch 'want' bytes of RX memory from 'rd' into rx_buf at 'dst', release
  * them on the chip as they come in, and read the received size for the
- * next round - all as one chain of queued SPI transactions that the SPI
- * ISR runs back to back, without the task in between:
+ * next round - all as one chain of queued SPI transfers that the SPI ISR
+ * runs back to back, without the task in between:
  *
  *   per RX_PIECE: read the piece, write Sn_RX_RD past it, RECV
  *   (the last RECV also clears Sn_IR.RECV), then read Sn_RX_RSR + Sn_RX_RD.
+ *
+ * With SCT (rx_chain_sct()) each piece is one segmented transfer with one
+ * interrupt, otherwise (rx_chain_trans()) each of these is a transaction of
+ * its own with an interrupt each.
  *
  * Releasing each piece right after it is read gives the chip its memory
  * back while a burst is still arriving, instead of after the whole round.
@@ -560,7 +767,7 @@ static esp_err_t rx_queue(w5500m_t *m, uint32_t *queued, uint32_t address, bool 
  * While the chain runs, the frames carried from the previous round are
  * delivered, and after each finished piece but the last its frames too
  * (rx_take(TAKE_INFLIGHT), advancing *off) - so the Wi-Fi task's work on
- * them overlaps the transfer. spi_lock is held while transactions are
+ * them overlaps the transfer. spi_lock is held while transfers are
  * queued, and rx_inflight tells w5500_mac_pump_tx() that the bus is busy
  * (the SPI driver allows no polled transaction while queued ones are
  * pending, and a second user would pick up the wrong results). Carried
@@ -580,46 +787,14 @@ static esp_err_t rx_fetch(w5500m_t *m, uint16_t rd, uint32_t dst, uint32_t want,
   if (since < CMD_SETTLE_US) esp_rom_delay_us((uint32_t)(CMD_SETTLE_US - since));
   const int64_t t0 = esp_timer_get_time();
   const uint32_t d0 = m->stats.deliver_us;
-  esp_err_t e = ESP_OK;
-  uint32_t queued = 0, pieces = 0;
-  for (uint32_t pos = 0; pos < want && e == ESP_OK; pos += RX_PIECE) {
-    const uint32_t n = want - pos < RX_PIECE ? want - pos : RX_PIECE;
-    const bool last = pos + n >= want;
-    const uint16_t nrd = (uint16_t)(rd + pos + n);
-    const uint8_t be[2] = { (uint8_t)(nrd >> 8), (uint8_t)nrd };
-    const uint8_t recv[2] = { W5500_SCR_RECV, W5500_SIR_RECV };
-    e = rx_queue(m, &queued, W5500_MEM_SOCK_RX(0, (uint32_t)(uint16_t)(rd + pos)), false,
-                 m->rx_buf + dst + pos, n);
-    if (e == ESP_OK) {
-      m->rx_t[queued - 1].user = (void *)(uintptr_t)(dst + pos + n);
-      pieces++;
-      e = rx_queue(m, &queued, W5500_REG_SOCK_RX_RD(0), true, (void *)be, 2);
-    }
-    if (e == ESP_OK) e = rx_queue(m, &queued, W5500_REG_SOCK_CR(0), true, (void *)recv, last ? 2 : 1);
-  }
   uint8_t r[4] = {0};
-  const bool size_read = e == ESP_OK &&
-                         rx_queue(m, &queued, W5500_REG_SOCK_RX_RSR(0), false, r, 4) == ESP_OK;
-  m->rx_inflight = queued > 0;
-  if (queued) rx_flush(m, true, t0);
-  uint32_t piece = 0;
-  for (uint32_t i = 0; i < queued; i++) {
-    spi_transaction_t *done;
-    const esp_err_t res = spi_device_get_trans_result(m->spi, &done, portMAX_DELAY);
-    if (res != ESP_OK) { e = res; continue; }
-    if (done->user == NULL) {                   /* register write, or the size read */
-      if (size_read && i + 1 == queued) memcpy(r, done->rx_data, 4);
-      continue;
-    }
-    const uint32_t pend = (uint32_t)(uintptr_t)done->user;
-    if (done->flags & SPI_TRANS_USE_RXDATA) {   /* <= 4 bytes came in rx_data */
-      const uint32_t n = (done->rxlength ? done->rxlength : done->length) / 8;
-      memcpy(m->rx_buf + pend - n, done->rx_data, n);
-    }
-    if (++piece < pieces && e == ESP_OK && !*bad) {
-      *bad = !rx_take(m, off, pend, TAKE_INFLIGHT, t0);
-    }
-  }
+  bool size_read = false;
+#if W5500_SCT
+  const esp_err_t e = m->sct ? rx_chain_sct(m, rd, dst, want, off, bad, t0, r, &size_read)
+                             : rx_chain_trans(m, rd, dst, want, off, bad, t0, r, &size_read);
+#else
+  const esp_err_t e = rx_chain_trans(m, rd, dst, want, off, bad, t0, r, &size_read);
+#endif
   m->rx_inflight = false;
   m->last_cmd_us = esp_timer_get_time();
   m->stats.spi_us += (uint32_t)(esp_timer_get_time() - t0) - (m->stats.deliver_us - d0);
@@ -1129,6 +1304,9 @@ esp_eth_mac_t *w5500_mac_new(const eth_w5500_config_t *w5500_config,
     ESP_LOGW(TAG, "SPI bus allows only %u bytes per transfer, RX batches limited",
              (unsigned)bus_max);
   }
+#if W5500_SCT
+  m->sct = sct_probe(m, &dev, bus_max);
+#endif
 
   const BaseType_t core = (mac_config->flags & ETH_MAC_FLAG_PIN_TO_CORE)
                           ? (BaseType_t)esp_cpu_get_core_id() : tskNO_AFFINITY;

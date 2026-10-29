@@ -1022,7 +1022,7 @@ bool bridge_eth_init(void) {
   bus.miso_io_num   = W5500_MISO_GPIO;
   bus.quadwp_io_num = -1;
   bus.quadhd_io_num = -1;
-  bus.max_transfer_sz = W5500_MAC_MAX_TRANSFER;   /* RX batches, see w5500_mac.h */
+  bus.max_transfer_sz = W5500_MAC_BUS_MAX_TRANSFER;   /* RX batches + SCT, see w5500_mac.h */
   err = spi_bus_initialize(W5500_SPI_HOST, &bus, SPI_DMA_CH_AUTO);
   if (err != ESP_OK) {
     printf("[ETH ] spi_bus_initialize: %s\n", esp_err_to_name(err));

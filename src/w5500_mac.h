@@ -30,6 +30,14 @@ extern "C" {
  * driver still works, just with smaller batches. */
 #define W5500_MAC_MAX_TRANSFER 8192
 
+/* What to pass as max_transfer_sz instead where the SPI master supports
+ * segmented transfers (SCT): the bus sizes its DMA descriptor pool from it
+ * (one per 4092 bytes), and an RX chain in SCT mode needs a descriptor per
+ * segment on top of the data - about 20 for a W5500_MAC_MAX_TRANSFER chain.
+ * The descriptors cost 24 bytes each; transfers stay capped at
+ * W5500_MAC_MAX_TRANSFER by the driver. */
+#define W5500_MAC_BUS_MAX_TRANSFER (24 * 4092)
+
 /* Create the MAC instance. Takes the same configuration as
  * esp_eth_mac_new_w5500(), except that int_gpio_num is mandatory
  * (poll_period_ms must be 0) and custom SPI drivers are not supported.
