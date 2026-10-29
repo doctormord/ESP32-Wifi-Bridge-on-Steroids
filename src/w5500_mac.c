@@ -58,6 +58,8 @@
 #include "esp_clk_tree.h"
 #include "esp_private/spi_master_internal.h"
 #include "hal/spi_hal.h"
+#include "hal/spi_ll.h"
+#include "soc/spi_struct.h"
 #else
 #define W5500_SCT 0
 #endif
@@ -175,6 +177,10 @@ static const char *TAG = "w5500m";
  * DMA. The W5500 only needs CS high for a few ns between frames. */
 #define SCT_GAP_CLOCKS     0
 
+/* An SCT not completed after this long is reported as stuck (see
+ * rx_chain_sct()); a whole chain takes well under a millisecond. */
+#define SCT_STUCK_MS       100
+
 typedef struct {
   esp_eth_mac_t       parent;
   esp_eth_mediator_t *eth;
@@ -232,6 +238,7 @@ typedef struct {
    * valid until the chain is done. */
   bool                sct;
   uint8_t             sct_dummy;
+  spi_dev_t          *sct_hw;      /* the SPI host's registers, see sct_mode_off() */
   spi_multi_transaction_t sct_t[RX_PIECES_MAX][SCT_SEGS_MAX];
   uint8_t             sct_rd[RX_PIECES_MAX][2];
   uint8_t             sct_recv[2];
@@ -580,6 +587,17 @@ static esp_err_t rx_queue(w5500m_t *m, uint32_t *queued, uint32_t address, bool 
 }
 
 #if W5500_SCT
+/* Leave SCT mode. The SPI master starts a queued transaction from its ISR,
+ * and the ISR only runs if the peripheral's trans-done interrupt is pending
+ * - spi_hal_init() leaves it set for that reason. spi_hal_sct_deinit()
+ * clears it, so after leaving SCT mode the next queued (non-polled)
+ * transaction would never start. Setting it again restores the state the
+ * driver expects when idle. */
+static void sct_mode_off(w5500m_t *m) {
+  spi_bus_multi_trans_mode_enable(m->spi, false);
+  spi_ll_set_int_stat(m->sct_hw);
+}
+
 /* Fill one SCT segment with a W5500 SPI frame - the same frame as
  * w_setup(), but always with a DMA buffer, and with the read compensation
  * dummy clocks set explicitly (SCT does not apply the device's timing). */
@@ -641,11 +659,12 @@ static esp_err_t rx_queue_sct(w5500m_t *m, uint16_t rd, uint32_t dst, uint32_t w
 /* Check once whether the RX chain can run in SCT mode, and work out the
  * dummy clocks a read needs: the same number the SPI driver puts in front
  * of a half-duplex read for the device's input_delay_ns. SCT requires a
- * half-duplex device, and a descriptor pool large enough for a whole chain
- * (W5500_MAC_BUS_MAX_TRANSFER). */
-static bool sct_probe(w5500m_t *m, const spi_device_interface_config_t *dev, size_t bus_max) {
-  const uint32_t descs_needed = 5 * RX_PIECES_MAX + 1;   /* TX side: conf + data per segment */
-  if (!m->half_duplex || bus_max / LLDESC_MAX_NUM_PER_DESC < descs_needed) return false;
+ * half-duplex device. Whether the bus has DMA descriptors for a whole chain
+ * (W5500_MAC_BUS_MAX_TRANSFER) only shows when one is queued - see
+ * rx_chain_sct(). */
+static bool sct_probe(w5500m_t *m, const spi_device_interface_config_t *dev, spi_host_device_t host) {
+  m->sct_hw = SPI_LL_GET_HW(host);
+  if (!m->half_duplex || !m->sct_hw) return false;
   int khz = 0;
   uint32_t src_hz = 0;
   const soc_module_clk_t src = dev->clock_source ? (soc_module_clk_t)dev->clock_source
@@ -658,8 +677,12 @@ static bool sct_probe(w5500m_t *m, const spi_device_interface_config_t *dev, siz
   int dummy = 0, miso_delay = 0;
   spi_hal_cal_timing((int)src_hz, khz * 1000, true, dev->input_delay_ns, &dummy, &miso_delay);
   if (dummy < 0 || dummy > 4) return false;
-  if (spi_bus_multi_trans_mode_enable(m->spi, true) != ESP_OK) return false;
-  spi_bus_multi_trans_mode_enable(m->spi, false);
+  const esp_err_t e = spi_bus_multi_trans_mode_enable(m->spi, true);
+  if (e != ESP_OK) {
+    ESP_LOGW(TAG, "no SCT: %s", esp_err_to_name(e));
+    return false;
+  }
+  sct_mode_off(m);
   m->sct_dummy = (uint8_t)dummy;
   ESP_LOGI(TAG, "RX chain in SCT mode (%d dummy clock(s) per read)", dummy);
   return true;
@@ -728,18 +751,38 @@ static esp_err_t rx_chain_sct(w5500m_t *m, uint16_t rd, uint32_t dst, uint32_t w
   uint32_t queued = 0;
   e = rx_queue_sct(m, rd, dst, want, &queued, size_read);
   *size_read = *size_read && e == ESP_OK;
+  if (e == ESP_ERR_INVALID_STATE) {
+    /* Out of DMA descriptors: the bus was set up with a smaller
+     * max_transfer_sz than W5500_MAC_BUS_MAX_TRANSFER. This round fails
+     * (rx_service() starts over from the chip's pointers), later ones run
+     * without SCT. */
+    ESP_LOGW(TAG, "SCT chain does not fit the SPI bus's DMA descriptors, SCT off");
+    m->sct = false;
+  }
   m->rx_inflight = queued > 0;
   if (queued) rx_flush(m, true, t0);
   for (uint32_t i = 0; i < queued; i++) {
     spi_multi_transaction_t *done;
-    const esp_err_t res = spi_device_get_multi_trans_result(m->spi, &done, portMAX_DELAY);
+    esp_err_t res = spi_device_get_multi_trans_result(m->spi, &done, pdMS_TO_TICKS(SCT_STUCK_MS));
+    if (res == ESP_ERR_TIMEOUT) {
+      /* An SCT that has not completed by now never will. It cannot be taken
+       * back from the SPI driver, so log the peripheral state for analysis
+       * and keep waiting. */
+      ESP_LOGE(TAG, "SCT %u/%u stuck: cmd %08" PRIx32 " user %08" PRIx32 " ms_dlen %08" PRIx32
+               " dma_conf %08" PRIx32 " int_ena %08" PRIx32 " int_raw %08" PRIx32
+               " slave %08" PRIx32 " want %u",
+               (unsigned)i, (unsigned)queued, GPSPI2.cmd.val, GPSPI2.user.val, GPSPI2.ms_dlen.val,
+               GPSPI2.dma_conf.val, GPSPI2.dma_int_ena.val, GPSPI2.dma_int_raw.val,
+               GPSPI2.slave.val, (unsigned)want);
+      res = spi_device_get_multi_trans_result(m->spi, &done, portMAX_DELAY);
+    }
     if (res != ESP_OK) { e = res; continue; }
     if (i + 1 < queued && e == ESP_OK && !*bad) {
       *bad = !rx_take(m, off, (uint32_t)(uintptr_t)done->base.user, TAKE_INFLIGHT, t0);
     }
   }
   if (*size_read) memcpy(r, m->sct_rsr, 4);
-  spi_bus_multi_trans_mode_enable(m->spi, false);
+  sct_mode_off(m);
   return e;
 }
 #endif
@@ -1238,6 +1281,16 @@ void w5500_mac_get_stats(esp_eth_mac_t *mac, w5500_mac_stats_t *out) {
 }
 
 /* See w5500_mac.h. */
+bool w5500_mac_uses_sct(esp_eth_mac_t *mac) {
+#if W5500_SCT
+  return __containerof(mac, w5500m_t, parent)->sct;
+#else
+  (void)mac;
+  return false;
+#endif
+}
+
+/* See w5500_mac.h. */
 esp_eth_mac_t *w5500_mac_new(const eth_w5500_config_t *w5500_config,
                              const eth_mac_config_t *mac_config) {
   ESP_RETURN_ON_FALSE(w5500_config && mac_config && w5500_config->spi_devcfg &&
@@ -1305,7 +1358,7 @@ esp_eth_mac_t *w5500_mac_new(const eth_w5500_config_t *w5500_config,
              (unsigned)bus_max);
   }
 #if W5500_SCT
-  m->sct = sct_probe(m, &dev, bus_max);
+  m->sct = sct_probe(m, &dev, w5500_config->spi_host_id);
 #endif
 
   const BaseType_t core = (mac_config->flags & ETH_MAC_FLAG_PIN_TO_CORE)

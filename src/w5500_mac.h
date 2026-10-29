@@ -88,6 +88,10 @@ bool w5500_mac_pump_tx(esp_eth_mac_t *mac);
 /* Copy the counters of 'mac' (created by w5500_mac_new()) into 'out'. */
 void w5500_mac_get_stats(esp_eth_mac_t *mac, w5500_mac_stats_t *out);
 
+/* Whether the RX chain of 'mac' runs in the SPI master's segmented transfer
+ * mode (SCT) - see W5500_MAC_BUS_MAX_TRANSFER. */
+bool w5500_mac_uses_sct(esp_eth_mac_t *mac);
+
 #ifdef __cplusplus
 }
 #endif

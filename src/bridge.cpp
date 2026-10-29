@@ -1082,8 +1082,9 @@ bool bridge_eth_init(void) {
   }
   if (!s_eth) return false;
   s_eth_spi_mhz = (uint8_t)(hz_used / 1000000);
-  printf("[ETH ] W5500 on SPI at %u MHz%s\n", (unsigned)s_eth_spi_mhz,
-         compensated ? " (half-duplex, read compensation)" : "");
+  printf("[ETH ] W5500 on SPI at %u MHz%s%s\n", (unsigned)s_eth_spi_mhz,
+         compensated ? " (half-duplex, read compensation)" : "",
+         w5500_mac_uses_sct(s_w5500_mac) ? ", RX chain in SCT mode" : "");
 
   /* The W5500 has no factory MAC. In promiscuous mode its own address plays
    * no role in the data path (frames are sent with the client's source MAC),
