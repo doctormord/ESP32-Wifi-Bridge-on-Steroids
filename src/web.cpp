@@ -381,18 +381,24 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
     <option value="0">on (default)</option>
     <option value="1">off</option>
   </select>
+  <label>Throttle start temperature
+    <span class="hint">&deg;C, 0 = default (79)</span></label>
+  <input id="thr_temp_c">
   <label>Max rate LAN&rarr;Wi-Fi
     <span class="hint">Mbit/s, 0 = no limit</span></label>
   <input id="e2w_max_mbit">
   <div class="sub" style="margin:6px 0 0">
     The temperature throttle lowers the LAN&rarr;Wi-Fi rate step by step while
-    the chip runs hot (from 79&nbsp;&deg;C) and lifts it again as it cools
-    (below 76&nbsp;&deg;C); tile <i>LAN&rarr;Wi-Fi limit</i> shows what is in
+    the chip runs hot (from the start temperature, 79&nbsp;&deg;C by default)
+    and lifts it again once it is 3&nbsp;&deg;C cooler; tile <i>LAN&rarr;Wi-Fi limit</i> shows what is in
     force, the console log every change. The fixed maximum is for hardware
     whose power supply cannot carry sustained Wi-Fi transmission: an
     ESP32-C5 module feeding a W5500 from its own regulator resets above
     roughly 12&ndash;16&nbsp;Mbit/s, and the chip temperature rises too late to
-    catch that. Both act within seconds, no reboot.
+    catch that. With a separate 3.3&nbsp;V supply the chip settles around
+    81&nbsp;&deg;C at full load - raise the start temperature to about
+    90&nbsp;&deg;C and remove the maximum. All three act within seconds, no
+    reboot.
   </div>
 
   <label>TX queue cap LAN&rarr;Wi-Fi
@@ -906,7 +912,7 @@ const CFG=['name','ssid1','ssid2','ssid3','ip','mask','gw','ip2','mask2','gw2','
            'ht40','no_11b','wd_enable','wd_actions','wd_bad_windows',
            'wifi_connect_timeout_s','wifi_connect_retries','ap_idle_reboot_s',
            'roam_enable','roam_check_s','roam_rssi_threshold','roam_margin_db','txq_cap',
-           'wifi_band','thr_off','e2w_max_mbit'];
+           'wifi_band','thr_off','e2w_max_mbit','thr_temp_c'];
 /* Fill the form from /api/config and take the unsaved-changes snapshot. */
 async function load(){
   const c=await(await fetch('/api/config')).json();
@@ -972,6 +978,7 @@ function defaults(){
   $('txq_cap').value='0';
   $('thr_off').value='0';
   $('e2w_max_mbit').value='0';
+  $('thr_temp_c').value='0';
   $('tmsg').textContent='Defaults filled in - save to apply.';
   dirtyCheck();   /* set by script - does not fire an input event */
 }
@@ -1070,7 +1077,7 @@ const PW=['pass1','pass2','pass3','mqtt_pass','admin_pass'];
    bridge_apply_live_tuning()). Everything else only after a reboot. */
 const LIVE=['tx_power','eth_tx_retries','wifi_tx_retries','wd_enable','wd_actions','wd_bad_windows',
             'roam_enable','roam_check_s','roam_rssi_threshold','roam_margin_db',
-            'ap_idle_reboot_s','telemetry_s','admin_pass','txq_cap','thr_off','e2w_max_mbit'];
+            'ap_idle_reboot_s','telemetry_s','admin_pass','txq_cap','thr_off','e2w_max_mbit','thr_temp_c'];
 let SNAP=null;
 function snapshot(){SNAP={};for(const k of CFG)SNAP[k]=$(k).value;dirtyCheck()}
 /* Names of all fields that differ from the baseline. */
@@ -1495,7 +1502,7 @@ static esp_err_t h_config_get(httpd_req_t *r) {
     "\"wifi_connect_timeout_s\":%u,\"wifi_connect_retries\":%u,"
     "\"ap_idle_reboot_s\":%u,"
     "\"roam_enable\":%u,\"roam_check_s\":%u,\"roam_rssi_threshold\":%d,"
-    "\"roam_margin_db\":%u,\"txq_cap\":%u,\"wifi_band\":%u,\"band5g\":%d,\"thr_off\":%u,\"e2w_max_mbit\":%u,"
+    "\"roam_margin_db\":%u,\"txq_cap\":%u,\"wifi_band\":%u,\"band5g\":%d,\"thr_off\":%u,\"e2w_max_mbit\":%u,\"thr_temp_c\":%u,"
     "\"def\":{\"eth_tx_retries\":%u,\"wifi_tx_retries\":%u,"
     "\"static_rx_buf\":%u,\"dynamic_rx_buf\":%u,\"dynamic_tx_buf\":%u,"
     "\"rx_ba_win\":%u,\"wifi_connect_timeout_s\":%u,"
@@ -1530,7 +1537,7 @@ static esp_err_t h_config_get(httpd_req_t *r) {
 #else
     0,
 #endif
-    g_cfg.thr_off, g_cfg.e2w_max_mbit,
+    g_cfg.thr_off, g_cfg.e2w_max_mbit, g_cfg.thr_temp_c,
     def.eth_retries, def.wifi_retries,
     def.static_rx, def.dyn_rx, def.dyn_tx, def.ba_win,
     def.wifi_connect_timeout_s, def.wifi_connect_retries, def.ap_idle_reboot_s,
@@ -1675,6 +1682,10 @@ static esp_err_t h_config_post(httpd_req_t *r) {
   if (form_get(body, "e2w_max_mbit", v, sizeof(v))) {
     int t = atoi(v);
     g_cfg.e2w_max_mbit = (uint8_t)(t < 0 ? 0 : t > 200 ? 200 : t);
+  }
+  if (form_get(body, "thr_temp_c", v, sizeof(v))) {
+    int t = atoi(v);
+    g_cfg.thr_temp_c = (uint8_t)(t <= 0 ? 0 : t < 40 ? 40 : t > 110 ? 110 : t);
   }
 
   /* Take effect at the next connect (bridge_wifi_start()), not immediately -

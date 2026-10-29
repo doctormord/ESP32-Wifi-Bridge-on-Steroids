@@ -3468,24 +3468,23 @@ uint32_t bridge_get_failovers(void) { return s_fo_count; }
  * Statistics
  * ========================================================================= */
 
-/* Thermal throttle limits (SoC temperature, 0.1 degC) and rates (kbit/s).
- * On the ESP32-C5 module with a W5500 the board resets (power-on, the
- * module's regulator gives up) when sustained Wi-Fi transmission heats it;
- * the chip temperature then reads 83-84 degC, from ~65 degC idle. Above
- * THR_HOT the limit drops quickly, above THR_WARM gently; below THR_COOL it
- * is raised again until it no longer limits and is removed. */
-#define THR_HOT       800
-#define THR_WARM      790
-#define THR_COOL      760
+/* Thermal throttle: start temperature (g_cfg.thr_temp_c, default
+ * THR_DEFAULT_C) and rates (kbit/s). On the stock ESP32-C5 module with a
+ * W5500 the board resets (the module's regulator gives up) when sustained
+ * Wi-Fi transmission heats it; the chip then reads 83-84 degC, from ~65 degC
+ * idle - hence 79. From the start temperature ("warm") the limit drops
+ * gently, 1 degC above ("hot") quickly; 3 degC below it is raised again
+ * until it no longer limits and is removed. */
+#define THR_DEFAULT_C 79
 #define THR_MIN_KBPS  4000
 #define THR_OFF_KBPS  60000
 
 /* Update the Ethernet -> Wi-Fi rate limit, once per temperature sample
  * (CPUSTAT_WINDOW_MS):
  *   - Temperature part (unless g_cfg.thr_off): dynamic - lowered by 10 %
- *     per sample above THR_WARM and by 30 % above THR_HOT, raised by 20 %
- *     per sample below THR_COOL until it no longer limits and is dropped.
- *     Between THR_COOL and THR_WARM it is held. The first limit starts below
+ *     per sample from the start temperature on and by 30 % from 1 degC
+ *     above it, raised by 20 % per sample from 3 degC below it until it no
+ *     longer limits and is dropped. In between it is held. The first limit starts below
  *     the rate flowing at that moment, so it bites at once.
  *   - Fixed part: g_cfg.e2w_max_mbit, if set.
  * The lower of both is enforced in eth_rx_cb(); every change is logged with
@@ -3500,13 +3499,15 @@ static void thermal_tick(void) {
   const int16_t t = cpustat_temp_x10();
 
   uint32_t tl = s_thr_temp_kbps;
+  const int16_t warm = (int16_t)((g_cfg.thr_temp_c ? g_cfg.thr_temp_c : THR_DEFAULT_C) * 10);
+  const int16_t hot = warm + 10, cool = warm - 30;
   if (g_cfg.thr_off || t == CPUSTAT_NO_TEMP) {
     tl = 0;
   } else {
     const uint32_t base = tl ? tl : (s_kbps_e2w > THR_MIN_KBPS ? s_kbps_e2w : THR_MIN_KBPS);
-    if (t >= THR_HOT)              tl = base * 7 / 10;
-    else if (t >= THR_WARM)        tl = base * 9 / 10;
-    else if (t <= THR_COOL && tl)  tl = tl * 12 / 10;
+    if (t >= hot)                  tl = base * 7 / 10;
+    else if (t >= warm)            tl = base * 9 / 10;
+    else if (t <= cool && tl)      tl = tl * 12 / 10;
     if (tl && tl < THR_MIN_KBPS) tl = THR_MIN_KBPS;
     if (tl >= THR_OFF_KBPS) tl = 0;
   }

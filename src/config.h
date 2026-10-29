@@ -189,6 +189,14 @@ struct BridgeConfig {
    * at high rates. Both take effect within a few seconds, no reboot. */
   uint8_t  thr_off;
   uint8_t  e2w_max_mbit;
+
+  /* Chip temperature in degC at which the temperature throttle starts
+   * lowering the rate; 0 = default (THR_DEFAULT_C in bridge.cpp, 79 degC,
+   * tuned for the stock ESP32-C5 module whose regulator also feeds the
+   * W5500). With a separate 3.3 V supply the chip itself settles around
+   * 81 degC at sustained full load, so a higher value (e.g. 90) keeps the
+   * throttle as a guard against real overheating only. Live. */
+  uint8_t  thr_temp_c;
 };
 
 extern BridgeConfig g_cfg;
