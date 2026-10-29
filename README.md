@@ -308,6 +308,9 @@ All endpoints are served on the management IP (or `192.168.4.1` in provisioning 
 | `lr`, `lr_k`, `lr_el`, `lr_tot`, `lr_r` | Long-run retry check: state (as `at`), retries in the running block, minutes elapsed / total, chosen retries |
 | `spi` | W5500 SPI clock in MHz (ESP32-C5 target), 0 = internal EMAC |
 | `w5` | W5500 driver counters since boot: drops `[TX ring full, SEND timeout, RX resync, RX no heap,` then RX rounds that found only an incomplete frame (not a drop)`]` (all 0 with the internal EMAC) |
+| `w5x` | W5500 driver activity since boot: `[RX frames, RX batches, TX frames, driver-task rounds, ms in SPI, ms delivering to Wi-Fi, waits for TX ring room]` — compare two readings under load to see where the time per frame goes |
+| `temp`, `temp_max` | SoC temperature now and its maximum since boot, in 0.1 °C (−32768 = no sensor; the ESP32 of the WT32-ETH01 has none) |
+| `thr`, `drop_thr` | LAN → Wi-Fi rate limit in force in kbit/s (0 = none) and the frames it dropped (also in `drop_up`) — see *Power supply limit* below |
 | `rst`, `rtc` | Reset reason of this boot (`esp_reset_reason_t`), and whether RTC memory survived it (1) |
 | `time` | UTC Unix time, 0 = not synced via SNTP yet |
 | `build` | Git revision of the running firmware (`-dirty` if built from uncommitted changes) |
@@ -345,6 +348,8 @@ All endpoints are served on the management IP (or `192.168.4.1` in provisioning 
 | `roam_margin_db` | 0–40 |
 | `txq_cap` | 0 (off) or 4–64 frames |
 | `wifi_band` | 0 prefer 5 GHz, 1 5 GHz only, 2 2.4 GHz only, 3 strongest signal (ESP32-C5 target; `band5g` in `GET` says whether the hardware has 5 GHz) |
+| `thr_off` | 0 = temperature throttle LAN → Wi-Fi on (default), 1 = off. Live |
+| `e2w_max_mbit` | Fixed LAN → Wi-Fi limit in Mbit/s, 0 = none (default). Live |
 
 Saving applies TX power and retries immediately; watchdog and roaming settings are read live; everything else takes effect after a reboot.
 
@@ -437,6 +442,20 @@ Home Assistant creates one device with sensors for signal strength, Wi-Fi channe
 - **INT is on IO15, not IO12** (UART0 RX) as a precaution: the W5500 keeps running through a reset and holds INT low, and the ROM's download mode also listens on UART0 RX. This is *not* why the automatic reset into download mode over USB fails (see below) — that happens with INT on IO15 as well.
 - **Own W5500 MAC driver** (`src/w5500_mac.c`) instead of ESP-IDF's: transmit only queues the frame (packed 32 KB ring, large enough for a whole Wi-Fi A-MPDU burst), the next frame is written to the chip while the previous one is still on the wire, received frames are fetched several per SPI transfer, and large transfers run interrupt-driven so the single core stays free for Wi-Fi. About 4 SPI transactions per frame instead of ~10. IDF's driver is still used for the W5500's PHY.
 - **Factory reset is GPIO4**, not the BOOT button (IO28): held at reset, BOOT enters download mode.
+- **Power supply limit — read this before deploying.** On the NiceMCU ESP32-C5_MINI_V1.0 the module's own 3.3 V regulator (LDO) also feeds the W5500-Lite (128–132 mA at a 100 Mbit link, datasheet table 5.4). Under *sustained* LAN → Wi-Fi traffic, when the bridge's Wi-Fi transmitter is on most of the time, the board resets — measured with a rate-controlled UDP stream from the Ethernet side, a 20 W USB-C supply and a short cable:
+
+  | Sustained LAN → Wi-Fi | Result |
+  |---|---|
+  | 12 Mbit/s | stable for 4 min |
+  | 16 Mbit/s | reset after ~85 s, then ~30 s unreachable |
+  | 20 Mbit/s | reset after ~6 s |
+  | 24–40 Mbit/s | reset within seconds, over and over |
+  | 38 Mbit/s **Wi-Fi → LAN** (download) | stable for 3 min |
+
+  Reset reason power-on (sometimes panic) with RTC memory lost, never brownout, no core dump: the regulator gives up, not the firmware. The time to reset shrinks with load and when already warm — heat in the regulator, which heats far faster than the ESP32-C5 itself (the chip read 67 °C at a reset under heavy load and 83–84 °C under moderate load). Downloads are unaffected because the bridge then mostly *receives* over Wi-Fi and only transmits small TCP ACKs. Lower TX power (down to 8.5 dBm) does not help: what matters is how long the transmitter is on. Two things follow:
+  - **Hardware fix:** feed the W5500 from its own 3.3 V regulator (5 V in, common GND), or the whole board from a stronger 3.3 V supply.
+  - **Until then, the firmware protects itself:** `e2w_max_mbit` caps LAN → Wi-Fi (12 is the measured safe value on this hardware), and the temperature throttle (`thr_off` = 0, default) lowers the cap further in steps while the chip runs above 79 °C and lifts it again below 76 °C. Every change is logged (`[THR ] Ethernet->Wi-Fi limited to … kbit/s`), the portal shows the chip temperature and the limit in force. The temperature alone reacts too late at high rates, hence the fixed cap. Verified: 30 Mbit/s offered for 3 min with a 12 Mbit/s cap — no reset; the throttle held the chip at 78 °C at 7.9 Mbit/s and returned to 12 once it cooled.
+  - A new firmware image confirms itself only after 30 s of network reachability; a supply reset before that rolls it back. Flash with the LAN side idle.
 - **Console and flashing over the USB-C port** (USB-Serial/JTAG, `/dev/cu.usbmodem*`). On macOS the port only delivers output while the host asserts DTR. esptool's automatic reset into download mode does not work on this board: it fails with "No serial data received" and leaves the board hung until it is power-cycled. Flash the first time with BOOT held while plugging in USB, then use OTA.
 
 ### Wiring for flashing
@@ -534,6 +553,19 @@ Measured LAN → Wi-Fi with four parallel HTTP downloads from a bridged IP camer
 | own (`w5500_mac.c`) | **14.4–14.8 Mbit/s** | 9.8 Mbit/s |
 
 The single stream is limited by the camera's web server. Later, with the RX stall fix and the packed TX ring, 8 streams sustained 18.9 Mbit/s over 60 s without a single drop. A speed test from a laptop behind the bridge: ~17.5 down / ~13 up Mbit/s, against 48/31 for the laptop's own Wi-Fi at the same spot.
+
+**With all driver changes** (80 MHz SPI, TX ring with backpressure, the TX pump during retries, 8 retries, SEND_OK shortcut), laptop behind the bridge at a second site (5 GHz ch 36, −53 dBm):
+
+| | Download | Upload |
+|---|---|---|
+| Web speed test (`speedtest-cli`, Ookla servers) | **36.1–36.8 Mbit/s** | 26.6 Mbit/s¹ |
+| `networkQuality` (Apple) | 32.2–32.7 Mbit/s | 28.3–33.5 Mbit/s¹ |
+| 3 min sustained HTTP download | **36.5 Mbit/s** average, 38 peak | — |
+| Laptop's own Wi-Fi, same spot | 71.8 Mbit/s | 87.1 Mbit/s |
+
+¹ Short tests only: sustained uploads above ~12 Mbit/s reset this hardware (see *Power supply limit* in the hardware section).
+
+The download is limited by the SPI path: ~205 µs of SPI per full frame at 80 MHz, 151 µs of it payload. The W5500's 16 KB TX + 16 KB RX buffers are already all on socket 0 (the only one that does MACRAW), received frames are already fetched 9–16 per SPI burst, and the fixed-length (FDM) mode would be slower than the variable-length bursts used — there is little left on the W5500 side.
 
 The radio link is not what limits it: placed 1 m from the AP (−17 dBm) the bridge was exactly as fast as at −55 dBm. The SPI path is — with the clock raised from 53 to 80 MHz (half-duplex read compensation, see the hardware section) the same test went from 17.4 / 18.6 to **20.0 / 22.1 Mbit/s** (4 / 8 streams), every download byte-identical, no RX resyncs, the SPI bus then busy 46 % of the time instead of 64 %. CPU is ~60 % idle throughout. On 2.4 GHz the bridge got a 7 dB stronger signal (about the free-space difference between the bands) but less throughput (14–15 Mbit/s, busier band) — keep it on 5 GHz. Expect less than the WT32-ETH01's internal EMAC: every frame crosses the SPI bus, and Wi-Fi, the W5500 task and lwIP share one CPU core.
 
