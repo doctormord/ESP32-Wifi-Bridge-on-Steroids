@@ -72,8 +72,30 @@ struct BridgeStats {
   char     client_name[32];   /* host name from the DHCP request (option 12)  */
 };
 
-/* Initialize Ethernet (RMII MAC + LAN8720 PHY, no netif). */
+/* Initialize Ethernet without a netif: RMII MAC + LAN8720 PHY on the
+ * WT32-ETH01, a W5500 on SPI on the ESP32-C5 target. */
 bool bridge_eth_init(void);
+
+/* SPI clock the W5500 actually runs at, in MHz, after the step-down in
+ * bridge_eth_init(). 0 = no SPI Ethernet (internal EMAC) or not initialized. */
+uint8_t bridge_get_eth_spi_mhz(void);
+
+/* Ethernet driver counters since boot (all 0 with the internal EMAC).
+ * Drops: [0] TX ring full, [1] SEND timeout, [2] corrupt RX header (RX
+ * buffer resynced), [3] no heap for a received frame. Activity: [4] RX
+ * rounds that found only an incomplete frame, [5] frames received, [6] RX
+ * rounds that delivered frames, [7] frames sent, [8] driver-task rounds,
+ * [9] ms in SPI transactions, [10] ms handing received frames to the
+ * Ethernet -> Wi-Fi path, [11] times a send waited for room in the full TX
+ * ring. */
+#define BRIDGE_ETH_DRV_STATS 12
+
+/* Thermal throttle (bridge.cpp: thermal_tick()): the Ethernet -> Wi-Fi rate
+ * limit in force in kbit/s (0 = none), and the frames it dropped since boot
+ * (also counted in drop_up). */
+uint32_t bridge_thermal_limit_kbps(void);
+uint32_t bridge_thermal_drops(void);
+void bridge_get_eth_drv_stats(uint32_t out[BRIDGE_ETH_DRV_STATS]);
 
 /* Start Ethernet and wait for the first frame from the client to learn its
  * MAC. timeout_ms = 0 -> wait forever. Returns false on timeout. */
@@ -101,6 +123,19 @@ void bridge_get_stats(BridgeStats *out);
  * itself. Without this exception, several watchdog restarts during a longer
  * Wi-Fi outage would trip the boot-loop protection. */
 bool bridge_consume_planned_restart(void);
+
+/* Reboot on request - /api/reboot, or after an OTA update was written. The
+ * next boot does not count as a failed boot (see main.cpp's boot-loop
+ * protection): it only counts boots that end on their own before running
+ * stably, and a reboot someone asked for is not such an end. Several
+ * requested reboots within a minute would otherwise drop the bridge into the
+ * provisioning portal. Unlike bridge_mark_planned_restart() this is not a
+ * watchdog restart and is not reported as one. Does not return. */
+void bridge_restart_requested(void);
+
+/* One-shot like bridge_consume_planned_restart(): true if the CURRENT boot
+ * was caused by bridge_restart_requested(). */
+bool bridge_consume_requested_restart(void);
 
 /* Restart the Ethernet driver (stop/start) WITHOUT rebooting the chip -
  * produces a real short link down/up for the attached client while Wi-Fi
@@ -148,6 +183,13 @@ typedef struct {
 #define WD_ACT_WIFI_RECON  0x02u
 #define WD_ACT_REBOOT      0x04u
 #define WD_ACT_ALL         (WD_ACT_ETH_RESET | WD_ACT_WIFI_RECON | WD_ACT_REBOOT)
+
+/* Values of g_cfg.wifi_band (dual-band chips only). */
+#define WIFI_BAND_PREFER_5G  0u   /* both bands, 5 GHz wins if usable (default) */
+#define WIFI_BAND_ONLY_5G    1u   /* 5 GHz only, enforced in the driver         */
+#define WIFI_BAND_ONLY_2G    2u   /* 2.4 GHz only, enforced in the driver       */
+#define WIFI_BAND_STRONGEST  3u   /* both bands, strongest signal wins          */
+#define WIFI_BAND_MAX        3u
 #define WD_BAD_WINDOWS_DEF 3u
 
 /* Firmware default for ap_idle_reboot_s (config.h) - defined here rather than

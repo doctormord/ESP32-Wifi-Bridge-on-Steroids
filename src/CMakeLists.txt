@@ -9,6 +9,9 @@ idf_component_register(
         "web.cpp"
         "telemetry.cpp"
         "crashlog.cpp"
+        "conlog.cpp"
+        "cpustat.cpp"
+        "w5500_mac.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_eth              # Ethernet MAC/PHY

@@ -115,9 +115,15 @@ static bool dump_read(crash_rec_t *r) {
     strlcpy(r->task, sum->exc_task, sizeof(r->task));
     r->pc   = sum->exc_pc;
     r->bt_n = 0;
+#if CONFIG_IDF_TARGET_ARCH_XTENSA
     for (uint32_t i = 0; i < sum->exc_bt_info.depth && r->bt_n < 8; i++)
       r->bt[r->bt_n++] = sum->exc_bt_info.bt[i];
     if (sum->exc_bt_info.corrupted) r->flags |= CRASH_F_BT_CORRUPT;
+#else
+    /* RISC-V has no on-device backtrace (see h_coredump_get() in web.cpp);
+     * the return address is the best single call-site hint. */
+    r->bt[r->bt_n++] = sum->ex_info.ra;
+#endif
     strlcpy(r->elf_sha, (const char *)sum->app_elf_sha256, sizeof(r->elf_sha));
     esp_core_dump_get_panic_reason(r->reason, sizeof(r->reason));
     r->flags |= CRASH_F_DUMP;
@@ -137,6 +143,15 @@ static bool dump_read(crash_rec_t *r) {
  * reason indicates a crash - prepends a record built from the old heartbeat
  * and (for panics) the coredump. On the very first boot with this feature an
  * existing coredump is imported once, with unknown time. */
+/* Set by crashlog_boot(), read by the status API. */
+static uint8_t s_boot_rst = 0;
+static bool    s_rtc_retained = false;
+
+/* See crashlog.h. */
+uint8_t crashlog_reset_reason(void) { return s_boot_rst; }
+bool    crashlog_rtc_retained(void) { return s_rtc_retained; }
+
+/* See crashlog.h. */
 void crashlog_boot(bool watchdog_restart) {
   /* Save the previous boot's heartbeat before the new boot overwrites it. */
   const heartbeat_t prev = s_hb;
@@ -154,10 +169,18 @@ void crashlog_boot(bool watchdog_restart) {
 
   const bool exists = log_load();
   const esp_reset_reason_t rr = esp_reset_reason();
+  s_boot_rst = (uint8_t)rr;
+  s_rtc_retained = prev_valid;
+  printf("[BOOT] Reset reason %d, RTC data from previous boot %s\n",
+         (int)rr, prev_valid ? "retained" : "not retained");
 
+  /* Every reset that is a fault, not a deliberate or external action. A CPU
+   * lockup (RISC-V double exception) and a power glitch are as much a crash
+   * as a panic or a brownout, even though no coredump is written for them. */
   const bool crashed = rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT ||
                        rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT ||
-                       rr == ESP_RST_BROWNOUT;
+                       rr == ESP_RST_BROWNOUT || rr == ESP_RST_CPU_LOCKUP ||
+                       rr == ESP_RST_PWR_GLITCH;
   if (crashed) {
     crash_rec_t r = {};
     r.rst      = (uint8_t)rr;
@@ -189,10 +212,26 @@ void crashlog_boot(bool watchdog_restart) {
       } else {
         r.flags |= CRASH_F_STALE_DUMP;
       }
+      /* No new dump and no heartbeat of the previous boot: that boot did not
+       * get as far as the first heartbeat (~1 s), and the panic left nothing
+       * behind. That is what a supply that bounces while being plugged in
+       * produces - the chip starts, faults in the voltage dip and restarts
+       * itself, so this boot reports a panic instead of a power-on. */
+      if ((r.flags & CRASH_F_STALE_DUMP) && !prev_valid) r.flags |= CRASH_F_SUPPLY;
     }
-    log_prepend(&r);
+    /* Repeated supply glitches of the same build would push every real
+     * crash out of the short history: count them in the newest entry. */
+    crash_rec_t *top = s_log.n ? &s_log.r[0] : NULL;
+    if ((r.flags & CRASH_F_SUPPLY) && top && (top->flags & CRASH_F_SUPPLY) &&
+        top->rst == r.rst && strcmp(top->build, r.build) == 0) {
+      if (top->repeat < 255) top->repeat++;
+      if (r.epoch) top->epoch = r.epoch;
+    } else {
+      log_prepend(&r);
+    }
     log_save();
-    printf("[CRSH] Unexpected reset (reason %d) recorded\n", (int)rr);
+    printf("[CRSH] Unexpected reset (reason %d%s) recorded\n", (int)rr,
+           (r.flags & CRASH_F_SUPPLY) ? ", probably a supply glitch at power-on" : "");
   } else if (!exists) {
     /* Very first boot with the history: an existing coredump predates it -
      * import it once, time unknown. */

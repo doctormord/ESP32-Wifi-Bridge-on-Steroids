@@ -6,6 +6,7 @@
 # that is described in CLAUDE.md ("sdkconfig drift").
 sdkconfig.wt32-eth01
 sdkconfig.wt32-eth01-minimal
+sdkconfig.nicemcu-c5-w5500
 sdkconfig.*.old
 
 # Build artifacts and comparison images.

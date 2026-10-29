@@ -24,9 +24,18 @@
 #include "esp_event.h"
 #include "esp_eth_mac.h"
 #include "esp_eth_phy.h"
+#if CONFIG_ETH_SPI_ETHERNET_W5500
+#include "esp_eth_mac_spi.h"
+#include "driver/spi_master.h"
+#include "w5500_mac.h"
+#endif
 #include "esp_mac.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "esp_log.h"
+#include "esp_rom_sys.h"
+#include "nvs.h"
+#include "cpustat.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -70,11 +79,61 @@ extern "C" esp_err_t esp_wifi_set_tx_done_cb(
 #error "CONFIG_LWIP_L2_TO_L3_COPY must be set - see eth_rx_cb() in bridge.cpp"
 #endif
 
+#if CONFIG_ETH_USE_ESP32_EMAC
 /* --- WT32-ETH01 pin assignment -------------------------------------------- */
 #define ETH_PHY_ADDR        1
 #define ETH_PHY_MDC_GPIO    23
 #define ETH_PHY_MDIO_GPIO   18
 #define ETH_PHY_PWR_GPIO    16
+#elif CONFIG_ETH_SPI_ETHERNET_W5500
+/* --- NiceMCU ESP32-C5_MINI_V1.0 + W5500 pin assignment -------------------- *
+ * SCLK and MOSI are not on the SPI2 IO_MUX pins (IO6/IO7), so the SPI driver
+ * routes all four bus signals through the GPIO matrix. On the ESP32-C5 that
+ * is equivalent to IO_MUX up to 80 MHz (ESP-IDF SPI master documentation).
+ * IO2 is a strapping pin; as MISO it is only driven by the W5500 while CS is
+ * low, so it cannot disturb the boot strapping. IO3 is JTAG MTDI, not a
+ * strapping pin, and is free to use as the W5500 reset output.
+ * INT is on IO12, the pin next to the W5500-Lite's INT when the two boards
+ * are soldered together as one block. IO12 is UART0 RX, but not a strapping
+ * pin, and the console runs on USB-Serial/JTAG only, so nothing in the
+ * firmware uses UART0. The W5500 keeps running and may hold INT low while
+ * the ESP32-C5 is in reset; that only matters to the ROM's UART download
+ * mode, which is entered by strapping (BOOT held), not by UART0 RX. */
+#define W5500_SPI_HOST      SPI2_HOST
+#define W5500_SCLK_GPIO     9
+#define W5500_MOSI_GPIO     8
+#define W5500_MISO_GPIO     2
+#define W5500_CS_GPIO       10
+#define W5500_INT_GPIO      12
+#define W5500_RST_GPIO      3
+/* SPI settings tried in order by bridge_eth_init(). 80 MHz is the W5500's
+ * theoretical design maximum; its datasheet only guarantees 33.3 MHz. The
+ * driver verifies the chip version register at init, so a setting that is
+ * grossly wrong fails there and the next step is tried. Marginal bit errors
+ * during operation are NOT caught by this (the SPI link has no checksum) -
+ * if they show up as TCP retransmissions, corrupted UDP payloads or RX
+ * resyncs (w5[2] in /api/status), drop the faster steps.
+ * The clocks are whole divisors of the C5's 160 MHz SPI clock source
+ * (PLL_F160M): /2, /3, /4, /8. At 80 MHz the MISO data arrives too late to
+ * be sampled in the same clock through the GPIO-matrix routing above, so
+ * 80 MHz is first tried in half-duplex mode with input_delay_ns set: the SPI
+ * driver then inserts one dummy clock before every read phase and samples
+ * one clock later. (The finer per-sample MISO delay of other chips is not
+ * implemented on the C5, so whole clocks are the only compensation.) */
+typedef struct {
+  int hz;
+  int input_delay_ns;   /* > 0: half-duplex with read compensation */
+} w5500_spi_step_t;
+static const w5500_spi_step_t W5500_SPI_STEPS[] = {
+  { 160 * 1000 * 1000 / 2, 15 },
+  { 160 * 1000 * 1000 / 2, 0 },
+  { 160 * 1000 * 1000 / 3, 0 },
+  { 160 * 1000 * 1000 / 4, 0 },
+  { 160 * 1000 * 1000 / 8, 0 },
+};
+#else
+#error "No supported Ethernet driver configured (ESP32 EMAC or W5500)"
+#endif
 
 /*
  * TX retries before a frame is dropped (Ethernet -> Wi-Fi).
@@ -210,6 +269,17 @@ static uint32_t s_q_delay_ms = 0;    /* matching queue delay                 */
  * counted in s_drop_e2w, so every loss figure includes them. */
 static volatile uint8_t  s_txq_cap  = 0;
 static volatile uint32_t s_drop_cap = 0;
+
+/* Ethernet -> Wi-Fi throttle (see thermal_tick()): the rate limit in force
+ * in kbit/s (0 = none) - the lower of the temperature limit s_thr_temp_kbps
+ * and the fixed g_cfg.e2w_max_mbit - and the frames it dropped (also in
+ * s_drop_e2w). s_thr_tokens is the token bucket in bytes, refilled by
+ * eth_rx_cb() from the time since s_thr_last_us. */
+static volatile uint32_t s_thr_kbps  = 0;
+static uint32_t          s_thr_temp_kbps = 0;
+static volatile uint32_t s_drop_thr  = 0;
+static int32_t           s_thr_tokens = 0;
+static int64_t           s_thr_last_us = 0;
 
 /* Frames up to this size bypass the cap: TCP ACKs, ARP, ICMP, DNS. They cost
  * next to no airtime, and dropping a camera's ACKs or the gateway's ARP
@@ -506,6 +576,42 @@ IRAM_ATTR static inline bool is_for_mgmt(const uint8_t *f, uint16_t len);
  * short: waiting stalls Ethernet reception, and whatever arrives meanwhile
  * is lost by the DMA in bursts.
  */
+#if CONFIG_ETH_SPI_ETHERNET_W5500
+/* Longest wait for a Wi-Fi TX buffer between two retries in eth_rx_cb(). */
+#define ETH_TX_RETRY_WAIT_US 2000
+
+/* The W5500 MAC instance: for its driver counters, and so eth_rx_cb() can
+ * keep its TX ring draining while it waits (eth_tx_retry_wait()). */
+static esp_eth_mac_t *s_w5500_mac = NULL;
+#endif
+
+/* The "real" wait between later retries in eth_rx_cb(), once yielding did
+ * not free a Wi-Fi TX buffer.
+ *
+ * With the ESP32 EMAC this is one scheduler tick: eth_rx_cb() runs in the
+ * EMAC's own RX task, and the measured retry results are based on it.
+ *
+ * With the W5500 the same task also moves Wi-Fi -> Ethernet frames to the
+ * chip, and a tick is 10 ms (CONFIG_FREERTOS_HZ=100). Worse, the Wi-Fi task
+ * may itself be waiting in the driver's transmit() for TX ring room - then
+ * it cannot free the Wi-Fi buffer this task waits for, and both sit until a
+ * timeout (8 retries collapsed the download to 5-6 Mbit/s). So instead:
+ * keep draining the driver's TX ring (w5500_mac_pump_tx()) while waiting
+ * for the Wi-Fi MAC to report a finished frame (s_air_done moves, i.e. a TX
+ * buffer was freed), at most ETH_TX_RETRY_WAIT_US. */
+IRAM_ATTR static void eth_tx_retry_wait(void) {
+#if CONFIG_ETH_SPI_ETHERNET_W5500
+  const uint32_t done0 = s_air_done;
+  const int64_t t0 = esp_timer_get_time();
+  while (s_air_done == done0 && esp_timer_get_time() - t0 < ETH_TX_RETRY_WAIT_US) {
+    if (s_w5500_mac && !w5500_mac_pump_tx(s_w5500_mac)) return;   /* ring cannot drain */
+    esp_rom_delay_us(20);
+  }
+#else
+  vTaskDelay(1);
+#endif
+}
+
 IRAM_ATTR static esp_err_t eth_rx_cb(esp_eth_handle_t h, uint8_t *buffer,
                                      uint32_t len, void *priv) {
   (void)h; (void)priv;
@@ -599,6 +705,28 @@ IRAM_ATTR static esp_err_t eth_rx_cb(esp_eth_handle_t h, uint8_t *buffer,
     return ESP_OK;
   }
 
+  /* Thermal throttle: while thermal_tick() has set a limit, a token bucket
+   * (refilled at the limit, at most 50 ms worth) decides whether the frame
+   * may go out. Small frames (ACKs, ARP) always pass - they cost little air
+   * time and keep the client's TCP clocked so it backs off cleanly. */
+  const uint32_t thr = s_thr_kbps;
+  if (thr && len > TXQ_CAP_MIN_LEN) {
+    const int64_t now = esp_timer_get_time();
+    const int32_t bucket_max = (int32_t)(thr * 1000 / 8 / 20);   /* 50 ms */
+    int64_t add = (now - s_thr_last_us) * (int64_t)thr / 8000;   /* bytes */
+    s_thr_last_us = now;
+    int64_t t = (int64_t)s_thr_tokens + add;
+    if (t > bucket_max) t = bucket_max;
+    if (t < (int64_t)len) {
+      s_thr_tokens = (int32_t)t;
+      s_drop_thr = s_drop_thr + 1;
+      s_drop_e2w = s_drop_e2w + 1;
+      free(buffer);
+      return ESP_OK;
+    }
+    s_thr_tokens = (int32_t)(t - len);
+  }
+
   esp_err_t err = ESP_FAIL;
   if (s_active && s_wifi_up) {
     const uint8_t retries = s_eth_tx_retries;
@@ -624,7 +752,7 @@ IRAM_ATTR static esp_err_t eth_rx_cb(esp_eth_handle_t h, uint8_t *buffer,
        * vTaskDelay(1) a residual loss of about 1.5 % remained that neither
        * more buffers nor HT40 could reduce. */
       if (i < 3) taskYIELD();
-      else       vTaskDelay(1);
+      else       eth_tx_retry_wait();
     }
   }
 
@@ -737,6 +865,10 @@ static void eth_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
  * (re)installs our RX callback. On disconnect: logs the event and, while the
  * bridge is active, reconnects immediately - this is the single place that
  * reconnects, which the watchdog and roaming rely on. */
+/* Defined with the network slot logic further down (see sta_lock_ap()). */
+static void sta_release_lock_on_disconnect(void);
+static void last_ap_note(const uint8_t bssid[6], uint8_t channel);
+
 static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
   (void)arg; (void)base;
 
@@ -744,6 +876,7 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
     s_wifi_up = true;
     wifi_event_sta_connected_t *e = (wifi_event_sta_connected_t *)data;
     if (e) mac2str(e->bssid, s_bssid_str);
+    if (e) last_ap_note(e->bssid, e->channel);
     printf("[WIFI] Connected (AP %s)\n", s_bssid_str);
     disc_log_reconnected();
 
@@ -764,6 +897,10 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
     printf("[WIFI] Disconnected (reason %d %s, %d dBm)\n", d ? d->reason : -1,
            bridge_wifi_reason_str(d ? d->reason : 0), d ? d->rssi : 0);
     disc_log_add(d, was_up);
+    /* A BSSID binding (sta_lock_ap()) holds for one connection only: release
+     * it on the first disconnect that is not our own roaming switch, so the
+     * reconnect below may pick any AP of the SSID again. */
+    sta_release_lock_on_disconnect();
     /* In operation, keep reconnecting - but not while esp_restart() is
      * stopping the driver, where a connect would race the shutdown. */
     if (s_active && !s_restarting) esp_wifi_connect();
@@ -774,6 +911,52 @@ static void wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data) {
  * Ethernet
  * ========================================================================= */
 
+/* Put the Ethernet receive filter into bridge mode: accept every frame on
+ * the wire. Promiscuous mode alone is not enough with the W5500 - its IDF
+ * driver also sets "block multicast" in MACRAW mode, which would cut the
+ * bridged client off from mDNS, SSDP, ONVIF discovery and IPv4 multicast
+ * streams. On the ESP32 EMAC, promiscuous mode already passes multicast and
+ * the second ioctl is harmless. Called wherever the driver is (re)started,
+ * because the filter state is not guaranteed to survive a stop/start. */
+static void eth_set_bridge_filters(void) {
+  bool on = true;
+  esp_eth_ioctl(s_eth, ETH_CMD_S_PROMISCUOUS, &on);
+  esp_err_t e = esp_eth_ioctl(s_eth, ETH_CMD_S_ALL_MULTICAST, &on);
+  if (e != ESP_OK && e != ESP_ERR_NOT_SUPPORTED) {
+    printf("[ETH ] all_multicast: %s\n", esp_err_to_name(e));
+  }
+}
+
+/* SPI clock the W5500 was brought up with, see bridge_get_eth_spi_mhz(). */
+static uint8_t s_eth_spi_mhz = 0;
+
+/* See bridge.h. */
+uint8_t bridge_get_eth_spi_mhz(void) { return s_eth_spi_mhz; }
+
+
+/* See bridge.h. */
+void bridge_get_eth_drv_stats(uint32_t out[BRIDGE_ETH_DRV_STATS]) {
+  for (int i = 0; i < BRIDGE_ETH_DRV_STATS; i++) out[i] = 0;
+#if CONFIG_ETH_SPI_ETHERNET_W5500
+  if (!s_w5500_mac) return;
+  w5500_mac_stats_t st;
+  w5500_mac_get_stats(s_w5500_mac, &st);
+  out[0] = st.tx_ring_full;
+  out[1] = st.tx_timeout;
+  out[2] = st.rx_bad_len;
+  out[3] = st.rx_no_mem;
+  out[4] = st.rx_stall;
+  out[5] = st.rx_frames;
+  out[6] = st.rx_batches;
+  out[7] = st.tx_frames;
+  out[8] = st.wakes;
+  out[9] = st.spi_us / 1000;
+  out[10] = st.deliver_us / 1000;
+  out[11] = st.tx_waits;
+#endif
+}
+
+#if CONFIG_ETH_USE_ESP32_EMAC
 /* Power up the LAN8720 PHY and install the ESP32 EMAC driver (RMII with the
  * external 50 MHz clock on GPIO0, as wired on the WT32-ETH01). No netif is
  * attached: frames are handled raw by the input callbacks above. */
@@ -820,11 +1003,110 @@ bool bridge_eth_init(void) {
                                       &eth_evt, NULL, NULL);
   return true;
 }
+#elif CONFIG_ETH_SPI_ETHERNET_W5500
+/* Bring up the W5500 on SPI2 and install its MAC/PHY driver. No netif is
+ * attached: frames are handled raw by the input callbacks above, exactly as
+ * with the EMAC. The SPI clock is tried in the steps of W5500_SPI_HZ, from
+ * fastest to slowest; the first one at which the chip identifies itself
+ * correctly is kept. The W5500 interrupt line is serviced through the shared
+ * GPIO ISR service, which is installed here if nobody did it yet. */
+bool bridge_eth_init(void) {
+  esp_err_t err = gpio_install_isr_service(0);
+  if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {   /* already installed is fine */
+    printf("[ETH ] gpio_install_isr_service: %s\n", esp_err_to_name(err));
+    return false;
+  }
+
+  spi_bus_config_t bus = {};
+  bus.sclk_io_num   = W5500_SCLK_GPIO;
+  bus.mosi_io_num   = W5500_MOSI_GPIO;
+  bus.miso_io_num   = W5500_MISO_GPIO;
+  bus.quadwp_io_num = -1;
+  bus.quadhd_io_num = -1;
+  bus.max_transfer_sz = W5500_MAC_MAX_TRANSFER;   /* RX batches, see w5500_mac.h */
+  err = spi_bus_initialize(W5500_SPI_HOST, &bus, SPI_DMA_CH_AUTO);
+  if (err != ESP_OK) {
+    printf("[ETH ] spi_bus_initialize: %s\n", esp_err_to_name(err));
+    return false;
+  }
+
+  eth_mac_config_t mac_cfg = ETH_MAC_DEFAULT_CONFIG();
+  mac_cfg.rx_task_stack_size = 4096;   /* our callback calls into the Wi-Fi stack */
+
+  eth_phy_config_t phy_cfg = ETH_PHY_DEFAULT_CONFIG();
+  phy_cfg.phy_addr       = -1;          /* the W5500's internal PHY */
+  phy_cfg.reset_gpio_num = W5500_RST_GPIO;
+
+  int hz_used = 0;
+  bool compensated = false;
+  for (size_t i = 0; i < sizeof(W5500_SPI_STEPS) / sizeof(W5500_SPI_STEPS[0]); i++) {
+    const w5500_spi_step_t *step = &W5500_SPI_STEPS[i];
+    spi_device_interface_config_t dev = {};
+    dev.mode           = 0;
+    dev.clock_speed_hz = step->hz;
+    dev.queue_size     = 20;
+    dev.spics_io_num   = W5500_CS_GPIO;
+    if (step->input_delay_ns > 0) {
+      dev.flags         |= SPI_DEVICE_HALFDUPLEX;
+      dev.input_delay_ns = step->input_delay_ns;
+    }
+
+    eth_w5500_config_t w5500 = ETH_W5500_DEFAULT_CONFIG(W5500_SPI_HOST, &dev);
+    w5500.int_gpio_num = W5500_INT_GPIO;
+
+    esp_eth_mac_t *mac = w5500_mac_new(&w5500, &mac_cfg);
+    esp_eth_phy_t *phy = esp_eth_phy_new_w5500(&phy_cfg);
+    if (!mac || !phy) {
+      printf("[ETH ] Could not create W5500 MAC/PHY object\n");
+      if (mac) mac->del(mac);
+      if (phy) phy->del(phy);
+      return false;
+    }
+
+    esp_eth_config_t cfg = ETH_DEFAULT_CONFIG(mac, phy);
+    err = esp_eth_driver_install(&cfg, &s_eth);
+    if (err == ESP_OK) {
+      hz_used = step->hz;
+      compensated = step->input_delay_ns > 0;
+      s_w5500_mac = mac;
+      break;
+    }
+
+    printf("[ETH ] W5500 not responding at %d MHz%s (%s)\n", step->hz / 1000000,
+           step->input_delay_ns > 0 ? " with read compensation" : "", esp_err_to_name(err));
+    /* deinit removes the INT handler in case mac->init succeeded and only the
+     * PHY failed - otherwise it would point into freed memory after del(). */
+    mac->deinit(mac);
+    mac->del(mac);
+    phy->del(phy);
+    s_eth = NULL;
+  }
+  if (!s_eth) return false;
+  s_eth_spi_mhz = (uint8_t)(hz_used / 1000000);
+  printf("[ETH ] W5500 on SPI at %u MHz%s\n", (unsigned)s_eth_spi_mhz,
+         compensated ? " (half-duplex, read compensation)" : "");
+
+  /* The W5500 has no factory MAC. In promiscuous mode its own address plays
+   * no role in the data path (frames are sent with the client's source MAC),
+   * but the driver needs a valid one. */
+  uint8_t own[6];
+  if (esp_read_mac(own, ESP_MAC_ETH) != ESP_OK) {
+    esp_read_mac(own, ESP_MAC_WIFI_STA);
+    own[0] |= 0x02;   /* locally administered */
+  }
+  esp_eth_ioctl(s_eth, ETH_CMD_S_MAC_ADDR, own);
+
+  esp_event_handler_instance_register(ETH_EVENT, ESP_EVENT_ANY_ID,
+                                      &eth_evt, NULL, NULL);
+  return true;
+}
+#endif
 
 /* Start Ethernet with the sniff callback and poll until the client MAC is
  * known or the timeout expires. On success, detach the sniff callback and
- * enable promiscuous mode, so frames for the client's MAC (which the EMAC
- * would otherwise filter) are received. */
+ * switch the receive filter to bridge mode (eth_set_bridge_filters), so
+ * frames for the client's MAC, which the MAC would otherwise filter, are
+ * received. */
 bool bridge_sniff_client_mac(uint32_t timeout_ms) {
   esp_eth_update_input_path(s_eth, eth_sniff_cb, NULL);
   if (esp_eth_start(s_eth) != ESP_OK) {
@@ -852,8 +1134,7 @@ bool bridge_sniff_client_mac(uint32_t timeout_ms) {
   printf("[ETH ] Client MAC: %s\n", s);
 
   esp_eth_update_input_path(s_eth, NULL, NULL);
-  bool promisc = true;
-  esp_eth_ioctl(s_eth, ETH_CMD_S_PROMISCUOUS, &promisc);
+  eth_set_bridge_filters();
   printf("[ETH ] Promiscuous mode on\n");
   return true;
 }
@@ -1026,6 +1307,11 @@ static void detect_location(size_t preferred) {
 /* Index (0..2) of the network slot the STA is configured for right now. */
 static volatile uint8_t s_cur_net = 0;
 
+/* STA config bound to one BSSID (see sta_lock_ap()); s_ap_lock_skip = the
+ * next disconnect is our own and must not release the binding. */
+static volatile bool s_ap_locked    = false;
+static volatile bool s_ap_lock_skip = false;
+
 static const char *net_ssid(size_t i) { return i==2 ? g_cfg.ssid3 : i==1 ? g_cfg.ssid2 : g_cfg.ssid1; }
 static const char *net_pass(size_t i) { return i==2 ? g_cfg.pass3 : i==1 ? g_cfg.pass2 : g_cfg.pass1; }
 static bool        net_in_use(size_t i) { return net_ssid(i)[0] != '\0'; }
@@ -1046,13 +1332,167 @@ static void sta_set_net(size_t i) {
   esp_err_t e = esp_wifi_set_config(WIFI_IF_STA, &wc);
   if (e != ESP_OK) printf("[WIFI] set_config('%s'): %s\n", net_ssid(i), esp_err_to_name(e));
   s_cur_net = (uint8_t)i;
+  s_ap_locked = false;
 }
 
-/* One blocking scan of all channels; vis[i] = network slot i was seen.
+/* --- AP selection by band ------------------------------------------------- */
+
+/* Under "both bands, 5 GHz preferred", a 5 GHz AP wins as long as its signal
+ * is at least this strong; below that, the better range of 2.4 GHz is worth
+ * more than the higher 5 GHz rates. */
+#define BAND_5G_MIN_RSSI  (-75)
+
+/* Is this AP on 5 GHz? Channels above 14 only exist there. */
+static inline bool ap_is_5g(const wifi_ap_record_t *r) { return r->primary > 14; }
+
+/* Band setting in effect: always "both, strongest" on 2.4 GHz-only chips. */
+static uint8_t band_setting(void) {
+#if CONFIG_SOC_WIFI_SUPPORT_5G
+  return g_cfg.wifi_band <= WIFI_BAND_MAX ? g_cfg.wifi_band : WIFI_BAND_PREFER_5G;
+#else
+  return WIFI_BAND_STRONGEST;
+#endif
+}
+
+/* May the station use this AP under the band setting? The "only" settings are
+ * also enforced by the driver's band mode; checking here keeps scan results
+ * from the other band out of the selection anyway. */
+static bool ap_allowed(const wifi_ap_record_t *r) {
+  switch (band_setting()) {
+    case WIFI_BAND_ONLY_5G: return ap_is_5g(r);
+    case WIFI_BAND_ONLY_2G: return !ap_is_5g(r);
+    default:                return true;
+  }
+}
+
+/* Ranking of an allowed AP, higher is better. With 5 GHz preferred, every
+ * usable 5 GHz AP (>= BAND_5G_MIN_RSSI) ranks above every 2.4 GHz AP, and
+ * within a group the signal decides. */
+static int ap_rank(const wifi_ap_record_t *r) {
+  if (band_setting() == WIFI_BAND_PREFER_5G && ap_is_5g(r) && r->rssi >= BAND_5G_MIN_RSSI)
+    return 1000 + r->rssi;
+  return r->rssi;
+}
+
+/* Best allowed AP for 'ssid' among scan records, skipping 'skip_bssid' (the
+ * current AP when roaming; NULL = none). Returns false if none qualifies. */
+static bool pick_best_ap(const char *ssid, const wifi_ap_record_t *recs, uint16_t n,
+                         const uint8_t *skip_bssid, wifi_ap_record_t *out) {
+  bool found = false;
+  for (uint16_t k = 0; k < n; k++) {
+    if (strcmp((const char *)recs[k].ssid, ssid) != 0) continue;
+    if (skip_bssid && memcmp(recs[k].bssid, skip_bssid, 6) == 0) continue;
+    if (!ap_allowed(&recs[k])) continue;
+    if (!found || ap_rank(&recs[k]) > ap_rank(out)) { *out = recs[k]; found = true; }
+  }
+  return found;
+}
+
+/* Point the STA at network slot i, bound to one specific AP (BSSID and
+ * channel from a scan). The driver then associates right away instead of
+ * scanning all channels of both bands again first, which saves several
+ * seconds per connect. The binding only holds for the next connection: the
+ * first disconnect afterwards (a failed attempt or a later drop) releases it
+ * in wifi_evt(), so a vanished AP cannot keep the bridge offline.
+ * skip_next_disc: the caller is about to disconnect on purpose (roaming) -
+ * that one disconnect must not release the binding yet. */
+static void sta_lock_ap(size_t i, const wifi_ap_record_t *ap, bool skip_next_disc) {
+  wifi_config_t wc = {};
+  strncpy((char *)wc.sta.ssid,     net_ssid(i), sizeof(wc.sta.ssid) - 1);
+  strncpy((char *)wc.sta.password, net_pass(i), sizeof(wc.sta.password) - 1);
+  wc.sta.pmf_cfg.capable = true;
+  wc.sta.scan_method = WIFI_FAST_SCAN;
+  wc.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+  wc.sta.bssid_set   = true;
+  memcpy(wc.sta.bssid, ap->bssid, 6);
+  wc.sta.channel     = ap->primary;
+  esp_err_t e = esp_wifi_set_config(WIFI_IF_STA, &wc);
+  if (e != ESP_OK) {
+    printf("[WIFI] set_config(locked '%s'): %s\n", net_ssid(i), esp_err_to_name(e));
+    sta_set_net(i);
+    return;
+  }
+  s_cur_net         = (uint8_t)i;
+  s_ap_lock_skip    = skip_next_disc;
+  s_ap_locked       = true;
+}
+
+/* Called by wifi_evt() on every disconnect: releases a BSSID binding unless
+ * this disconnect is the deliberate one announced by sta_lock_ap(). */
+static void sta_release_lock_on_disconnect(void) {
+  if (!s_ap_locked) return;
+  if (s_ap_lock_skip) { s_ap_lock_skip = false; return; }
+  sta_set_net(s_cur_net);
+}
+
+/* --- Last AP (fast start) ---------------------------------------------------
+ * The AP of the last successful connection, kept in NVS so it survives a
+ * power loss too. At boot, bridge_wifi_start() first tries it directly - no
+ * scan - and only scans if that fails. Written only when it changes (roaming,
+ * a different network), so the flash sees a write per AP change, not per
+ * boot. */
+#define LAST_AP_NS    "wifi_last"
+#define LAST_AP_KEY   "ap"
+#define LAST_AP_MAGIC 0x4c415031u   /* "LAP1" */
+
+typedef struct {
+  uint32_t magic;
+  uint8_t  slot;       /* network slot 0..2 */
+  uint8_t  channel;
+  uint8_t  bssid[6];
+} last_ap_t;
+
+static last_ap_t     s_last_ap = {};
+static volatile bool s_last_ap_dirty = false;
+
+/* Load the stored last AP; false if none or invalid. */
+static bool last_ap_load(last_ap_t *out) {
+  nvs_handle_t h;
+  if (nvs_open(LAST_AP_NS, NVS_READONLY, &h) != ESP_OK) return false;
+  size_t sz = sizeof(*out);
+  const esp_err_t e = nvs_get_blob(h, LAST_AP_KEY, out, &sz);
+  nvs_close(h);
+  return e == ESP_OK && sz == sizeof(*out) && out->magic == LAST_AP_MAGIC && out->slot < 3;
+}
+
+/* Called from wifi_evt() on every connect: remember the AP in RAM only. The
+ * NVS write happens later in last_ap_tick(), outside the event task. */
+static void last_ap_note(const uint8_t bssid[6], uint8_t channel) {
+  if (s_last_ap.magic == LAST_AP_MAGIC && s_last_ap.slot == s_cur_net &&
+      s_last_ap.channel == channel && memcmp(s_last_ap.bssid, bssid, 6) == 0) return;
+  s_last_ap.magic   = LAST_AP_MAGIC;
+  s_last_ap.slot    = s_cur_net;
+  s_last_ap.channel = channel;
+  memcpy(s_last_ap.bssid, bssid, 6);
+  s_last_ap_dirty = true;
+}
+
+/* Persist a changed last AP; called from bridge_tick(). */
+static void last_ap_tick(void) {
+  if (!s_last_ap_dirty) return;
+  s_last_ap_dirty = false;
+  nvs_handle_t h;
+  if (nvs_open(LAST_AP_NS, NVS_READWRITE, &h) != ESP_OK) return;
+  esp_err_t e = nvs_set_blob(h, LAST_AP_KEY, &s_last_ap, sizeof(s_last_ap));
+  if (e == ESP_OK) e = nvs_commit(h);
+  nvs_close(h);
+  if (e != ESP_OK) printf("[WIFI] Storing the last AP failed: %s\n", esp_err_to_name(e));
+}
+
+/* Passive dwell time per channel for our scans. The IDF default of 360 ms
+ * makes a dual-band scan slow, because most 5 GHz channels are DFS channels
+ * that may only be scanned passively. APs beacon every ~102 ms, so 150 ms
+ * still catches at least one beacon per channel. */
+#define SCAN_PASSIVE_MS  150
+
+/* One blocking scan of all channels (of the allowed bands); vis[i] = network
+ * slot i was seen, best[i] = its best AP under the band setting (valid only
+ * where have[i] is set - a slot can be visible only on a forbidden band).
  * Returns false if the scan itself failed (vis is then meaningless). Only
  * call while no connect attempt is running - IDF refuses to scan then. */
-static bool scan_visible_nets(bool vis[3]) {
+static bool scan_visible_nets(bool vis[3], wifi_ap_record_t best[3], bool have[3]) {
   wifi_scan_config_t sc = {};
+  sc.scan_time.passive = SCAN_PASSIVE_MS;
   if (esp_wifi_scan_start(&sc, true) != ESP_OK) return false;
   uint16_t n = 0;
   esp_wifi_scan_get_ap_num(&n);
@@ -1064,6 +1504,8 @@ static bool scan_visible_nets(bool vis[3]) {
   for (uint16_t k = 0; k < n; k++)
     for (size_t i = 0; i < 3; i++)
       if (net_in_use(i) && strcmp((const char *)recs[k].ssid, net_ssid(i)) == 0) vis[i] = true;
+  for (size_t i = 0; i < 3; i++)
+    have[i] = net_in_use(i) && pick_best_ap(net_ssid(i), recs, n, NULL, &best[i]);
   free(recs);
   return true;
 }
@@ -1189,16 +1631,49 @@ bool bridge_wifi_start(void) {
   /* 802.11b can be disabled: the b rates are slow and, as basic rates, waste
    * airtime. Only sensible if no pure 802.11b device is left on the network -
    * otherwise the AP might not see us anymore. */
+#if CONFIG_SOC_WIFI_SUPPORT_5G
+  /* Dual-band chips (ESP32-C5): allow 2.4 and 5 GHz, so the scan can pick
+   * the strongest AP on either band, with 802.11ax on both. In auto band
+   * mode the single-band APIs esp_wifi_set_protocol/_bandwidth return
+   * ESP_ERR_NOT_SUPPORTED, hence the plural variants. The 802.11b switch only
+   * concerns 2.4 GHz; 5 GHz has no b rates. */
+  /* "Only" settings are enforced by the driver, so neither its own scans nor
+   * a reconnect can ever end up on the other band. */
+  const uint8_t band = band_setting();
+  esp_wifi_set_band_mode(band == WIFI_BAND_ONLY_5G ? WIFI_BAND_MODE_5G_ONLY :
+                         band == WIFI_BAND_ONLY_2G ? WIFI_BAND_MODE_2G_ONLY :
+                                                     WIFI_BAND_MODE_AUTO);
+  wifi_protocols_t protos = {};
+  protos.ghz_2g = g_cfg.no_11b
+      ? (WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AX)
+      : (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AX);
+  protos.ghz_5g = WIFI_PROTOCOL_11A | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AC |
+                  WIFI_PROTOCOL_11AX;
+  esp_err_t pr = esp_wifi_set_protocols(WIFI_IF_STA, &protos);
+  if (pr != ESP_OK) {
+    printf("[WIFI] set_protocols: %s\n", esp_err_to_name(pr));
+  }
+#else
   esp_wifi_set_protocol(WIFI_IF_STA,
       g_cfg.no_11b ? (WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N)
                    : (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
+#endif
 
   /* HT40 doubles the channel width and thus the gross data rate, but only
    * takes effect if the AP actually offers 40 MHz on 2.4 GHz - many don't,
    * for coexistence reasons. Without AP support it silently stays at HT20,
    * which is not an error. */
+#if CONFIG_SOC_WIFI_SUPPORT_5G
+  /* The HT40 switch applies to both bands. On 5 GHz 40 MHz is the norm, as
+   * there is no 2.4 GHz coexistence restriction. */
+  wifi_bandwidths_t bws = {};
+  bws.ghz_2g = g_cfg.ht40 ? WIFI_BW_HT40 : WIFI_BW_HT20;
+  bws.ghz_5g = g_cfg.ht40 ? WIFI_BW_HT40 : WIFI_BW_HT20;
+  esp_err_t bw = esp_wifi_set_bandwidths(WIFI_IF_STA, &bws);
+#else
   esp_err_t bw = esp_wifi_set_bandwidth(
       WIFI_IF_STA, g_cfg.ht40 ? WIFI_BW_HT40 : WIFI_BW_HT20);
+#endif
   if (bw != ESP_OK) {
     printf("[WIFI] set_bandwidth: %s\n", esp_err_to_name(bw));
   }
@@ -1237,6 +1712,22 @@ bool bridge_wifi_start(void) {
   esp_err_t td = esp_wifi_set_tx_done_cb(wifi_tx_done);
   if (td != ESP_OK) printf("[WIFI] tx_done_cb: %s\n", esp_err_to_name(td));
 
+  /* The driver scans on its own before every connect and reconnect, even
+   * with BSSID and channel given, and by default dwells 360 ms on every
+   * passive (DFS) channel - on a dual-band chip that alone is close to 10 s.
+   * Use the same shorter passive dwell as our own scans. Needs a started
+   * driver. */
+  /* Filled by hand: WIFI_SCAN_PARAMS_DEFAULT_CONFIG() uses nested C
+   * designators that C++ does not accept. Everything but the passive time
+   * stays at the IDF default. */
+  wifi_scan_default_params_t sp = {};
+  sp.scan_time.active.min    = WIFI_ACTIVE_SCAN_MIN_DEFAULT_TIME;
+  sp.scan_time.active.max    = WIFI_ACTIVE_SCAN_MAX_DEFAULT_TIME;
+  sp.scan_time.passive       = SCAN_PASSIVE_MS;
+  sp.home_chan_dwell_time    = WIFI_SCAN_HOME_CHANNEL_DWELL_DEFAULT_TIME;
+  esp_err_t spe = esp_wifi_set_scan_parameters(&sp);
+  if (spe != ESP_OK) printf("[WIFI] set_scan_parameters: %s\n", esp_err_to_name(spe));
+
   /* TX power only AFTER esp_wifi_start() - before that the API returns
    * ESP_ERR_WIFI_NOT_STARTED. */
   bridge_apply_live_tuning();
@@ -1247,8 +1738,53 @@ bool bridge_wifi_start(void) {
    * network 1 would cost its full timeout x attempts on every boot before
    * network 2 is even tried. If the scan fails, the plain priority order is
    * used. */
+  /* While connecting, let the Wi-Fi driver report its state changes
+   * (auth -> assoc -> run) with timestamps, so a slow connect can be traced
+   * in the log. Back to the quiet default once connected or given up. */
+  esp_log_level_set("wifi", ESP_LOG_INFO);
+
+  /* Fast path: straight to the AP of the last successful connection, no
+   * scan. Only if it is still allowed under the band setting - and with
+   * "prefer 5 GHz" only if it is a 5 GHz AP: a stored 2.4 GHz AP would
+   * otherwise keep the bridge on 2.4 GHz after every boot until roaming
+   * moves it. The attempt ends early on the first disconnect (AP not found,
+   * rejected) instead of waiting out the full timeout. */
+  last_ap_t la;
+  if (last_ap_load(&la) && net_in_use(la.slot)) {
+    wifi_ap_record_t rec = {};
+    memcpy(rec.bssid, la.bssid, 6);
+    rec.primary = la.channel;
+    if (ap_allowed(&rec) &&
+        !(band_setting() == WIFI_BAND_PREFER_5G && !ap_is_5g(&rec))) {
+      s_last_ap = la;   /* known, so an identical connect does not rewrite NVS */
+      sta_lock_ap(la.slot, &rec, false);
+      printf("[WIFI] Connecting to '%s' via last AP %02x:%02x:%02x:%02x:%02x:%02x, channel %u (no scan)...\n",
+             net_ssid(la.slot), la.bssid[0], la.bssid[1], la.bssid[2], la.bssid[3],
+             la.bssid[4], la.bssid[5], (unsigned)la.channel);
+      const uint32_t disc0 = s_wifi_disc_count;
+      esp_wifi_connect();
+      const uint32_t t0 = millis();
+      while (!s_wifi_up && s_wifi_disc_count == disc0 && (millis() - t0) < connect_timeout_ms)
+        delay(100);
+      if (s_wifi_up) {
+        s_cur_net = la.slot;
+        esp_log_level_set("wifi", ESP_LOG_WARN);
+#ifndef BRIDGE_MINIMAL
+        detect_location(la.slot);
+#endif
+        return true;
+      }
+      printf("[WIFI] Last AP not reachable - scanning\n");
+      disc_mark_own(DISC_SRC_CONNECT);
+      esp_wifi_disconnect();
+      sta_set_net(la.slot);
+    }
+  }
+
   bool vis[3] = { false, false, false };
-  const bool scanned = scan_visible_nets(vis);
+  bool have[3] = { false, false, false };
+  wifi_ap_record_t best[3];
+  const bool scanned = scan_visible_nets(vis, best, have);
   size_t order[3]; size_t n = 0;
   for (size_t i = 0; i < 3; i++) if (net_in_use(i) && (!scanned || vis[i])) order[n++] = i;
   for (size_t i = 0; i < 3; i++) if (net_in_use(i) && scanned && !vis[i]) order[n++] = i;
@@ -1258,8 +1794,19 @@ bool bridge_wifi_start(void) {
     /* The driver was started with the first slot in use, but the scan may
      * have put another one first - always point it at this one. */
     if (i != s_cur_net) sta_set_net(i);
-    printf("[WIFI] Connecting to '%s'%s...\n", net_ssid(i),
-           scanned ? (vis[i] ? " (seen in scan)" : " (not seen in scan)") : "");
+    /* First attempt straight to the AP the scan picked; the binding is
+     * released by the first failure (wifi_evt()), so further attempts fall
+     * back to the driver's own full scan. */
+    if (scanned && have[i]) {
+      sta_lock_ap(i, &best[i], false);
+      printf("[WIFI] Connecting to '%s' via %02x:%02x:%02x:%02x:%02x:%02x, channel %u (%s, %d dBm)...\n",
+             net_ssid(i), best[i].bssid[0], best[i].bssid[1], best[i].bssid[2],
+             best[i].bssid[3], best[i].bssid[4], best[i].bssid[5], (unsigned)best[i].primary,
+             ap_is_5g(&best[i]) ? "5 GHz" : "2.4 GHz", (int)best[i].rssi);
+    } else {
+      printf("[WIFI] Connecting to '%s'%s...\n", net_ssid(i),
+             scanned ? (vis[i] ? " (seen in scan, no AP on an allowed band)" : " (not seen in scan)") : "");
+    }
 
     for (int attempt = 0; attempt < connect_retries; attempt++) {
       if (attempt > 0) {
@@ -1277,6 +1824,7 @@ bool bridge_wifi_start(void) {
     }
     if (s_wifi_up) {
       s_cur_net = (uint8_t)i;
+      esp_log_level_set("wifi", ESP_LOG_WARN);
       /* Connected - but at WHICH site? The SSID slot does not tell when
        * several sites share the same SSID. So try the profiles in use and
        * ping their gateways, starting with the profile of the connected slot
@@ -1291,6 +1839,7 @@ bool bridge_wifi_start(void) {
     disc_mark_own(DISC_SRC_CONNECT);
     esp_wifi_disconnect();
   }
+  esp_log_level_set("wifi", ESP_LOG_WARN);
   esp_wifi_stop();
   return false;
 }
@@ -1372,8 +1921,7 @@ void bridge_set_client_mac(const uint8_t mac[6]) {
    * sniff callback installed and without promiscuous mode, i.e. it would only
    * pass broadcasts and transport practically nothing. */
   esp_eth_update_input_path(s_eth, NULL, NULL);
-  bool promisc = true;
-  esp_eth_ioctl(s_eth, ETH_CMD_S_PROMISCUOUS, &promisc);
+  eth_set_bridge_filters();
   printf("[ETH ] Promiscuous mode on\n");
 }
 
@@ -1443,7 +1991,18 @@ int16_t bridge_get_tx_power(void) {
 
 uint8_t bridge_get_bandwidth_mhz(void) {
   wifi_bandwidth_t bw;
+#if CONFIG_SOC_WIFI_SUPPORT_5G
+  /* In auto band mode only the per-band query exists; the current channel
+   * decides which of the two values is in effect. */
+  wifi_bandwidths_t bws;
+  uint8_t ch = 0;
+  wifi_second_chan_t sec;
+  if (esp_wifi_get_bandwidths(WIFI_IF_STA, &bws) != ESP_OK) return 0;
+  if (esp_wifi_get_channel(&ch, &sec) != ESP_OK) return 0;
+  bw = (ch > 14) ? bws.ghz_5g : bws.ghz_2g;
+#else
   if (esp_wifi_get_bandwidth(WIFI_IF_STA, &bw) != ESP_OK) return 0;
+#endif
   return (bw == WIFI_BW_HT40) ? 40 : 20;
 }
 
@@ -2518,6 +3077,23 @@ bool bridge_consume_planned_restart(void) {
   return planned;
 }
 
+/* Marker for bridge_restart_requested(), one-shot like s_wd_restart_magic. */
+#define REQ_RESTART_MAGIC 0x52515354u  /* "RQST" */
+RTC_NOINIT_ATTR static uint32_t s_req_restart_magic;
+
+/* See bridge.h. */
+void bridge_restart_requested(void) {
+  s_req_restart_magic = REQ_RESTART_MAGIC;
+  esp_restart();
+}
+
+/* See bridge.h. */
+bool bridge_consume_requested_restart(void) {
+  const bool requested = (s_req_restart_magic == REQ_RESTART_MAGIC);
+  s_req_restart_magic = 0;
+  return requested;
+}
+
 static uint32_t s_wd_t0 = 0, s_wd_pkt0 = 0, s_wd_drop0 = 0, s_wd_disc0 = 0;
 static uint8_t  s_wd_bad = 0;
 static uint8_t  s_wd_probe = 0;   /* 0=not needed/off, 1=ok, 2=failed -
@@ -2541,8 +3117,7 @@ bool bridge_reset_eth(void) {
   esp_eth_start(s_eth);
 
   esp_eth_update_input_path(s_eth, eth_rx_cb, NULL);
-  bool promisc = true;
-  esp_eth_ioctl(s_eth, ETH_CMD_S_PROMISCUOUS, &promisc);
+  eth_set_bridge_filters();
   return true;
 }
 
@@ -2705,17 +3280,19 @@ static void watchdog_tick(void) {
 static uint32_t s_roam_t0    = 0;
 static uint32_t s_roam_count = 0;
 
-/* Best RSSI among the OTHER APs with the given SSID - the currently connected
- * one (cur_bssid) does not count as a candidate. Otherwise a mere measurement
- * difference between the averaged RSSI from esp_wifi_sta_get_ap_info() and
- * the single value from the scan could "beat" the margin, and the bridge
- * would disconnect only to reconnect to the same AP. Blocking scan.
- * Returns false if the scan failed or no other AP was visible. */
+/* Best candidate among the OTHER APs with the given SSID under the band
+ * setting (pick_best_ap()) - the currently connected one (cur_bssid) does not
+ * count. Otherwise a mere measurement difference between the averaged RSSI
+ * from esp_wifi_sta_get_ap_info() and the single value from the scan could
+ * "beat" the margin, and the bridge would disconnect only to reconnect to
+ * the same AP. Blocking scan. Returns false if the scan failed or no other
+ * allowed AP was visible. */
 static bool roam_scan_best(const uint8_t *ssid, const uint8_t *cur_bssid,
-                           int8_t *out_best) {
+                           wifi_ap_record_t *out) {
   wifi_scan_config_t sc = {};
   sc.ssid        = (uint8_t *)ssid;
   sc.show_hidden = false;
+  sc.scan_time.passive = SCAN_PASSIVE_MS;
   if (esp_wifi_scan_start(&sc, true) != ESP_OK) return false;
 
   uint16_t n = 0;
@@ -2724,28 +3301,27 @@ static bool roam_scan_best(const uint8_t *ssid, const uint8_t *cur_bssid,
   if (n > 20) n = 20;
 
   wifi_ap_record_t *recs = (wifi_ap_record_t *)malloc(sizeof(wifi_ap_record_t) * n);
-  if (!recs) return false;
+  if (!recs) { esp_wifi_clear_ap_list(); return false; }
   esp_wifi_scan_get_ap_records(&n, recs);
+  esp_wifi_clear_ap_list();
 
-  bool found = false;
-  int8_t best = -127;
-  for (uint16_t i = 0; i < n; i++) {
-    if (memcmp(recs[i].bssid, cur_bssid, 6) == 0) continue;
-    if (recs[i].rssi > best) best = recs[i].rssi;
-    found = true;
-  }
+  const bool found = pick_best_ap((const char *)ssid, recs, n, cur_bssid, out);
   free(recs);
-
-  *out_best = best;
   return found;
 }
 
-/* Roaming check; called from bridge_tick(). Every roam_check_s seconds: if
- * the current RSSI is below the threshold, scan for other APs of the same
- * SSID and disconnect if one is better by at least the margin - the
- * reconnect in wifi_evt() then picks the strongest AP. */
+/* Roaming check; called from bridge_tick(). Every roam_check_s seconds it
+ * may scan for other APs of the same SSID and switch to one of them:
+ *  - roaming (roam_enable): when the current RSSI is below the threshold and
+ *    a candidate is better by at least the margin;
+ *  - band return (5 GHz preferred, regardless of roam_enable): when the
+ *    bridge sits on 2.4 GHz and a usable 5 GHz AP (BAND_5G_MIN_RSSI) is in
+ *    range - e.g. because 5 GHz was not available when it connected.
+ * The switch binds the STA to the chosen AP (sta_lock_ap()) and disconnects;
+ * wifi_evt()'s reconnect then goes straight to that AP. */
 static void roam_tick(void) {
-  if (!g_cfg.roam_enable || !s_active || s_paused) { s_roam_t0 = 0; return; }
+  const bool band_return = band_setting() == WIFI_BAND_PREFER_5G;
+  if ((!g_cfg.roam_enable && !band_return) || !s_active || s_paused) { s_roam_t0 = 0; return; }
 
   const uint32_t interval_ms =
       (g_cfg.roam_check_s ? g_cfg.roam_check_s : ROAM_CHECK_S_DEF) * 1000UL;
@@ -2757,23 +3333,27 @@ static void roam_tick(void) {
   wifi_ap_record_t ap;
   if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return;   /* not connected right now */
 
+  const bool want_5g = band_return && !ap_is_5g(&ap);
   const int8_t threshold = g_cfg.roam_rssi_threshold
       ? g_cfg.roam_rssi_threshold : ROAM_RSSI_THRESHOLD_DEF;
-  if (ap.rssi >= threshold) return;   /* good enough already - don't even scan */
+  const bool weak = g_cfg.roam_enable && ap.rssi < threshold;
+  if (!want_5g && !weak) return;   /* nothing to look for - don't even scan */
 
-  int8_t best;
-  if (!roam_scan_best(ap.ssid, ap.bssid, &best)) return;
+  wifi_ap_record_t cand;
+  if (!roam_scan_best(ap.ssid, ap.bssid, &cand)) return;
 
   const uint8_t margin = g_cfg.roam_margin_db ? g_cfg.roam_margin_db : ROAM_MARGIN_DB_DEF;
-  if ((int)best - (int)ap.rssi < (int)margin) return;   /* no sufficient candidate */
-
-  printf("[ROAM] Current %d dBm, found candidate with %d dBm - switching AP\n",
-         (int)ap.rssi, (int)best);
+  if (want_5g && ap_is_5g(&cand) && cand.rssi >= BAND_5G_MIN_RSSI) {
+    printf("[ROAM] On 2.4 GHz (%d dBm), 5 GHz AP with %d dBm on channel %u - switching\n",
+           (int)ap.rssi, (int)cand.rssi, (unsigned)cand.primary);
+  } else if (weak && (int)cand.rssi - (int)ap.rssi >= (int)margin) {
+    printf("[ROAM] Current %d dBm, found candidate with %d dBm - switching AP\n",
+           (int)ap.rssi, (int)cand.rssi);
+  } else {
+    return;   /* no sufficient candidate */
+  }
   s_roam_count++;
-  /* wifi_evt()'s WIFI_EVENT_STA_DISCONNECTED handler reconnects automatically
-   * (s_active is always set here) and, via WIFI_ALL_CHANNEL_SCAN +
-   * WIFI_CONNECT_AP_BY_SIGNAL, again picks the strongest visible AP - no
-   * extra esp_wifi_connect() needed. */
+  sta_lock_ap(s_cur_net, &cand, true);
   disc_mark_own(DISC_SRC_ROAM);
   esp_wifi_disconnect();
 }
@@ -2906,6 +3486,74 @@ uint32_t bridge_get_failovers(void) { return s_fo_count; }
  * Statistics
  * ========================================================================= */
 
+/* Thermal throttle: start temperature (g_cfg.thr_temp_c, default
+ * THR_DEFAULT_C) and rates (kbit/s). On the stock ESP32-C5 module with a
+ * W5500 the board resets (the module's regulator gives up) when sustained
+ * Wi-Fi transmission heats it; the chip then reads 83-84 degC, from ~65 degC
+ * idle - hence 79. From the start temperature ("warm") the limit drops
+ * gently, 1 degC above ("hot") quickly; 3 degC below it is raised again
+ * until it no longer limits and is removed. */
+#define THR_DEFAULT_C 79
+#define THR_MIN_KBPS  4000
+#define THR_OFF_KBPS  60000
+
+/* Update the Ethernet -> Wi-Fi rate limit, once per temperature sample
+ * (CPUSTAT_WINDOW_MS):
+ *   - Temperature part (unless g_cfg.thr_off): dynamic - lowered by 10 %
+ *     per sample from the start temperature on and by 30 % from 1 degC
+ *     above it, raised by 20 % per sample from 3 degC below it until it no
+ *     longer limits and is dropped. In between it is held. The first limit starts below
+ *     the rate flowing at that moment, so it bites at once.
+ *   - Fixed part: g_cfg.e2w_max_mbit, if set.
+ * The lower of both is enforced in eth_rx_cb(); every change is logged with
+ * a "[THR ]" line. Only this direction is limited: it is the one that keeps
+ * the Wi-Fi transmitter on - the opposite direction ran at 38 Mbit/s for
+ * minutes without trouble on the hardware that needs this. */
+static void thermal_tick(void) {
+  static uint32_t last_ms = 0;
+  const uint32_t now = millis();
+  if (now - last_ms < CPUSTAT_WINDOW_MS) return;
+  last_ms = now;
+  const int16_t t = cpustat_temp_x10();
+
+  uint32_t tl = s_thr_temp_kbps;
+  const int16_t warm = (int16_t)((g_cfg.thr_temp_c ? g_cfg.thr_temp_c : THR_DEFAULT_C) * 10);
+  const int16_t hot = warm + 10, cool = warm - 30;
+  if (g_cfg.thr_off || t == CPUSTAT_NO_TEMP) {
+    tl = 0;
+  } else {
+    const uint32_t base = tl ? tl : (s_kbps_e2w > THR_MIN_KBPS ? s_kbps_e2w : THR_MIN_KBPS);
+    if (t >= hot)                  tl = base * 7 / 10;
+    else if (t >= warm)            tl = base * 9 / 10;
+    else if (t <= cool && tl)      tl = tl * 12 / 10;
+    if (tl && tl < THR_MIN_KBPS) tl = THR_MIN_KBPS;
+    if (tl >= THR_OFF_KBPS) tl = 0;
+  }
+  s_thr_temp_kbps = tl;
+
+  const uint32_t fixed = (uint32_t)g_cfg.e2w_max_mbit * 1000;
+  uint32_t lim = tl;
+  if (fixed && (!lim || fixed < lim)) lim = fixed;
+  if (lim == s_thr_kbps) return;
+
+  if (!s_thr_kbps && lim) s_thr_last_us = esp_timer_get_time();
+  if (lim) {
+    printf("[THR ] Ethernet->Wi-Fi limited to %lu kbit/s (%s, chip %d.%d degC)\n",
+           (unsigned long)lim, lim == tl ? "temperature" : "fixed limit",
+           t == CPUSTAT_NO_TEMP ? 0 : t / 10, t == CPUSTAT_NO_TEMP ? 0 : t % 10);
+  } else {
+    printf("[THR ] Ethernet->Wi-Fi limit lifted (chip %d.%d degC)\n",
+           t == CPUSTAT_NO_TEMP ? 0 : t / 10, t == CPUSTAT_NO_TEMP ? 0 : t % 10);
+  }
+  s_thr_kbps = lim;
+}
+
+/* See bridge.h. */
+uint32_t bridge_thermal_limit_kbps(void) { return s_thr_kbps; }
+
+/* See bridge.h. */
+uint32_t bridge_thermal_drops(void) { return s_drop_thr; }
+
 /* Periodic work, called from the main loop: run the autotune, watchdog and
  * roaming state machines, and once per second recompute the throughput in
  * kbit/s from the byte counters. */
@@ -2917,7 +3565,10 @@ void bridge_tick(void) {
   tune_all_tick();
   watchdog_tick();
   roam_tick();
+  last_ap_tick();
   failover_tick();
+  cpustat_tick(s_by_e2w, s_by_w2e);
+  thermal_tick();
 
   static uint32_t last = 0;
   static uint64_t le = 0, lw = 0;

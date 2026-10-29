@@ -24,6 +24,9 @@
 #define CRASH_F_IMPORTED  0x04u   /* written before the history existed */
 #define CRASH_F_BT_CORRUPT 0x08u  /* backtrace incomplete according to the coredump */
 #define CRASH_F_STALE_DUMP 0x10u  /* panic, but no new image was written */
+#define CRASH_F_SUPPLY    0x20u   /* panic without a new dump and without the RTC
+                                   * heartbeat: most likely the supply bouncing
+                                   * at power-on, not a firmware fault */
 
 typedef struct {
   uint32_t epoch;        /* crash time UTC, 0 = unknown (clock not set) */
@@ -31,7 +34,8 @@ typedef struct {
   uint8_t  rst;          /* esp_reset_reason_t, 0xFF = unknown (import) */
   uint8_t  flags;        /* CRASH_F_* */
   uint8_t  bt_n;
-  uint8_t  _pad;
+  uint8_t  repeat;       /* further identical CRASH_F_SUPPLY resets merged into
+                          * this entry (see crashlog_boot()) */
   char     build[12];    /* GIT_REV of the crashed image */
   char     task[16];
   uint32_t pc;
@@ -45,6 +49,14 @@ typedef struct {
  * watchdog_restart = result of bridge_consume_planned_restart(). Records a
  * crash of the previous boot if there was one, and starts the heartbeat. */
 void crashlog_boot(bool watchdog_restart);
+
+/* Reset reason of the current boot (esp_reset_reason_t), and whether the
+ * previous boot's RTC heartbeat was found intact. The latter shows whether
+ * RTC_NOINIT memory survived the reset - all RTC-based diagnostics (this
+ * heartbeat, the Wi-Fi disconnect log, the planned-restart marker) depend on
+ * it. Both are valid after crashlog_boot(). */
+uint8_t crashlog_reset_reason(void);
+bool    crashlog_rtc_retained(void);
 
 /* Start SNTP once the management netif is up (bridge mode). */
 void crashlog_time_start(const uint8_t gw[4]);

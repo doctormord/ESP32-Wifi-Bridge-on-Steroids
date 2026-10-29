@@ -1,6 +1,6 @@
 # ESP32 Wi-Fi Bridge on Steroids
 
-A **transparent Layer-2 Wi-Fi ↔ Ethernet bridge** for the WT32-ETH01, with a web portal, a JSON API, MQTT telemetry with Home Assistant autodiscovery, over-the-air updates, a self-healing watchdog, crash forensics and live performance tuning.
+A **transparent Layer-2 Wi-Fi ↔ Ethernet bridge** for the WT32-ETH01 — and, as a second target, an ESP32-C5 with a W5500 SPI Ethernet module (dual-band 2.4/5 GHz) — with a web portal, a JSON API, MQTT telemetry with Home Assistant autodiscovery, over-the-air updates, a self-healing watchdog, crash forensics and live performance tuning.
 
 Plug an IP camera (or any Ethernet device) into the board, and it appears on your Wi-Fi network **as if it were cabled directly to your router** — same MAC, its own DHCP lease, directly reachable, discovery protocols intact. No NAT, no second subnet, no port forwarding.
 
@@ -152,13 +152,23 @@ Detects a bridge the driver still reports as "connected" but that has stopped de
 - **OTA over HTTP** with automatic rollback. A new image boots as `PENDING_VERIFY` and only confirms itself after **30 s of network reachability** — not merely "it booted". Anything that does not confirm is undone by a single power cycle.
 - **Boot-loop protection**: three starts without 60 s of stable operation, and the board falls back to the portal instead of rebooting forever.
 - **Portal idle auto-recovery**: while in the setup AP with no real portal use (page load, save, scan — deliberately *not* the 2 s status poll), the board retries a normal boot with the stored credentials every `ap_idle_reboot_s` (default 15 min). Only if credentials exist, so a factory-reset board does not loop.
-- **Factory reset** by holding GPIO14 low for two seconds at boot.
+- **Factory reset** by holding GPIO14 (ESP32-C5 target: GPIO4) low for two seconds at boot.
+- **Fast start**: the AP of the last successful connection is kept in NVS and tried directly at boot, without a scan; only if it does not answer is the regular scan run. On the ESP32-C5 target the data path is up about 4 s after power-on instead of ~19 s.
 
 ### Crash forensics
 
 - **Core dumps** to a dedicated 64 KB flash partition, retrievable over HTTP (`/api/coredump`: panic reason, task, PC, backtrace).
-- **Timestamped crash history** (`/api/crashes`, last 8 entries in NVS): every unexpected reset — panic, interrupt/task/hardware watchdog, brownout — is recorded on the next boot with its **wall-clock time** (SNTP, gateway first, `pool.ntp.org` as fallback), the uptime it crashed at and the build it was running. A heartbeat in RTC memory, updated every second, survives the crash and tells the next boot when it happened. A stale core dump (panic without a new image) is detected by its CRC fingerprint and not attributed to the wrong crash.
+- **Timestamped crash history** (`/api/crashes`, last 8 entries in NVS): every unexpected reset — panic, interrupt/task/hardware watchdog, brownout — is recorded on the next boot with its **wall-clock time** (SNTP, gateway first, `pool.ntp.org` as fallback), the uptime it crashed at and the build it was running. A heartbeat in RTC memory, updated every second, survives the crash and tells the next boot when it happened. A stale core dump (panic without a new image) is detected by its CRC fingerprint and not attributed to the wrong crash. A panic that left neither a new dump nor the previous boot's heartbeat is shown as a *power-on glitch*: a supply that bounces while being plugged in starts the chip, which faults in the dip and restarts itself, so the boot that follows reports a panic instead of a power-on. Repeats of it are counted in one entry, so they do not push real crashes out of the history.
+- **Previous boot's log**: the console output lives in a ring buffer in RAM that survives every reset but a power loss; after a crash, watchdog or software reset the last 2 KB of the previous boot are stored in NVS together with the reset reason (`/api/log?prev=1`, *Previous boot* in the portal).
 - **Build identification**: every build embeds its git revision (`"build"` in `/api/status`), and `scripts/ota_flash.sh` archives the matching `firmware.elf` so a later core dump can be resolved with `addr2line` against the exact binary.
+
+### Console log over the network
+
+The serial console is unreachable on a deployed board (and on the ESP32-C5's native USB it only shows output while a host has the port open). Everything printed to `stdout` — the firmware's own log lines and `ESP_LOG` output — is also kept in an 8 KB ring buffer and shown in the portal's *Console log* box, polled once a second while it is open (`GET /api/log`, admin key). ROM and bootloader output is not captured.
+
+### Dual-band Wi-Fi (ESP32-C5 target)
+
+`wifi_band` selects which band the bridge may use: **prefer 5 GHz** (default — a 5 GHz AP is chosen over 2.4 GHz as long as it is at least −75 dBm), **5 GHz only**, **2.4 GHz only**, or **strongest signal**. With 5 GHz preferred, a bridge that had to fall back to 2.4 GHz moves back to 5 GHz as soon as a usable 5 GHz AP shows up, even with roaming switched off. The connect is pinned to the BSSID and channel the scan picked. The setting is only offered in the portal on hardware that supports 5 GHz.
 
 ### Wi-Fi disconnect log
 
@@ -245,6 +255,10 @@ All endpoints are served on the management IP (or `192.168.4.1` in provisioning 
 | POST 🔑 | `/api/update` | Upload firmware (raw `.bin` body) |
 | GET / DELETE 🔑 | `/api/coredump` | Read / erase the stored core dump |
 | GET / DELETE 🔑 | `/api/crashes` | Read / clear the crash history |
+| GET 🔑 | `/api/log?since=N` | Console output from byte position `N` (max 2 KB per reply; `X-Log-Next` = position for the next poll, `X-Log-Reset: 1` after a reboot or ring wrap) |
+| GET 🔑 | `/api/cpu` | CPU share per task over the last and the busiest 5 s window, with the bridge throughput in each (`?reset=1` forgets the busiest). Needs `CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS` (on for the ESP32-C5 target), else `{"enabled":0}` |
+| GET / POST 🔑 | `/api/speed` | `GET ?mb=N` sends N MiB of zeros, `POST` discards the body and reports `bytes`/`ms`/`kbps`: a throughput test of the management stack. With the default 2880-byte lwIP TCP windows it tops out around 5 Mbit/s - it measures the bridge's own Wi-Fi only with larger windows |
+| GET 🔑 | `/api/log?prev=1` | End of the previous boot's console output; `X-Log-Rst` = the reset reason that ended it |
 
 ### `GET /api/status`
 
@@ -292,6 +306,12 @@ All endpoints are served on the management IP (or `192.168.4.1` in provisioning 
 | `qc`, `qc_s`, `qc_k`, `qc_r` | Queue cap calibration: state (as `at`), completed measurements, cap under test, chosen cap (0 = off, -1 = no result) |
 | `all` | *Calibrate all*: 0 idle, 1–4 running stage (retries, TX power, queue cap, long-run check), 5 done, 6 stopped |
 | `lr`, `lr_k`, `lr_el`, `lr_tot`, `lr_r` | Long-run retry check: state (as `at`), retries in the running block, minutes elapsed / total, chosen retries |
+| `spi` | W5500 SPI clock in MHz (ESP32-C5 target), 0 = internal EMAC |
+| `w5` | W5500 driver counters since boot: drops `[TX ring full, SEND timeout, RX resync, RX no heap,` then RX rounds that found only an incomplete frame (not a drop)`]` (all 0 with the internal EMAC) |
+| `w5x` | W5500 driver activity since boot: `[RX frames, RX batches, TX frames, driver-task rounds, ms in SPI, ms delivering to Wi-Fi, waits for TX ring room]` — compare two readings under load to see where the time per frame goes |
+| `temp`, `temp_max` | SoC temperature now and its maximum since boot, in 0.1 °C (−32768 = no sensor; the ESP32 of the WT32-ETH01 has none) |
+| `thr`, `drop_thr` | LAN → Wi-Fi rate limit in force in kbit/s (0 = none) and the frames it dropped (also in `drop_up`) — see *Power supply limit* below |
+| `rst`, `rtc` | Reset reason of this boot (`esp_reset_reason_t`), and whether RTC memory survived it (1) |
 | `time` | UTC Unix time, 0 = not synced via SNTP yet |
 | `build` | Git revision of the running firmware (`-dirty` if built from uncommitted changes) |
 
@@ -327,6 +347,10 @@ All endpoints are served on the management IP (or `192.168.4.1` in provisioning 
 | `roam_rssi_threshold` | 0 or −100…−1 dBm |
 | `roam_margin_db` | 0–40 |
 | `txq_cap` | 0 (off) or 4–64 frames |
+| `wifi_band` | 0 prefer 5 GHz, 1 5 GHz only, 2 2.4 GHz only, 3 strongest signal (ESP32-C5 target; `band5g` in `GET` says whether the hardware has 5 GHz) |
+| `thr_off` | 0 = temperature throttle LAN → Wi-Fi on (default), 1 = off. Live |
+| `e2w_max_mbit` | Fixed LAN → Wi-Fi limit in Mbit/s, 0 = none (default). Live |
+| `thr_temp_c` | Chip temperature in °C at which the throttle starts, 0 = default (79). ~90 with a separate 3.3 V supply. Live |
 
 Saving applies TX power and retries immediately; watchdog and roaming settings are read live; everything else takes effect after a reboot.
 
@@ -402,6 +426,39 @@ Home Assistant creates one device with sensors for signal strength, Wi-Fi channe
   - Fed from a USB-serial adapter's 5 V pin, the rail collapses when Wi-Fi starts and takes the adapter down with it. Tell-tale: the *adapter* re-enumerates on USB — a crashing ESP32 cannot do that.
   - A power bank switches off because the ESP32 in download mode draws less than its idle threshold. Symptom: `esptool` fails with "No serial data received", identical to a broken TX wire.
 
+### Second target: ESP32-C5 + W5500
+
+- **NiceMCU ESP32-C5_MINI_V1.0** (ESP32-C5HF4: single-core RISC-V at 240 MHz, dual-band Wi-Fi 6, 4 MB in-package flash, no PSRAM, native USB) plus a **W5500** module (W5500-Lite) on SPI. PlatformIO environment `nicemcu-c5-w5500`; partition table `partitions_4mb_ota.csv` (2 × 1920 KB OTA + 64 KB core dump), firmware ~58 % of a slot.
+
+| W5500 | ESP32-C5 |
+|---|---|
+| SCLK | IO9 |
+| MOSI | IO8 |
+| MISO | IO2 |
+| CS | IO10 |
+| INT | IO12 (required) |
+| RST | IO3 |
+
+- **SPI clock:** 80 MHz is the W5500's theoretical maximum (33.3 MHz guaranteed). With SCLK/MOSI routed through the GPIO matrix (these are not the SPI2 IO_MUX pins) the MISO data arrives too late for plain 80 MHz, so the firmware first tries **80 MHz in half-duplex mode with read compensation** (one dummy clock before every read), then plain 80 → 53.3 → 40 → 20 MHz, keeping the first setting at which the chip identifies itself. The reference wiring runs at **80 MHz** compensated (`spi` in `/api/status`). The check only catches gross failures — marginal wiring would show up as RX resyncs (`w5[2]`) or TCP retransmissions.
+- **INT is on IO12** (UART0 RX), so the W5500-Lite and the C5 module can be soldered together as one block without a jumper wire. The firmware does not use UART0 (the console is USB only). The W5500 keeps running through a C5 reset and may hold INT low then; that does not affect booting (IO12 is not a strapping pin). The automatic reset into download mode over USB fails with INT on IO12 and on IO15 alike (see below).
+- **Own W5500 MAC driver** (`src/w5500_mac.c`) instead of ESP-IDF's: transmit only queues the frame (packed 16 KB ring; the Wi-Fi task waits for room instead of dropping), the next frame is written to the chip while the previous one is still on the wire, and large transfers run interrupt-driven so the single core stays free for Wi-Fi. Reception runs as one chain of queued SPI transactions per round: the received data in ~3 KB pieces, each followed by its own release (`Sn_RX_RD` + RECV), then the size read for the next round - the chip gets its memory back while a burst is still arriving, and frames go to Wi-Fi while the DMA continues. IDF's driver is still used for the W5500's PHY. Details and measurements: [`docs/content/w5500-macraw-rx.md`](docs/content/w5500-macraw-rx.md).
+- **Factory reset is GPIO4**, not the BOOT button (IO28): held at reset, BOOT enters download mode.
+- **Power supply limit — read this before deploying.** On the NiceMCU ESP32-C5_MINI_V1.0 the module's own 3.3 V regulator (LDO) also feeds the W5500-Lite (128–132 mA at a 100 Mbit link, datasheet table 5.4). Under *sustained* LAN → Wi-Fi traffic, when the bridge's Wi-Fi transmitter is on most of the time, the board resets — measured with a rate-controlled UDP stream from the Ethernet side, a 20 W USB-C supply and a short cable:
+
+  | Sustained LAN → Wi-Fi | Result |
+  |---|---|
+  | 12 Mbit/s | stable for 4 min |
+  | 16 Mbit/s | reset after ~85 s, then ~30 s unreachable |
+  | 20 Mbit/s | reset after ~6 s |
+  | 24–40 Mbit/s | reset within seconds, over and over |
+  | 38 Mbit/s **Wi-Fi → LAN** (download) | stable for 3 min |
+
+  Reset reason power-on (sometimes panic) with RTC memory lost, never brownout, no core dump: the regulator gives up, not the firmware. The time to reset shrinks with load and when already warm — heat in the regulator, which heats far faster than the ESP32-C5 itself (the chip read 67 °C at a reset under heavy load and 83–84 °C under moderate load). Downloads are unaffected because the bridge then mostly *receives* over Wi-Fi and only transmits small TCP ACKs. Lower TX power (down to 8.5 dBm) does not help: what matters is how long the transmitter is on. Two things follow:
+  - **Hardware fix — verified:** feed the board from an external 3.3 V DC/DC buck instead of the module's LDO (tested: buck mounted directly at the pins, ~3 mm to the board, 10 µF ceramic at its output, ≥ 400 kHz switching). Afterwards: a ramp to 40 Mbit/s LAN → Wi-Fi without a reset (39.5 Mbit/s forwarded), **5 min at 30 Mbit/s without a reset or drop**, 80 MHz SPI unaffected; throughput on such a board is under *Performance*. The chip idles ~15 °C cooler (51 instead of 65–67 °C) and settles at ~81 °C under sustained full load — normal for the chip, so raise `thr_temp_c` to ~90 and set `e2w_max_mbit` to 0 on such a board.
+  - **On the unmodified module, the firmware protects itself:** `e2w_max_mbit` caps LAN → Wi-Fi (12 is the measured safe value on this hardware), and the temperature throttle (`thr_off` = 0, default) lowers the cap further in steps while the chip runs at or above `thr_temp_c` (default 79 °C) and lifts it again once it is 3 °C cooler. Every change is logged (`[THR ] Ethernet->Wi-Fi limited to … kbit/s`), the portal shows the chip temperature and the limit in force. The temperature alone reacts too late at high rates, hence the fixed cap. Verified: 30 Mbit/s offered for 3 min with a 12 Mbit/s cap — no reset; the throttle held the chip at 78 °C at 7.9 Mbit/s and returned to 12 once it cooled.
+  - A new firmware image confirms itself only after 30 s of network reachability; a supply reset before that rolls it back. Flash with the LAN side idle.
+- **Console and flashing over the USB-C port** (USB-Serial/JTAG, `/dev/cu.usbmodem*`). On macOS the port only delivers output while the host asserts DTR. esptool's automatic reset into download mode does not work on this board: it fails with "No serial data received" and leaves the board hung until it is power-cycled. Flash the first time with BOOT held while plugging in USB, then use OTA.
+
 ### Wiring for flashing
 
 | USB-serial adapter | WT32-ETH01 |
@@ -411,7 +468,7 @@ Home Assistant creates one device with sensors for signal strength, Wi-Fi channe
 | GND | GND |
 | DTR / RTS | IO0 / EN (optional, for automatic reset) |
 
-Use a **3.3 V logic** adapter. Pull **IO0 to GND** to enter download mode; the firmware only runs with it removed. Leave **IO14 unconnected** — it is the factory-reset input. Never open the serial monitor while an OTA is in progress: toggling DTR/RTS resets the board.
+For the WT32-ETH01: use a **3.3 V logic** adapter. Pull **IO0 to GND** to enter download mode; the firmware only runs with it removed. Leave **IO14 unconnected** — it is the factory-reset input. Never open the serial monitor while an OTA is in progress: toggling DTR/RTS resets the board.
 
 ---
 
@@ -425,7 +482,14 @@ cd ESP32-Wifi-Bridge-on-Steroids
 pio run -e wt32-eth01                                            # build
 pio run -e wt32-eth01 -t upload --upload-port /dev/ttyUSB0       # first flash via serial
 scripts/ota_flash.sh <mgmt-ip> [admin-key]                       # later: build + archive ELF + OTA
+
+# ESP32-C5 + W5500
+pio run -e nicemcu-c5-w5500
+pio run -e nicemcu-c5-w5500 -t upload --upload-port /dev/cu.usbmodem1101
+scripts/ota_flash.sh <mgmt-ip> "<admin-key>" nicemcu-c5-w5500
 ```
+
+C5-only settings (W5500 driver, USB console, 4 MB flash, coredump stack) live in `sdkconfig.defaults.esp32c5`, which ESP-IDF applies on top of `sdkconfig.defaults` for that target.
 
 Always pass `--upload-port` explicitly if more than one serial adapter is attached.
 
@@ -469,7 +533,7 @@ python3.13 -m venv ~/.pio-py313
 
 ## Performance
 
-Measured on the development board with an IP camera streaming:
+Measured on the WT32-ETH01 development board with an IP camera streaming:
 
 | | |
 |---|---|
@@ -479,6 +543,29 @@ Measured on the development board with an IP camera streaming:
 | Latency through the bridge | **4.9 ms** average |
 
 In a direct A/B against the Rust original on the same board and spot, both landed around 60 Mbit/s combined (24/36 and 29/31). Radio environment dominates: the same firmware delivered 3.3 Mbit/s upstream on a weak mesh node and 35.7 Mbit/s on a good access point. **Placement beats tuning.**
+
+### ESP32-C5 + W5500
+
+Current firmware, board on an external 3.3 V buck (see *Power supply limit* in the hardware section), W5500 at 80 MHz SPI, 5 GHz channel 36 at −50 to −60 dBm. A laptop is plugged into the bridge's Ethernet port; the counterpart is on the Wi-Fi side.
+
+| Direction | Test | Result |
+|---|---|---|
+| Upload (LAN → Wi-Fi) | UDP, 70 Mbit/s offered by the laptop | **54–59 Mbit/s** forwarded |
+| Upload | TCP, `networkQuality` upload | 34–38 Mbit/s |
+| Upload | bursts of N back-to-back full frames at 100 Mbit/s | 15: no loss · 40: 6–8 lost · 60: 14–16 lost |
+| Download (Wi-Fi → LAN) | TCP, `networkQuality` download | 32–33 Mbit/s |
+| Download | web speed test (`speedtest-cli`, Ookla) | 36–37 Mbit/s |
+| Both at once | UDP up + `networkQuality` down | ~28 up + 31–34 down |
+| For comparison | the same laptop on its own Wi-Fi, same spot | 72 down / 87 up |
+
+**What limits each direction.** The radio is not the limit: 1 m from the AP (−17 dBm) the bridge was as fast as at −55 dBm. Every frame crosses the SPI bus, and Wi-Fi, the W5500 driver and lwIP share one CPU core.
+- *Download* is limited by the SPI transmit path: a full frame costs ~205 µs of SPI at 80 MHz, 151 µs of it payload.
+- *Upload with UDP* (a camera's RTP stream) gets the most. It is limited by the SPI receive path (~150 µs per full frame) and by delivering the frames to Wi-Fi.
+- *Upload with TCP* is lower because of the sender, not the bridge. A laptop with TSO sends 64 KB segments as bursts of 44 frames at line rate. The W5500 holds only 16 KB of received frames (10.8 full frames), so 5–7 % of such a burst is lost before the driver can take it, and TCP backs off. Senders that pace their packets, like most cameras, or bursts of up to ~15 full frames get through without loss. The W5500 does not count these losses; compare the sender's interface counter with `w5x[0]` in `/api/status`.
+
+The receive path is the part tuned furthest: RX memory is released piece by piece within one queued SPI chain, while frames already go to Wi-Fi. The technique, the measurements behind it and what did not help (PAUSE frames, half-duplex backpressure, the SPI peripheral's segmented transfer mode) are written up in [`docs/content/w5500-macraw-rx.md`](docs/content/w5500-macraw-rx.md), for anyone maintaining a W5500 MACRAW driver elsewhere. How the numbers developed driver change by driver change is in [`docs/content/history.md`](docs/content/history.md).
+
+Under heavy load in both directions the minimum free heap drops to 6–14 KB, because frames move into the Wi-Fi driver faster. `dynamic_tx_buf` and `txq_cap` bound that if needed. On 2.4 GHz the bridge gets a stronger signal but less throughput (14–15 Mbit/s, busier band), so keep it on 5 GHz.
 
 ### Retry counts matter more than anything else
 
@@ -507,7 +594,7 @@ Raising `dynamic_tx_buf` from 32 to 64 dropped free heap from 111 kB to 9 kB and
 
 **Throughput poor, RSSI good.** Check the retry count first, then which AP you are on (`/api/scan` shows what the board sees from where it is mounted).
 
-**Unexpected reboot.** Check the crash history and `/api/coredump` before reflashing; resolve the backtrace with `xtensa-esp32-elf-addr2line -e elf_archive/<build>_*.elf <addresses>`.
+**Unexpected reboot.** Check the crash history and `/api/coredump` before reflashing; resolve the backtrace with `xtensa-esp32-elf-addr2line -e elf_archive/<build>_*.elf <addresses>`. The ESP32-C5 (RISC-V) has no on-device backtrace; `/api/coredump` reports `pc`, the return address `ra` (as the only `bt` entry), `mcause` and `mtval` instead — resolve `pc` and `ra` with `riscv32-esp-elf-addr2line`. *Previous boot* in the console log box shows what the board printed right before.
 
 **Board silent, adapter fine.** Power. See the hardware section.
 
@@ -524,6 +611,8 @@ src/
   config.cpp/.h     NVS-backed configuration (append-only blob)
   telemetry.cpp/.h  MQTT and Home Assistant discovery
   crashlog.cpp/.h   timestamped crash history, RTC heartbeat, SNTP
+  conlog.cpp/.h     console ring buffer for /api/log, previous boot's log
+  w5500_mac.c/.h    W5500 MAC driver (ESP32-C5 target), w5500_regs.h its registers
   compat.h          millis()/delay() over esp_timer/vTaskDelay
 scripts/
   ota_flash.sh        build, archive firmware.elf, OTA-upload
@@ -531,8 +620,11 @@ scripts/
   portal_screenshots.mjs  renders images/ from PAGE[] with anonymized sample data
 images/             portal screenshots (32-color PNGs)
 partitions_8mb_ota.csv   live partition table (2 × 3 MB OTA + 64 KB core dump)
+partitions_4mb_ota.csv   ESP32-C5 target (2 × 1920 KB OTA + 64 KB core dump)
 sdkconfig.defaults       single source of truth for driver and buffer settings
-docs/content/       development history, backlog, handoff notes
+sdkconfig.defaults.esp32c5  ESP32-C5 additions (W5500, USB console, 4 MB flash)
+docs/content/       development history, backlog, handoff notes,
+                    w5500-macraw-rx.md (W5500 MACRAW receive path, technical note)
 ```
 
 ---

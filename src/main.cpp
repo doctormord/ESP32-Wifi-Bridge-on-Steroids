@@ -48,6 +48,7 @@
 #include "web.h"
 #include "telemetry.h"
 #include "crashlog.h"
+#include "conlog.h"
 
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -56,8 +57,15 @@
 #include "lwip/apps/netbiosns.h"
 
 /* Pull this pin to GND at boot for a factory reset. On the WT32-ETH01 most
- * GPIOs are taken by RMII; IO14 is free and not a strapping pin. */
+ * GPIOs are taken by RMII; IO14 is free and not a strapping pin. On the
+ * NiceMCU ESP32-C5 Mini, IO4 is free and not a strapping pin. The C5's BOOT
+ * button (IO28) cannot serve this purpose: held during reset, it selects
+ * the serial download mode. */
+#if CONFIG_IDF_TARGET_ESP32C5
+#define FACTORY_RESET_GPIO   4
+#else
 #define FACTORY_RESET_GPIO   14
+#endif
 
 /* How long to wait for the first client frame before giving up and offering
  * the portal instead. Without a client MAC there is no bridge. */
@@ -179,6 +187,9 @@ static void bridge_setup(void) {
     ESP_ERROR_CHECK(nvs_flash_erase());
     ESP_ERROR_CHECK(nvs_flash_init());
   }
+  /* Store the end of the previous boot's log (taken from RAM by
+   * conlog_init()) now that NVS is available - see /api/log?prev=1. */
+  conlog_persist_prev();
 
   ESP_ERROR_CHECK(esp_netif_init());
   esp_err_t e = esp_event_loop_create_default();
@@ -204,6 +215,8 @@ static void bridge_setup(void) {
    * otherwise the one-shot magic word would be cleared without being
    * consumed. */
   const bool planned_restart = bridge_consume_planned_restart();
+  /* The same for a reboot someone asked for (/api/reboot, OTA). */
+  const bool requested_restart = bridge_consume_requested_restart();
 
   /* Log an unexpected reset of the previous boot (timestamp taken from the
    * RTC heartbeat) - in every mode, even if we go straight to the portal. */
@@ -212,7 +225,7 @@ static void bridge_setup(void) {
   if (s_boot_magic != BOOT_MAGIC) {
     s_boot_magic = BOOT_MAGIC;
     s_boot_failures = 0;
-  } else if (planned_restart) {
+  } else if (planned_restart || requested_restart) {
     /* s_boot_failures stays unchanged. */
   } else {
     s_boot_failures++;
@@ -459,6 +472,7 @@ static void bridge_loop(void) {
  * without the Arduino core behind it.
  * ------------------------------------------------------------------------ */
 extern "C" void app_main(void) {
+  conlog_init();   /* first, so every task created later logs into the ring too */
   bridge_setup();
   for (;;) {
     bridge_loop();

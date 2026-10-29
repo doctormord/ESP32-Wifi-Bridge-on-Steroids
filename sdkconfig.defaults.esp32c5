@@ -1,0 +1,70 @@
+# ============================================================================
+#  sdkconfig.defaults.esp32c5  -  ESP32-C5 target only
+# ============================================================================
+#  ESP-IDF loads this file automatically IN ADDITION to sdkconfig.defaults
+#  when IDF_TARGET=esp32c5 (env:nicemcu-c5-w5500). It only holds what differs
+#  from the WT32-ETH01; everything else is shared.
+#
+#  The CONFIG_ETH_DMA_* lines in sdkconfig.defaults only concern the internal
+#  EMAC of the classic ESP32. The C5 has none, so Kconfig ignores them for
+#  this target.
+
+# --- Ethernet: W5500 on SPI instead of EMAC + LAN8720 -----------------------
+CONFIG_ETH_USE_SPI_ETHERNET=y
+CONFIG_ETH_SPI_ETHERNET_W5500=y
+CONFIG_ETH_SPI_ETHERNET_DM9051=n
+CONFIG_ETH_SPI_ETHERNET_KSZ8851SNL=n
+
+# The W5500 driver talks to the chip several times per frame through
+# spi_device_polling_transmit (RX size, header, payload, read pointer, RECV
+# command). Keeping those paths in IRAM instead of fetching them through the
+# flash cache matters at 80 MHz SPI, where the software gaps between
+# transfers are a noticeable share of the time per frame.
+CONFIG_SPI_MASTER_IN_IRAM=y
+CONFIG_SPI_MASTER_ISR_IN_IRAM=y
+
+# --- Console: native USB only -----------------------------------------------
+# The board's USB-C connector is the chip's own USB-Serial/JTAG port, which
+# carries both flashing and the serial log; there is no USB-UART chip, so a
+# UART0 console would only reach the bare TXD/RXD header pins. A host reading
+# the log must assert DTR, otherwise the port delivers no output.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# --- CPU --------------------------------------------------------------------
+# CONFIG_ESP32_DEFAULT_CPU_FREQ_240 in sdkconfig.defaults is an ESP32-only
+# symbol; this is the C5 equivalent. The C5 also runs at 240 MHz.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# --- Flash ------------------------------------------------------------------
+# board_build.flash_size does not reach Kconfig, which would otherwise fall
+# back to 2 MB. Set explicitly to match the C5HF4's 4 MB in-package flash and
+# partitions_4mb_ota.csv.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# --- Coredump ---------------------------------------------------------------
+# Write the coredump on a dedicated stack instead of the crashing task's own.
+# With 0 (the default) a crash that is itself stack-related - an overflow or
+# a corrupted stack - can make the coredump write fail, leaving no image.
+CONFIG_ESP_COREDUMP_STACK_SIZE=1792
+
+# --- Logging ----------------------------------------------------------------
+# Default level stays WARN (sdkconfig.defaults). The maximum is raised to
+# INFO so bridge_wifi_start() can switch the Wi-Fi driver's log to INFO while
+# connecting - its state changes (auth -> assoc -> run) show where a slow
+# connect spends its time. Above the maximum, esp_log_level_set() has no
+# effect.
+CONFIG_LOG_MAXIMUM_LEVEL_INFO=y
+
+# --- CPU load statistics ----------------------------------------------------
+# Per-task run-time counters for GET /api/cpu (cpustat.cpp). On the
+# single-core C5, Wi-Fi, the W5500 driver task and lwIP share one CPU, so
+# whether a throughput limit is CPU-bound has to be measured, not guessed.
+# Costs one timer read per context switch.
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+
+# --- Unused radios -----------------------------------------------------------
+# The C5 also has an 802.15.4 (Thread/Zigbee) radio. The bridge never starts
+# it, so it draws no power either way; disabled to keep its driver out of the
+# image.
+CONFIG_IEEE802154_ENABLED=n

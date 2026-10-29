@@ -14,6 +14,8 @@
  *   POST /api/update        raw OTA upload            (admin key)
  *   GET/DELETE /api/coredump  coredump summary/erase  (admin key)
  *   GET/DELETE /api/crashes   crash history/erase     (admin key)
+ *   GET  /api/log?since=N   console output since byte N (admin key)
+ *   GET  /api/log?prev=1    end of the previous boot's output  (admin key)
  */
 
 #include "web.h"
@@ -32,6 +34,8 @@
 #include "esp_core_dump.h"
 #include "build_info.h"
 #include "crashlog.h"
+#include "conlog.h"
+#include "cpustat.h"
 
 #define AP_PASSWORD   "bridgesetup"   /* at least 8 characters, otherwise open */
 
@@ -236,6 +240,9 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
     <div class="m"><div class="k">Channel width</div><div class="v" id="bw">-</div></div>
     <div class="m"><div class="k">TX queue</div><div class="v" id="txq">-</div></div>
     <div class="m"><div class="k">Lost on air</div><div class="v" id="airf">-</div></div>
+    <div class="m" id="spim" style="display:none"><div class="k">Ethernet SPI</div><div class="v" id="spi">-</div></div>
+    <div class="m" id="tempm" style="display:none"><div class="k">Chip temperature</div><div class="v" id="temp">-</div></div>
+    <div class="m"><div class="k">LAN&rarr;Wi-Fi limit</div><div class="v" id="thr">-</div></div>
   </div>
   <div class="sub" style="margin:12px 0 0" id="detail"></div>
   <div id="cdbox" style="display:none;margin-top:10px;padding:10px;background:rgba(255,107,107,.08);
@@ -254,6 +261,18 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
     <div id="dlsum" class="sub" style="margin:6px 0"></div>
     <div style="overflow-x:auto"><table id="dltab" class="sub" style="border-collapse:collapse;width:100%;font-size:12px"></table></div>
     <button class="sec" onclick="loadDisc()" style="margin-top:6px">Refresh</button>
+  </details>
+  <details id="lgbox" style="margin-top:10px" ontoggle="logToggle(this.open)">
+    <summary class="sub" style="cursor:pointer">Console log</summary>
+    <pre id="lgpre" style="background:#0d1015;border-radius:8px;padding:8px;margin:6px 0 0;
+         max-height:360px;overflow:auto;font-size:11px;line-height:1.35;white-space:pre-wrap;
+         word-break:break-all"></pre>
+    <span class="hint" id="lghint"></span>
+    <button class="sec" onclick="$('lgpre').textContent=''" style="margin-top:6px">Clear view</button>
+    <button class="sec" onclick="logPrev()" style="margin-top:6px">Previous boot</button>
+    <pre id="lgprev" style="display:none;background:#0d1015;border-radius:8px;padding:8px;margin:6px 0 0;
+         max-height:360px;overflow:auto;font-size:11px;line-height:1.35;white-space:pre-wrap;
+         word-break:break-all"></pre>
   </details>
 </div>
 
@@ -355,6 +374,31 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
     invisibly in the DMA. So: as small as possible, as large as necessary.
     <br>The opposite direction rarely needs more than 1 &ndash; Ethernet
     practically always accepts.
+  </div>
+
+  <label>Temperature throttle LAN&rarr;Wi-Fi</label>
+  <select id="thr_off">
+    <option value="0">on (default)</option>
+    <option value="1">off</option>
+  </select>
+  <label>Throttle start temperature
+    <span class="hint">&deg;C, 0 = default (79)</span></label>
+  <input id="thr_temp_c">
+  <label>Max rate LAN&rarr;Wi-Fi
+    <span class="hint">Mbit/s, 0 = no limit</span></label>
+  <input id="e2w_max_mbit">
+  <div class="sub" style="margin:6px 0 0">
+    The temperature throttle lowers the LAN&rarr;Wi-Fi rate step by step while
+    the chip runs hot (from the start temperature, 79&nbsp;&deg;C by default)
+    and lifts it again once it is 3&nbsp;&deg;C cooler; tile <i>LAN&rarr;Wi-Fi limit</i> shows what is in
+    force, the console log every change. The fixed maximum is for hardware
+    whose power supply cannot carry sustained Wi-Fi transmission: an
+    ESP32-C5 module feeding a W5500 from its own regulator resets above
+    roughly 12&ndash;16&nbsp;Mbit/s, and the chip temperature rises too late to
+    catch that. With a separate 3.3&nbsp;V supply the chip settles around
+    81&nbsp;&deg;C at full load - raise the start temperature to about
+    90&nbsp;&deg;C and remove the maximum. All three act within seconds, no
+    reboot.
   </div>
 
   <label>TX queue cap LAN&rarr;Wi-Fi
@@ -614,6 +658,22 @@ body:has(#dirty:not([hidden])) .wrap{padding-bottom:150px}
     <option value="0">keep enabled (default)</option>
     <option value="1">disable - saves airtime</option>
   </select>
+  <div id="bandrow" style="display:none">
+    <label>Wi-Fi band</label>
+    <select id="wifi_band">
+      <option value="0">Both, prefer 5 GHz (default)</option>
+      <option value="1">5 GHz only</option>
+      <option value="2">2.4 GHz only</option>
+      <option value="3">Both, strongest signal</option>
+    </select>
+    <div class="sub" style="margin:6px 0 0">
+      With "prefer 5 GHz" a 5 GHz AP is used whenever its signal is at least
+      -75&nbsp;dBm, and a bridge that had to fall back to 2.4&nbsp;GHz moves
+      back to 5&nbsp;GHz on its own once a usable AP is in range (checked at
+      the roaming interval, even with roaming off). "Only" settings are
+      enforced by the radio itself and also apply to every reconnect.
+    </div>
+  </div>
   <div class="sub" style="margin:6px 0 0">
     HT40 doubles the gross rate but occupies twice the bandwidth and picks
     up correspondingly more interference. In crowded 2.4&nbsp;GHz
@@ -669,7 +729,7 @@ function sdur(s){return s<60?s+'s':dur(s)}
 function ts(e){return e?new Date(e*1000).toLocaleString():''}
 const TD=(t,h)=>'<'+(h?'th':'td')+' style="text-align:left;padding:2px 6px;border-bottom:1px solid rgba(128,128,128,.25);vertical-align:top">'+t+'</'+(h?'th':'td')+'>';
 /* esp_reset_reason_t -> plain text. 255 = imported from before the history existed. */
-const RST={4:'Crash (panic)',5:'Interrupt watchdog',6:'Task watchdog',7:'Hardware watchdog',9:'Brownout (voltage)',255:'Crash (imported)'};
+const RST={4:'Crash (panic)',5:'Interrupt watchdog',6:'Task watchdog',7:'Hardware watchdog',9:'Brownout (voltage)',14:'Power glitch',15:'CPU lockup',255:'Crash (imported)'};
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 /* Load the crash history (admin key from the firmware field, if set). */
 async function checkCrashes(){
@@ -683,10 +743,12 @@ async function checkCrashes(){
     $('crtab').innerHTML='<tr>'+['When','Kind','Task / reason','Build'].map(t=>TD(t,1)).join('')+'</tr>'+
       j.recs.map(c=>{
         const when=c.e?ts(c.e):(c.f&4?'unknown (before history existed)':'unknown (clock not set)');
-        let kind=(c.f&2)?'Watchdog reboot (intended)':(RST[c.rst]||('Reset '+c.rst));
+        let kind=(c.f&2)?'Watchdog reboot (intended)':(c.f&32)?'Power-on glitch':(RST[c.rst]||('Reset '+c.rst));
+        if(c.n>1)kind+=' <span class="hint">&times;'+c.n+'</span>';
         const det=(c.f&1)?'<b>'+esc(c.task)+'</b> @ 0x'+c.pc+(c.reason?'<br>'+esc(c.reason):'')+
             (c.bt.length?'<br><span class="hint">BT: '+c.bt.map(a=>'0x'+a).join(' ')+(c.f&8?' (incomplete)':'')+'</span>':'')
-          :(c.f&16?'<span class="hint">no new dump written</span>':'<span class="hint">no dump (reset without coredump)</span>');
+          :(c.f&32?'<span class="hint">panic right after power-on, no dump, no heartbeat - usually the supply bouncing while plugged in</span>'
+          :c.f&16?'<span class="hint">no new dump written</span>':'<span class="hint">no dump (reset without coredump)</span>');
         return '<tr>'+TD(when+(c.up>=0?'<br><span class="hint">after '+sdur(c.up)+' uptime</span>':''))+
           TD(kind)+TD(det)+TD(esc(c.build))+'</tr>';
       }).join('');
@@ -734,7 +796,7 @@ async function tick(){
     $('rssi').textContent=s.wifi?s.rssi+' dBm':'-';
     /* -30 dBm = excellent, -90 = dead */
     $('rssibar').style.width=Math.max(0,Math.min(100,(s.rssi+95)*100/65))+'%';
-    $('ch').textContent=s.wifi?s.ch:'-';
+    $('ch').textContent=s.wifi?s.ch+(s.ch>14?' (5 GHz)':' (2.4 GHz)'):'-';
     $('up').textContent=fmt(s.kbps_up); $('down').textContent=fmt(s.kbps_down);
     $('drops').textContent=s.drop_up+' / '+s.drop_down;
     $('drops').className='v '+((s.drop_up+s.drop_down)?'bad':'ok');
@@ -744,6 +806,12 @@ async function tick(){
     $('txp').textContent=(s.wifi&&s.txp>=0)?(s.txp/4).toFixed(2).replace(/\.?0+$/,'')+' dBm':'-';
     /* Actual value from the driver: shows whether HT40 was really negotiated. */
     $('bw').textContent=(s.wifi&&s.bw)?s.bw+' MHz':'-';
+    /* Only SPI Ethernet (W5500) has a bus clock to show; the EMAC reports 0. */
+    if(s.spi){$('spim').style.display='';$('spi').textContent=s.spi+' MHz'}
+    if(s.temp>-32768){$('tempm').style.display='';
+      $('temp').textContent=(s.temp/10).toFixed(1)+' \u00b0C (max '+(s.temp_max/10).toFixed(1)+')'}
+    $('thr').textContent=(s.thr?(s.thr/1000).toFixed(1)+' Mbit/s':'none')+
+      (s.drop_thr?' \u00b7 '+s.drop_thr+' dropped':'');
     /* Calibration progress. at: 0=idle 1=running 2=done 3=too little traffic */
     /* The number of steps is not known in advance (up first, then down,
        stop at the first outlier) - so no remaining time, only the progress. */
@@ -845,11 +913,13 @@ const CFG=['name','ssid1','ssid2','ssid3','ip','mask','gw','ip2','mask2','gw2','
            'static_rx_buf','dynamic_rx_buf','dynamic_tx_buf','rx_ba_win',
            'ht40','no_11b','wd_enable','wd_actions','wd_bad_windows',
            'wifi_connect_timeout_s','wifi_connect_retries','ap_idle_reboot_s',
-           'roam_enable','roam_check_s','roam_rssi_threshold','roam_margin_db','txq_cap'];
+           'roam_enable','roam_check_s','roam_rssi_threshold','roam_margin_db','txq_cap',
+           'wifi_band','thr_off','e2w_max_mbit','thr_temp_c'];
 /* Fill the form from /api/config and take the unsaved-changes snapshot. */
 async function load(){
   const c=await(await fetch('/api/config')).json();
   DEF=c.def||null;
+  $('bandrow').style.display=c.band5g?'':'none';
   for(const k of CFG) if(c[k]!==undefined)$(k).value=c[k];
   snapshot();
   /* Buffers: the form shows the SAVED value (otherwise a change made before
@@ -908,6 +978,9 @@ function defaults(){
   for(const k in DEF) if($(k)) $(k).value=DEF[k];
   $('tx_power').value='0';
   $('txq_cap').value='0';
+  $('thr_off').value='0';
+  $('e2w_max_mbit').value='0';
+  $('thr_temp_c').value='0';
   $('tmsg').textContent='Defaults filled in - save to apply.';
   dirtyCheck();   /* set by script - does not fire an input event */
 }
@@ -1006,7 +1079,7 @@ const PW=['pass1','pass2','pass3','mqtt_pass','admin_pass'];
    bridge_apply_live_tuning()). Everything else only after a reboot. */
 const LIVE=['tx_power','eth_tx_retries','wifi_tx_retries','wd_enable','wd_actions','wd_bad_windows',
             'roam_enable','roam_check_s','roam_rssi_threshold','roam_margin_db',
-            'ap_idle_reboot_s','telemetry_s','admin_pass','txq_cap'];
+            'ap_idle_reboot_s','telemetry_s','admin_pass','txq_cap','thr_off','e2w_max_mbit','thr_temp_c'];
 let SNAP=null;
 function snapshot(){SNAP={};for(const k of CFG)SNAP[k]=$(k).value;dirtyCheck()}
 /* Names of all fields that differ from the baseline. */
@@ -1126,6 +1199,54 @@ function upload(){
   $('omsg').textContent='Starting upload...';
   x.send(f);
 }
+/* Console log: while the box is open, fetch only the output that is new
+   since the last poll (lgSince = byte position returned by the board) once
+   a second. Closed, it costs nothing. The view is capped so a long session
+   does not grow the page without bound. */
+/* Reset reasons for the previous-boot log header (esp_reset_reason_t). */
+const RSTN={1:'power-on',2:'reset pin',3:'software restart',4:'panic',5:'interrupt watchdog',
+  6:'task watchdog',7:'hardware watchdog',8:'deep sleep',9:'brownout',11:'USB',12:'JTAG',
+  14:'power glitch',15:'CPU lockup'};
+/* Show the end of the previous boot's log (stored in NVS at boot), headed
+   by the reset reason that ended it. */
+async function logPrev(){
+  const p=$('lgprev');p.style.display='block';
+  try{
+    const r=await fetch('/api/log?prev=1',{headers:cdHeaders(),cache:'no-store'});
+    if(!r.ok){p.textContent=r.status==401?'Admin key required (enter it under Firmware update)':'Error '+r.status;return}
+    const t=await r.text(),n=+(r.headers.get('X-Log-Rst')||0);
+    p.textContent=t?'--- previous boot, ended by: '+(RSTN[n]||('reset '+n))+' ---\n'+t
+                   :'No previous boot log stored (none since the last power-on).';
+    p.scrollTop=p.scrollHeight;
+  }catch(e){p.textContent='Board not reachable'}
+}
+let lgSince=0,lgTimer=null,lgBusy=false;
+function logToggle(open){
+  clearInterval(lgTimer);lgTimer=null;
+  if(open){logPoll();lgTimer=setInterval(logPoll,1000)}
+}
+/* One request at a time: the 1 s timer and the immediate follow-up after a
+   full reply must not both read from the same position. */
+async function logPoll(){
+  if(lgBusy)return;
+  lgBusy=true;let more=false;
+  try{
+    const r=await fetch('/api/log?since='+lgSince,{headers:cdHeaders(),cache:'no-store'});
+    if(!r.ok){$('lghint').textContent=r.status==401?'Admin key required (enter it under Firmware update)':'Error '+r.status;return}
+    const t=await r.text(),p=$('lgpre');
+    const atEnd=p.scrollTop+p.clientHeight>=p.scrollHeight-4;
+    if(r.headers.get('X-Log-Reset')==='1'&&p.textContent)
+      p.textContent+='\n--- board rebooted or older lines dropped ---\n';
+    p.textContent+=t;
+    if(p.textContent.length>65536)p.textContent=p.textContent.slice(-49152);
+    lgSince=+(r.headers.get('X-Log-Next')||0);
+    if(atEnd)p.scrollTop=p.scrollHeight;
+    $('lghint').textContent='';
+    more=t.length>=2048;   /* full reply: more is waiting */
+  }catch(e){$('lghint').textContent='Board not reachable'}
+  finally{lgBusy=false}
+  if(more&&lgTimer)logPoll();
+}
 load();tick();checkCoredump();checkCrashes();setInterval(tick,2000);
 </script></body></html>)HTML";
 
@@ -1152,8 +1273,10 @@ static esp_err_t h_status(httpd_req_t *r) {
   bridge_get_stats(&st);
   uint32_t lr_el, lr_tot;
   bridge_long_tune_progress(&lr_el, &lr_tot);
+  uint32_t ethd[BRIDGE_ETH_DRV_STATS];
+  bridge_get_eth_drv_stats(ethd);
 
-  char buf[1350];
+  char buf[1550];
   snprintf(buf, sizeof(buf),
     "{\"prov\":%d,\"wifi\":%d,\"eth\":%d,\"rssi\":%d,\"ch\":%u,"
     "\"kbps_up\":%lu,\"kbps_down\":%lu,\"pkt_up\":%lu,\"pkt_down\":%lu,"
@@ -1170,7 +1293,7 @@ static esp_err_t h_status(httpd_req_t *r) {
     "\"pt\":%d,\"pt_s\":%u,\"pt_k\":%d,\"pt_r\":%d,"
     "\"drop_cap\":%lu,\"txq_cap\":%u,\"qc\":%d,\"qc_s\":%u,\"qc_k\":%u,\"qc_r\":%d,\"all\":%d,"
     "\"lr\":%d,\"lr_k\":%u,\"lr_el\":%lu,\"lr_tot\":%lu,\"lr_r\":%u,"
-    "\"time\":%lu,\"build\":\"" GIT_REV "\"}",
+    "\"spi\":%u,\"temp\":%d,\"temp_max\":%d,\"thr\":%lu,\"drop_thr\":%lu,\"w5\":[%lu,%lu,%lu,%lu,%lu],\"w5x\":[%lu,%lu,%lu,%lu,%lu,%lu,%lu],\"rst\":%u,\"rtc\":%d,\"time\":%lu,\"build\":\"" GIT_REV "\"}",
     s_provisioning ? 1 : 0, st.wifi_up ? 1 : 0, st.eth_link ? 1 : 0,
     (int)st.rssi, (unsigned)st.channel,
     (unsigned long)st.kbps_eth2wifi, (unsigned long)st.kbps_wifi2eth,
@@ -1227,6 +1350,26 @@ static esp_err_t h_status(httpd_req_t *r) {
      * elapsed / total, chosen retries. */
     (int)bridge_long_tune_state(), bridge_long_tune_candidate(),
     (unsigned long)lr_el, (unsigned long)lr_tot, bridge_long_tune_result(),
+    /* W5500 SPI clock in MHz, 0 = internal EMAC. */
+    (unsigned)bridge_get_eth_spi_mhz(),
+    /* SoC temperature now and its maximum since boot, 0.1 degC (-32768 = no
+     * sensor), see cpustat.h. */
+    (int)cpustat_temp_x10(), (int)cpustat_temp_max_x10(),
+    /* Thermal throttle: Ethernet -> Wi-Fi limit in kbit/s (0 = none) and
+     * its drops (see bridge_thermal_limit_kbps()). */
+    (unsigned long)bridge_thermal_limit_kbps(), (unsigned long)bridge_thermal_drops(),
+    /* Ethernet driver: drops (TX ring full, SEND timeout, RX resync, RX no
+     * heap) and incomplete RX rounds (see bridge_get_eth_drv_stats()). */
+    (unsigned long)ethd[0], (unsigned long)ethd[1], (unsigned long)ethd[2], (unsigned long)ethd[3],
+    (unsigned long)ethd[4],
+    /* ... and its activity: RX frames, RX batches, TX frames, task rounds,
+     * ms in SPI, ms delivering to Wi-Fi, waits for TX ring room. */
+    (unsigned long)ethd[5], (unsigned long)ethd[6], (unsigned long)ethd[7],
+    (unsigned long)ethd[8], (unsigned long)ethd[9], (unsigned long)ethd[10],
+    (unsigned long)ethd[11],
+    /* Why this boot happened (esp_reset_reason_t) and whether RTC memory
+     * survived it - see crashlog.h. */
+    (unsigned)crashlog_reset_reason(), crashlog_rtc_retained() ? 1 : 0,
     /* Time UTC, 0 = not set via SNTP yet. */
     (unsigned long)crashlog_now());
 
@@ -1361,7 +1504,7 @@ static esp_err_t h_config_get(httpd_req_t *r) {
     "\"wifi_connect_timeout_s\":%u,\"wifi_connect_retries\":%u,"
     "\"ap_idle_reboot_s\":%u,"
     "\"roam_enable\":%u,\"roam_check_s\":%u,\"roam_rssi_threshold\":%d,"
-    "\"roam_margin_db\":%u,\"txq_cap\":%u,"
+    "\"roam_margin_db\":%u,\"txq_cap\":%u,\"wifi_band\":%u,\"band5g\":%d,\"thr_off\":%u,\"e2w_max_mbit\":%u,\"thr_temp_c\":%u,"
     "\"def\":{\"eth_tx_retries\":%u,\"wifi_tx_retries\":%u,"
     "\"static_rx_buf\":%u,\"dynamic_rx_buf\":%u,\"dynamic_tx_buf\":%u,"
     "\"rx_ba_win\":%u,\"wifi_connect_timeout_s\":%u,"
@@ -1390,7 +1533,13 @@ static esp_err_t h_config_get(httpd_req_t *r) {
     eff.wd_actions, eff.wd_bad_windows,
     eff.wifi_connect_timeout_s, eff.wifi_connect_retries, eff.ap_idle_reboot_s,
     g_cfg.roam_enable, eff.roam_check_s, (int)eff.roam_rssi_threshold, eff.roam_margin_db,
-    g_cfg.txq_cap,
+    g_cfg.txq_cap, g_cfg.wifi_band,
+#if CONFIG_SOC_WIFI_SUPPORT_5G
+    1,
+#else
+    0,
+#endif
+    g_cfg.thr_off, g_cfg.e2w_max_mbit, g_cfg.thr_temp_c,
     def.eth_retries, def.wifi_retries,
     def.static_rx, def.dyn_rx, def.dyn_tx, def.ba_win,
     def.wifi_connect_timeout_s, def.wifi_connect_retries, def.ap_idle_reboot_s,
@@ -1525,6 +1674,21 @@ static esp_err_t h_config_post(httpd_req_t *r) {
   }
   if (form_get(body, "ht40",   v, sizeof(v))) g_cfg.ht40   = (uint8_t)(atoi(v) ? 1 : 0);
   if (form_get(body, "no_11b", v, sizeof(v))) g_cfg.no_11b = (uint8_t)(atoi(v) ? 1 : 0);
+  if (form_get(body, "wifi_band", v, sizeof(v))) {
+    int t = atoi(v);
+    g_cfg.wifi_band = (uint8_t)((t < 0 || t > (int)WIFI_BAND_MAX) ? WIFI_BAND_PREFER_5G : t);
+  }
+  /* Throttle LAN -> Wi-Fi (see config.h); read by thermal_tick(), no
+   * reboot needed. */
+  if (form_get(body, "thr_off", v, sizeof(v))) g_cfg.thr_off = (uint8_t)(atoi(v) ? 1 : 0);
+  if (form_get(body, "e2w_max_mbit", v, sizeof(v))) {
+    int t = atoi(v);
+    g_cfg.e2w_max_mbit = (uint8_t)(t < 0 ? 0 : t > 200 ? 200 : t);
+  }
+  if (form_get(body, "thr_temp_c", v, sizeof(v))) {
+    int t = atoi(v);
+    g_cfg.thr_temp_c = (uint8_t)(t <= 0 ? 0 : t < 40 ? 40 : t > 110 ? 110 : t);
+  }
 
   /* Take effect at the next connect (bridge_wifi_start()), not immediately -
    * unlike tx_power/retries they do not affect an existing connection. Upper
@@ -1709,7 +1873,7 @@ static esp_err_t h_autotune_get(httpd_req_t *r) {
 static esp_err_t h_reboot(httpd_req_t *r) {
   httpd_resp_send(r, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
   delay(400);
-  esp_restart();
+  bridge_restart_requested();
   return ESP_OK;
 }
 
@@ -1889,7 +2053,7 @@ static esp_err_t h_update(httpd_req_t *r) {
   httpd_resp_set_type(r, "application/json");
   httpd_resp_send(r, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
   delay(600);
-  esp_restart();
+  bridge_restart_requested();
   return ESP_OK;
 }
 
@@ -1949,21 +2113,35 @@ static esp_err_t h_coredump_get(httpd_req_t *r) {
   char task_esc[40];
   json_escape(sum.exc_task, task_esc, sizeof(task_esc));
 
+  char bt[400] = "";
+  char extra[80] = "";
+#if CONFIG_IDF_TARGET_ARCH_XTENSA
   /* Backtrace as hex addresses - resolvable to file+line with the matching
    * firmware.elf via xtensa-esp32-elf-addr2line. */
-  char bt[400] = "";
   size_t o = 0;
   for (uint32_t i = 0; i < sum.exc_bt_info.depth && i < 16 && o + 13 < sizeof(bt); i++) {
     o += snprintf(bt + o, sizeof(bt) - o, "%s\"0x%08lx\"", i ? "," : "",
                   (unsigned long)sum.exc_bt_info.bt[i]);
   }
+  const bool corrupted = sum.exc_bt_info.corrupted;
+#else
+  /* RISC-V: ESP-IDF builds no backtrace on the device, only registers and a
+   * raw stack dump (the full backtrace comes from espcoredump.py on the host).
+   * The return address ra is the one call-site entry available without the
+   * ELF; mcause/mtval say what happened (e.g. mcause 5 = load access fault,
+   * mtval = the faulting address). The JSON shape stays the same. */
+  snprintf(bt, sizeof(bt), "\"0x%08lx\"", (unsigned long)sum.ex_info.ra);
+  snprintf(extra, sizeof(extra), ",\"mcause\":\"0x%08lx\",\"mtval\":\"0x%08lx\"",
+           (unsigned long)sum.ex_info.mcause, (unsigned long)sum.ex_info.mtval);
+  const bool corrupted = false;
+#endif
 
-  char buf[1200];
+  char buf[1280];
   snprintf(buf, sizeof(buf),
     "{\"present\":true,\"readable\":true,\"corrupted\":%s,"
-    "\"task\":\"%s\",\"pc\":\"0x%08lx\",\"reason\":\"%s\",\"bt\":[%s]}",
-    sum.exc_bt_info.corrupted ? "true" : "false",
-    task_esc, (unsigned long)sum.exc_pc, reason_esc, bt);
+    "\"task\":\"%s\",\"pc\":\"0x%08lx\",\"reason\":\"%s\",\"bt\":[%s]%s}",
+    corrupted ? "true" : "false",
+    task_esc, (unsigned long)sum.exc_pc, reason_esc, bt, extra);
 
   return httpd_resp_send(r, buf, HTTPD_RESP_USE_STRLEN);
 }
@@ -2021,11 +2199,11 @@ static esp_err_t h_crashes_get(httpd_req_t *r) {
     for (uint8_t k = 0; k < c->bt_n && k < 8; k++)
       b += snprintf(bt + b, sizeof(bt) - b, "%s\"%08lx\"", k ? "," : "", (unsigned long)c->bt[k]);
     o += snprintf(buf + o, cap - o,
-      "%s{\"e\":%lu,\"up\":%ld,\"rst\":%u,\"f\":%u,\"build\":\"%s\",\"task\":\"%s\","
+      "%s{\"e\":%lu,\"up\":%ld,\"rst\":%u,\"f\":%u,\"n\":%u,\"build\":\"%s\",\"task\":\"%s\","
       "\"pc\":\"%08lx\",\"reason\":\"%s\",\"bt\":[%s]}",
       i ? "," : "", (unsigned long)c->epoch,
       c->uptime_s == 0xFFFFFFFFu ? -1L : (long)c->uptime_s,
-      (unsigned)c->rst, (unsigned)c->flags, build, task,
+      (unsigned)c->rst, (unsigned)c->flags, (unsigned)c->repeat + 1u, build, task,
       (unsigned long)c->pc, reason, bt);
   }
   if (o < cap) o += snprintf(buf + o, cap - o, "]}");
@@ -2054,13 +2232,167 @@ static esp_err_t h_crashes_delete(httpd_req_t *r) {
  * Start
  * ========================================================================= */
 
+/* GET /api/log?since=N - console output from byte position N on, as plain
+ * text (see conlog.h). X-Log-Next carries the position for the next poll;
+ * X-Log-Reset: 1 means the requested position was no longer (or not yet)
+ * available - the board rebooted or the ring wrapped - and the reply starts
+ * at the oldest byte held. A reply carries at most LOG_REPLY_MAX bytes; the
+ * portal asks again right away when it got a full one. That keeps the ring
+ * lock short and the buffer on the httpd stack small. Protected like the
+ * other diagnostics: the log shows network details. */
+#define LOG_REPLY_MAX 2048
+static esp_err_t h_log(httpd_req_t *r) {
+  if (!admin_key_ok(r)) {
+    httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "wrong key");
+    return ESP_FAIL;
+  }
+  uint32_t since = 0;
+  bool prev = false;
+  char q[32], v[12];
+  if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK) {
+    if (httpd_query_key_value(q, "since", v, sizeof(v)) == ESP_OK)
+      since = (uint32_t)strtoul(v, NULL, 10);
+    if (httpd_query_key_value(q, "prev", v, sizeof(v)) == ESP_OK)
+      prev = atoi(v) != 0;
+  }
+
+  char buf[LOG_REPLY_MAX];
+  if (prev) {
+    /* The end of the previous boot's log from NVS (see conlog.h), with the
+     * reset reason that ended that boot in X-Log-Rst; empty if none. */
+    uint8_t rst = 0;
+    const size_t pn = conlog_get_prev(buf, sizeof(buf), &rst);
+    char rst_s[4];
+    snprintf(rst_s, sizeof(rst_s), "%u", (unsigned)rst);
+    httpd_resp_set_type(r, "text/plain; charset=utf-8");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(r, "X-Log-Rst", rst_s);
+    return httpd_resp_send(r, buf, pn);
+  }
+  uint32_t next = since;
+  bool reset = false;
+  const size_t n = conlog_read(since, buf, sizeof(buf), &next, &reset);
+
+  char next_s[12];
+  snprintf(next_s, sizeof(next_s), "%lu", (unsigned long)next);
+  httpd_resp_set_type(r, "text/plain; charset=utf-8");
+  httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+  httpd_resp_set_hdr(r, "X-Log-Next", next_s);
+  httpd_resp_set_hdr(r, "X-Log-Reset", reset ? "1" : "0");
+  return httpd_resp_send(r, buf, n);
+}
+
+/* GET /api/cpu - CPU load per task over the last and the busiest window
+ * (see cpustat.h); ?reset=1 forgets the busiest one first, so a new load
+ * test starts clean. Admin key, like the other diagnostics. */
+static esp_err_t h_cpu(httpd_req_t *r) {
+  if (!admin_key_ok(r)) {
+    httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "wrong key");
+    return ESP_FAIL;
+  }
+  char q[16], v[4];
+  if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK &&
+      httpd_query_key_value(q, "reset", v, sizeof(v)) == ESP_OK && atoi(v)) {
+    cpustat_reset_peak();
+  }
+  char buf[900];
+  const size_t n = cpustat_json(buf, sizeof(buf));
+  httpd_resp_set_type(r, "application/json");
+  httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+  return httpd_resp_send(r, buf, n);
+}
+
+/* Largest test transfer GET/POST /api/speed accepts, in MiB. */
+#define SPEED_MAX_MB 200
+
+/* GET /api/speed?mb=N - send N MiB (default 20) of zeros from the management
+ * stack. Together with POST it measures what the bridge's own Wi-Fi link
+ * carries at its location, without the Ethernet side involved: if this is
+ * no faster than traffic through the bridge, the radio link is the limit,
+ * not the Ethernet driver. Admin key; occupies the HTTP server while it
+ * runs. */
+static esp_err_t h_speed_get(httpd_req_t *r) {
+  if (!admin_key_ok(r)) {
+    httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "wrong key");
+    return ESP_FAIL;
+  }
+  uint32_t mb = 20;
+  char q[16], v[8];
+  if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK &&
+      httpd_query_key_value(q, "mb", v, sizeof(v)) == ESP_OK) {
+    mb = (uint32_t)strtoul(v, NULL, 10);
+  }
+  if (mb < 1) mb = 1;
+  if (mb > SPEED_MAX_MB) mb = SPEED_MAX_MB;
+
+  static const uint8_t zeros[4096] = {};
+  httpd_resp_set_type(r, "application/octet-stream");
+  httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+  const uint32_t chunks = mb * (1024 * 1024 / sizeof(zeros));
+  for (uint32_t i = 0; i < chunks; i++) {
+    if (httpd_resp_send_chunk(r, (const char *)zeros, sizeof(zeros)) != ESP_OK) return ESP_FAIL;
+  }
+  return httpd_resp_send_chunk(r, NULL, 0);
+}
+
+/* POST /api/speed - read and discard the request body, reply with its size
+ * and the time it took: the upload half of the Wi-Fi-only measurement (see
+ * h_speed_get()). Admin key. */
+static esp_err_t h_speed_post(httpd_req_t *r) {
+  if (!admin_key_ok(r)) {
+    httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "wrong key");
+    return ESP_FAIL;
+  }
+  if (r->content_len > (size_t)SPEED_MAX_MB * 1024 * 1024) {
+    httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "too large");
+    return ESP_FAIL;
+  }
+  static char sink[4096];
+  const int64_t t0 = esp_timer_get_time();
+  size_t left = r->content_len, got = 0;
+  while (left > 0) {
+    const int n = httpd_req_recv(r, sink, left < sizeof(sink) ? left : sizeof(sink));
+    if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;
+    if (n <= 0) return ESP_FAIL;
+    left -= (size_t)n;
+    got += (size_t)n;
+  }
+  const uint32_t ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+  char out[96];
+  snprintf(out, sizeof(out), "{\"bytes\":%lu,\"ms\":%lu,\"kbps\":%lu}",
+           (unsigned long)got, (unsigned long)ms,
+           (unsigned long)(ms ? (uint64_t)got * 8 / ms : 0));
+  httpd_resp_set_type(r, "application/json");
+  return httpd_resp_sendstr(r, out);
+}
+
+#ifdef BRIDGE_PANIC_TEST
+/* POST /api/panic_test - deliberately crash, to verify on real hardware that
+ * a panic writes a coredump and that RTC and .noinit RAM (crash heartbeat,
+ * previous-boot log) survive the reset. Only exists in builds made with
+ * -DBRIDGE_PANIC_TEST, never in the regular firmware, and additionally
+ * requires the admin key. */
+static esp_err_t h_panic_test(httpd_req_t *r) {
+  if (!admin_key_ok(r)) {
+    httpd_resp_send_err(r, HTTPD_401_UNAUTHORIZED, "wrong key");
+    return ESP_FAIL;
+  }
+  httpd_resp_sendstr(r, "{\"ok\":true}");
+  printf("[TEST] Deliberate panic requested via /api/panic_test\n");
+  fflush(stdout);
+  delay(200);   /* let the reply and the log line go out */
+  abort();
+  return ESP_OK;
+}
+#endif
+
 /* Start the HTTP server and register all routes (see web.h). */
 bool web_start(bool provisioning) {
   s_provisioning = provisioning;
 
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.stack_size       = 6144;
-  cfg.max_uri_handlers = 18;    /* currently 15 routes (uris[] below) - if this
+  cfg.max_uri_handlers = 24;    /* currently 21 routes (uris[] below) - if this
                                  * is too small, registration fails silently */
   cfg.recv_wait_timeout = 20;   /* the OTA upload needs patience */
   cfg.lru_purge_enable = true;
@@ -2102,6 +2434,13 @@ bool web_start(bool provisioning) {
 #endif
     { "/api/crashes", HTTP_GET,    h_crashes_get,     NULL },
     { "/api/crashes", HTTP_DELETE, h_crashes_delete,  NULL },
+    { "/api/log",     HTTP_GET,    h_log,             NULL },
+    { "/api/cpu",     HTTP_GET,    h_cpu,             NULL },
+    { "/api/speed",   HTTP_GET,    h_speed_get,       NULL },
+    { "/api/speed",   HTTP_POST,   h_speed_post,      NULL },
+#ifdef BRIDGE_PANIC_TEST
+    { "/api/panic_test", HTTP_POST, h_panic_test,     NULL },
+#endif
   };
   for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
     httpd_register_uri_handler(s_httpd, &uris[i]);
