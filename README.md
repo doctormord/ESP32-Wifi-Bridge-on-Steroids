@@ -256,6 +256,8 @@ All endpoints are served on the management IP (or `192.168.4.1` in provisioning 
 | GET / DELETE 🔑 | `/api/coredump` | Read / erase the stored core dump |
 | GET / DELETE 🔑 | `/api/crashes` | Read / clear the crash history |
 | GET 🔑 | `/api/log?since=N` | Console output from byte position `N` (max 2 KB per reply; `X-Log-Next` = position for the next poll, `X-Log-Reset: 1` after a reboot or ring wrap) |
+| GET 🔑 | `/api/cpu` | CPU share per task over the last and the busiest 5 s window, with the bridge throughput in each (`?reset=1` forgets the busiest). Needs `CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS` (on for the ESP32-C5 target), else `{"enabled":0}` |
+| GET / POST 🔑 | `/api/speed` | `GET ?mb=N` sends N MiB of zeros, `POST` discards the body and reports `bytes`/`ms`/`kbps`: a throughput test of the management stack. With the default 2880-byte lwIP TCP windows it tops out around 5 Mbit/s - it measures the bridge's own Wi-Fi only with larger windows |
 | GET 🔑 | `/api/log?prev=1` | End of the previous boot's console output; `X-Log-Rst` = the reset reason that ended it |
 
 ### `GET /api/status`
@@ -305,7 +307,7 @@ All endpoints are served on the management IP (or `192.168.4.1` in provisioning 
 | `all` | *Calibrate all*: 0 idle, 1–4 running stage (retries, TX power, queue cap, long-run check), 5 done, 6 stopped |
 | `lr`, `lr_k`, `lr_el`, `lr_tot`, `lr_r` | Long-run retry check: state (as `at`), retries in the running block, minutes elapsed / total, chosen retries |
 | `spi` | W5500 SPI clock in MHz (ESP32-C5 target), 0 = internal EMAC |
-| `w5` | W5500 driver drops since boot: `[TX ring full, SEND timeout, RX resync, RX no heap]` (all 0 with the internal EMAC) |
+| `w5` | W5500 driver counters since boot: drops `[TX ring full, SEND timeout, RX resync, RX no heap,` then RX rounds that found only an incomplete frame (not a drop)`]` (all 0 with the internal EMAC) |
 | `rst`, `rtc` | Reset reason of this boot (`esp_reset_reason_t`), and whether RTC memory survived it (1) |
 | `time` | UTC Unix time, 0 = not synced via SNTP yet |
 | `build` | Git revision of the running firmware (`-dirty` if built from uncommitted changes) |
@@ -433,7 +435,7 @@ Home Assistant creates one device with sensors for signal strength, Wi-Fi channe
 
 - **SPI clock:** 80 MHz is the W5500's theoretical maximum (33.3 MHz guaranteed). The firmware tries 80 → 53.3 → 40 → 20 MHz and keeps the first clock at which the chip identifies itself; with SCLK/MOSI routed through the GPIO matrix (these are not the SPI2 IO_MUX pins) the reference wiring ends up at **53 MHz** (`spi` in `/api/status`). That check only catches gross failures — marginal wiring shows up later as TCP retransmissions.
 - **INT is on IO15, not IO12** (UART0 RX) as a precaution: the W5500 keeps running through a reset and holds INT low, and the ROM's download mode also listens on UART0 RX. This is *not* why the automatic reset into download mode over USB fails (see below) — that happens with INT on IO15 as well.
-- **Own W5500 MAC driver** (`src/w5500_mac.c`) instead of ESP-IDF's: transmit only queues the frame (16-slot ring), the next frame is written to the chip while the previous one is still on the wire, received frames are fetched several per SPI transfer, and large transfers run interrupt-driven so the single core stays free for Wi-Fi. About 4 SPI transactions per frame instead of ~10. IDF's driver is still used for the W5500's PHY.
+- **Own W5500 MAC driver** (`src/w5500_mac.c`) instead of ESP-IDF's: transmit only queues the frame (packed 32 KB ring, large enough for a whole Wi-Fi A-MPDU burst), the next frame is written to the chip while the previous one is still on the wire, received frames are fetched several per SPI transfer, and large transfers run interrupt-driven so the single core stays free for Wi-Fi. About 4 SPI transactions per frame instead of ~10. IDF's driver is still used for the W5500's PHY.
 - **Factory reset is GPIO4**, not the BOOT button (IO28): held at reset, BOOT enters download mode.
 - **Console and flashing over the USB-C port** (USB-Serial/JTAG, `/dev/cu.usbmodem*`). On macOS the port only delivers output while the host asserts DTR. esptool's automatic reset into download mode does not work on this board: it fails with "No serial data received" and leaves the board hung until it is power-cycled. Flash the first time with BOOT held while plugging in USB, then use OTA.
 
@@ -531,7 +533,9 @@ Measured LAN → Wi-Fi with four parallel HTTP downloads from a bridged IP camer
 | ESP-IDF's | 11.6 Mbit/s | 9.0 Mbit/s |
 | own (`w5500_mac.c`) | **14.4–14.8 Mbit/s** | 9.8 Mbit/s |
 
-The single stream is limited by the camera's web server. Wi-Fi → LAN has not been measured with the new driver yet; with ESP-IDF's driver a laptop behind the bridge reached about 17/17 Mbit/s in a speed test. Expect less than the WT32-ETH01's internal EMAC: every frame crosses the SPI bus, and Wi-Fi, the W5500 task and lwIP share one CPU core.
+The single stream is limited by the camera's web server. Later, with the RX stall fix and the packed TX ring, 8 streams sustained 18.9 Mbit/s over 60 s without a single drop. A speed test from a laptop behind the bridge: ~17.5 down / ~13 up Mbit/s, against 48/31 for the laptop's own Wi-Fi at the same spot.
+
+What limits it is the radio link, not the driver or the CPU: at that throughput ~60 % of the CPU is idle and the Wi-Fi TX queue stays empty, while the bridge's own Wi-Fi, measured through the management stack with enlarged TCP windows, carried only ~25 Mbit/s. The ESP32-C5 module has one RF chain and a ceramic chip antenna and saw the AP 10 dB weaker than the laptop 50 cm away. On 2.4 GHz the same bridge got a 7 dB stronger signal (about the free-space difference between the bands) but less throughput (14–15 Mbit/s, busier band) — keep it on 5 GHz. Expect less than the WT32-ETH01's internal EMAC: every frame crosses the SPI bus, and Wi-Fi, the W5500 task and lwIP share one CPU core.
 
 ### Retry counts matter more than anything else
 
