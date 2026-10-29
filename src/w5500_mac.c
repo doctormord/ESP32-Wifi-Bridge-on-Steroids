@@ -319,7 +319,13 @@ static void tx_service(w5500m_t *m) {
     }
     __sync_synchronize();          /* entry consumed before its space is released */
     m->tx_tail = m->tx_tail + 4 + ((len + 3u) & ~3u);
-    xSemaphoreGive(m->tx_space);   /* wake a producer waiting for room */
+    /* Wake a producer waiting for room only once half the ring is free (or
+     * it is empty): it has the higher priority, so waking it per freed
+     * frame would switch tasks for every single frame. */
+    if (m->tx_tail == m->tx_head ||
+        TX_RING_SIZE - (m->tx_head - m->tx_tail) >= TX_RING_SIZE / 2) {
+      xSemaphoreGive(m->tx_space);
+    }
   }
 }
 
