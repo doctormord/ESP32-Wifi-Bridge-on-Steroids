@@ -86,8 +86,9 @@ uint8_t bridge_get_eth_spi_mhz(void);
  * rounds that found only an incomplete frame, [5] frames received, [6] RX
  * rounds that delivered frames, [7] frames sent, [8] driver-task rounds,
  * [9] ms in SPI transactions, [10] ms handing received frames to the
- * Ethernet -> Wi-Fi path. */
-#define BRIDGE_ETH_DRV_STATS 11
+ * Ethernet -> Wi-Fi path, [11] times a send waited for room in the full TX
+ * ring. */
+#define BRIDGE_ETH_DRV_STATS 12
 void bridge_get_eth_drv_stats(uint32_t out[BRIDGE_ETH_DRV_STATS]);
 
 /* Start Ethernet and wait for the first frame from the client to learn its

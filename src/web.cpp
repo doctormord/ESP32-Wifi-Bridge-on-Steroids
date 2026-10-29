@@ -1257,7 +1257,7 @@ static esp_err_t h_status(httpd_req_t *r) {
     "\"pt\":%d,\"pt_s\":%u,\"pt_k\":%d,\"pt_r\":%d,"
     "\"drop_cap\":%lu,\"txq_cap\":%u,\"qc\":%d,\"qc_s\":%u,\"qc_k\":%u,\"qc_r\":%d,\"all\":%d,"
     "\"lr\":%d,\"lr_k\":%u,\"lr_el\":%lu,\"lr_tot\":%lu,\"lr_r\":%u,"
-    "\"spi\":%u,\"w5\":[%lu,%lu,%lu,%lu,%lu],\"w5x\":[%lu,%lu,%lu,%lu,%lu,%lu],\"rst\":%u,\"rtc\":%d,\"time\":%lu,\"build\":\"" GIT_REV "\"}",
+    "\"spi\":%u,\"w5\":[%lu,%lu,%lu,%lu,%lu],\"w5x\":[%lu,%lu,%lu,%lu,%lu,%lu,%lu],\"rst\":%u,\"rtc\":%d,\"time\":%lu,\"build\":\"" GIT_REV "\"}",
     s_provisioning ? 1 : 0, st.wifi_up ? 1 : 0, st.eth_link ? 1 : 0,
     (int)st.rssi, (unsigned)st.channel,
     (unsigned long)st.kbps_eth2wifi, (unsigned long)st.kbps_wifi2eth,
@@ -1321,9 +1321,10 @@ static esp_err_t h_status(httpd_req_t *r) {
     (unsigned long)ethd[0], (unsigned long)ethd[1], (unsigned long)ethd[2], (unsigned long)ethd[3],
     (unsigned long)ethd[4],
     /* ... and its activity: RX frames, RX batches, TX frames, task rounds,
-     * ms in SPI, ms delivering to Wi-Fi. */
+     * ms in SPI, ms delivering to Wi-Fi, waits for TX ring room. */
     (unsigned long)ethd[5], (unsigned long)ethd[6], (unsigned long)ethd[7],
     (unsigned long)ethd[8], (unsigned long)ethd[9], (unsigned long)ethd[10],
+    (unsigned long)ethd[11],
     /* Why this boot happened (esp_reset_reason_t) and whether RTC memory
      * survived it - see crashlog.h. */
     (unsigned)crashlog_reset_reason(), crashlog_rtc_retained() ? 1 : 0,

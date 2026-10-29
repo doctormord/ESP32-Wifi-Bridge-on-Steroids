@@ -48,15 +48,25 @@
 
 static const char *TAG = "w5500m";
 
-/* TX ring: bytes transmit() can queue ahead of the chip. The Wi-Fi task
- * hands over a whole A-MPDU (up to the BA window, 32 frames) before the
- * lower-priority driver task gets to run, so the ring must absorb a burst
- * rather than a frame or two. Frames are packed (4-byte length header, data
- * padded to 4 bytes), so 32 KB hold ~21 full-size frames or several hundred
- * TCP ACKs - fixed 1.5 KB slots would waste most of their space on ACKs.
- * Must be a power of two (free-running head/tail byte offsets). */
-#define TX_RING_SIZE       32768
+/* TX ring: bytes transmit() can queue ahead of the chip. Frames are packed
+ * (4-byte length header, data padded to 4 bytes), so 16 KB hold ~10
+ * full-size frames or a few hundred TCP ACKs - fixed 1.5 KB slots would
+ * waste most of their space on ACKs. A Wi-Fi A-MPDU burst can be larger;
+ * that is handled by making transmit() wait (TX_FULL_WAIT_MS), not by ring
+ * size: on the C5 free heap is the scarcer resource under load, and the
+ * Wi-Fi driver fails allocations when it runs low. Must be a power of two
+ * (free-running head/tail byte offsets). */
+#define TX_RING_SIZE       16384
 #define TX_RING_SKIP       0xFFFFFFFFu   /* header: rest of the ring unused, wrap */
+
+/* How long transmit() waits for room when the ring is full before it drops
+ * the frame. A download from Wi-Fi arrives in A-MPDU bursts larger than the
+ * ring (32-64 full frames); dropping the overflow makes TCP back off hard,
+ * while making the Wi-Fi task wait lets the lower-priority driver task run
+ * and drain the ring - the surplus frames stay in the Wi-Fi driver's own RX
+ * buffers meanwhile, and the sender is slowed by flow control instead of
+ * loss. Only the wait for a hung chip is bounded by this. */
+#define TX_FULL_WAIT_MS    20
 
 /* Bytes fetched from RX memory per SPI read: room for four full frames plus
  * the 2-byte headers. Larger reads save transactions, but delay the first
@@ -114,6 +124,7 @@ typedef struct {
   SemaphoreHandle_t   spi_lock;    /* one SPI transaction at a time            */
   SemaphoreHandle_t   op_lock;     /* data path vs. start/stop                 */
   SemaphoreHandle_t   tx_lock;     /* producers of the TX ring                 */
+  SemaphoreHandle_t   tx_space;    /* given when the driver task frees ring room */
   TaskHandle_t        task;
   int                 int_gpio;
   uint32_t            sw_reset_timeout_ms;
@@ -281,12 +292,14 @@ static void tx_service(w5500m_t *m) {
     }
     __sync_synchronize();          /* entry consumed before its space is released */
     m->tx_tail = m->tx_tail + 4 + ((len + 3u) & ~3u);
+    xSemaphoreGive(m->tx_space);   /* wake a producer waiting for room */
   }
 }
 
 /* esp_eth_mac_t::transmit - queue a frame for the driver task. Never touches
- * the SPI bus, so the caller (the Wi-Fi RX path in the bridge) is held up
- * only for one memcpy. Returns ESP_ERR_NO_MEM if the ring has no room. */
+ * the SPI bus, so the caller (the Wi-Fi RX path in the bridge) is normally
+ * held up only for one memcpy. If the ring is full it waits for room, up to
+ * TX_FULL_WAIT_MS (see there), and returns ESP_ERR_NO_MEM only after that. */
 static esp_err_t w5500m_transmit(esp_eth_mac_t *mac, uint8_t *buf, uint32_t length) {
   w5500m_t *m = __containerof(mac, w5500m_t, parent);
   ESP_RETURN_ON_FALSE(length <= ETH_MAX_PACKET_SIZE, ESP_ERR_INVALID_ARG, TAG,
@@ -294,15 +307,26 @@ static esp_err_t w5500m_transmit(esp_eth_mac_t *mac, uint8_t *buf, uint32_t leng
   if (!m->running) return ESP_ERR_INVALID_STATE;
 
   const uint32_t need = 4 + ((length + 3u) & ~3u);
-  xSemaphoreTake(m->tx_lock, portMAX_DELAY);
-  uint32_t head = m->tx_head;
-  const uint32_t pos = head % TX_RING_SIZE;
-  const uint32_t tail_room = TX_RING_SIZE - pos;          /* bytes before the end */
-  const uint32_t skip = tail_room < need ? tail_room : 0; /* wrap if it does not fit */
-  if (TX_RING_SIZE - (head - m->tx_tail) < skip + need) {
-    m->stats.tx_ring_full++;
+  const TickType_t t0 = xTaskGetTickCount();
+  const TickType_t wait = pdMS_TO_TICKS(TX_FULL_WAIT_MS) ? pdMS_TO_TICKS(TX_FULL_WAIT_MS) : 1;
+  uint32_t head, pos, skip;
+  for (;;) {
+    xSemaphoreTake(m->tx_lock, portMAX_DELAY);
+    head = m->tx_head;
+    pos = head % TX_RING_SIZE;
+    const uint32_t tail_room = TX_RING_SIZE - pos;        /* bytes before the end */
+    skip = tail_room < need ? tail_room : 0;              /* wrap if it does not fit */
+    if (TX_RING_SIZE - (head - m->tx_tail) >= skip + need) break;
     xSemaphoreGive(m->tx_lock);
-    return ESP_ERR_NO_MEM;
+
+    /* Full: let the driver task drain, then look again. */
+    const TickType_t spent = xTaskGetTickCount() - t0;
+    if (!m->running || spent >= wait ||
+        xSemaphoreTake(m->tx_space, wait - spent) != pdTRUE) {
+      m->stats.tx_ring_full++;
+      return ESP_ERR_NO_MEM;
+    }
+    m->stats.tx_waits++;
   }
   if (skip) {
     *(uint32_t *)(m->tx_ring + pos) = TX_RING_SKIP;
@@ -726,6 +750,7 @@ static esp_err_t w5500m_del(esp_eth_mac_t *mac) {
   if (m->spi_lock) vSemaphoreDelete(m->spi_lock);
   if (m->op_lock) vSemaphoreDelete(m->op_lock);
   if (m->tx_lock) vSemaphoreDelete(m->tx_lock);
+  if (m->tx_space) vSemaphoreDelete(m->tx_space);
   heap_caps_free(m->tx_ring);
   heap_caps_free(m->rx_buf);
   free(m);
@@ -777,7 +802,8 @@ esp_eth_mac_t *w5500_mac_new(const eth_w5500_config_t *w5500_config,
   m->spi_lock = xSemaphoreCreateMutex();
   m->op_lock  = xSemaphoreCreateMutex();
   m->tx_lock  = xSemaphoreCreateMutex();
-  if (!m->tx_ring || !m->rx_buf || !m->spi_lock || !m->op_lock || !m->tx_lock) {
+  m->tx_space = xSemaphoreCreateBinary();
+  if (!m->tx_ring || !m->rx_buf || !m->spi_lock || !m->op_lock || !m->tx_lock || !m->tx_space) {
     ESP_LOGE(TAG, "no mem for buffers");
     goto err;
   }

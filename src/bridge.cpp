@@ -885,6 +885,7 @@ void bridge_get_eth_drv_stats(uint32_t out[BRIDGE_ETH_DRV_STATS]) {
   out[8] = st.wakes;
   out[9] = st.spi_us / 1000;
   out[10] = st.deliver_us / 1000;
+  out[11] = st.tx_waits;
 #endif
 }
 

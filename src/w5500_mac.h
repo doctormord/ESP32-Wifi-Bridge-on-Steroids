@@ -60,6 +60,8 @@ typedef struct {
   uint32_t spi_us;         /* time spent in SPI transactions              */
   uint32_t deliver_us;     /* time spent handing frames to esp_eth, i.e.
                             * in the bridge's Ethernet -> Wi-Fi callback  */
+  uint32_t tx_waits;       /* transmit() found the ring full and waited for
+                            * room (not a drop unless tx_ring_full counts) */
 } w5500_mac_stats_t;
 
 /* Copy the counters of 'mac' (created by w5500_mac_new()) into 'out'. */
