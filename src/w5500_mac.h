@@ -62,6 +62,8 @@ typedef struct {
                             * in the bridge's Ethernet -> Wi-Fi callback  */
   uint32_t tx_waits;       /* transmit() found the ring full and waited for
                             * room (not a drop unless tx_ring_full counts) */
+  uint32_t tx_done_skipped; /* SEND_OK taken as done from the wire time,
+                             * without reading the chip                 */
 } w5500_mac_stats_t;
 
 /* Move queued TX frames to the chip now. Only has an effect when called

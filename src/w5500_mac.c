@@ -141,6 +141,10 @@ typedef struct {
   uint16_t            tx_wr;       /* Sn_TX_WR as last committed               */
   bool                tx_pending;  /* a SEND is in flight, SEND_OK not yet seen */
   uint32_t            tx_tmo_us;
+  int64_t             tx_sent_us;      /* when the frame in flight got its SEND */
+  uint32_t            tx_sent_len;     /* its length                            */
+  uint32_t            tx_ns_per_byte;  /* wire time per byte at the link speed  */
+  bool                full_duplex;     /* link duplex, from the PHY driver      */
   int64_t             last_cmd_us;
 
   /* RX: rx_buf[0..rx_have) mirrors RX memory starting at rx_rd - a frame
@@ -250,9 +254,26 @@ static esp_err_t w_cmd(w5500m_t *m, uint8_t cmd) {
 
 /* --- Transmit ---------------------------------------------------------------- */
 
-/* Wait for SEND_OK of the frame in flight. On timeout the frame is written
- * off (the link is probably gone) so the next one is not blocked forever. */
+/* Margin on top of the wire time of the frame in flight after which its
+ * SEND is taken as complete without reading Sn_IR (see
+ * tx_wait_send_done()): covers the chip fetching the frame from TX memory
+ * and the inter-frame gap. */
+#define TX_DONE_MARGIN_US  15
+
+/* Wait for SEND_OK of the frame in flight. On a full-duplex link a frame
+ * leaves at a fixed rate, so once its wire time (plus TX_DONE_MARGIN_US) has
+ * passed since the SEND it is out, and the Sn_IR read - one SPI transaction
+ * per frame - is skipped; the SEND_OK bit is still cleared together with the
+ * next SEND. Half duplex (collisions, back-off) always reads. On timeout the
+ * frame is written off (the link is probably gone) so the next one is not
+ * blocked forever. */
 static bool tx_wait_send_done(w5500m_t *m) {
+  if (m->full_duplex &&
+      esp_timer_get_time() - m->tx_sent_us >
+          (int64_t)((m->tx_sent_len + 24) * m->tx_ns_per_byte / 1000) + TX_DONE_MARGIN_US) {
+    m->stats.tx_done_skipped++;
+    return true;
+  }
   const int64_t t0 = esp_timer_get_time();
   uint8_t ir = 0;
   do {
@@ -288,7 +309,13 @@ static void tx_service(w5500m_t *m) {
       static const uint8_t send[2] = { W5500_SCR_SEND, W5500_SIR_SEND };
       ok = w_write16(m, W5500_REG_SOCK_TX_WR(0), wr) == ESP_OK &&
            w_cmd_fast(m, send, sizeof(send)) == ESP_OK;
-      if (ok) { m->tx_wr = wr; m->tx_pending = true; m->stats.tx_frames++; }
+      if (ok) {
+        m->tx_wr = wr;
+        m->tx_pending = true;
+        m->tx_sent_us = esp_timer_get_time();
+        m->tx_sent_len = len;
+        m->stats.tx_frames++;
+      }
     }
     __sync_synchronize();          /* entry consumed before its space is released */
     m->tx_tail = m->tx_tail + 4 + ((len + 3u) & ~3u);
@@ -676,15 +703,19 @@ static esp_err_t w5500m_set_link(esp_eth_mac_t *mac, eth_link_t link) {
 static esp_err_t w5500m_set_speed(esp_eth_mac_t *mac, eth_speed_t speed) {
   w5500m_t *m = __containerof(mac, w5500m_t, parent);
   switch (speed) {
-  case ETH_SPEED_10M:  m->tx_tmo_us = TX_TMO_10M_US;  return ESP_OK;
-  case ETH_SPEED_100M: m->tx_tmo_us = TX_TMO_100M_US; return ESP_OK;
+  case ETH_SPEED_10M:  m->tx_tmo_us = TX_TMO_10M_US;  m->tx_ns_per_byte = 800; return ESP_OK;
+  case ETH_SPEED_100M: m->tx_tmo_us = TX_TMO_100M_US; m->tx_ns_per_byte = 80;  return ESP_OK;
   default:             return ESP_ERR_INVALID_ARG;
   }
 }
 
-/* Duplex is handled by the PHY alone; accept both. */
+/* Duplex is handled by the PHY; it is only remembered for the SEND_OK
+ * shortcut in tx_wait_send_done(). */
 static esp_err_t w5500m_set_duplex(esp_eth_mac_t *mac, eth_duplex_t duplex) {
-  return (duplex == ETH_DUPLEX_HALF || duplex == ETH_DUPLEX_FULL) ? ESP_OK : ESP_ERR_INVALID_ARG;
+  w5500m_t *m = __containerof(mac, w5500m_t, parent);
+  if (duplex != ETH_DUPLEX_HALF && duplex != ETH_DUPLEX_FULL) return ESP_ERR_INVALID_ARG;
+  m->full_duplex = duplex == ETH_DUPLEX_FULL;
+  return ESP_OK;
 }
 
 /* The W5500 supports neither flow control nor PAUSE frames. */
@@ -784,6 +815,7 @@ esp_eth_mac_t *w5500_mac_new(const eth_w5500_config_t *w5500_config,
   m->sw_reset_timeout_ms = mac_config->sw_reset_timeout_ms;
   m->int_gpio  = w5500_config->int_gpio_num;
   m->tx_tmo_us = TX_TMO_100M_US;
+  m->tx_ns_per_byte = 800;   /* conservative until the PHY reports the speed */
 
   m->parent.set_mediator           = w5500m_set_mediator;
   m->parent.init                   = w5500m_init;
