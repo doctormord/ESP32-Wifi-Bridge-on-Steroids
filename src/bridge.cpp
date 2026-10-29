@@ -3077,6 +3077,23 @@ bool bridge_consume_planned_restart(void) {
   return planned;
 }
 
+/* Marker for bridge_restart_requested(), one-shot like s_wd_restart_magic. */
+#define REQ_RESTART_MAGIC 0x52515354u  /* "RQST" */
+RTC_NOINIT_ATTR static uint32_t s_req_restart_magic;
+
+/* See bridge.h. */
+void bridge_restart_requested(void) {
+  s_req_restart_magic = REQ_RESTART_MAGIC;
+  esp_restart();
+}
+
+/* See bridge.h. */
+bool bridge_consume_requested_restart(void) {
+  const bool requested = (s_req_restart_magic == REQ_RESTART_MAGIC);
+  s_req_restart_magic = 0;
+  return requested;
+}
+
 static uint32_t s_wd_t0 = 0, s_wd_pkt0 = 0, s_wd_drop0 = 0, s_wd_disc0 = 0;
 static uint8_t  s_wd_bad = 0;
 static uint8_t  s_wd_probe = 0;   /* 0=not needed/off, 1=ok, 2=failed -

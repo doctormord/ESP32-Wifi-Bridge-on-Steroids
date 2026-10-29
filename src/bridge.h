@@ -124,6 +124,19 @@ void bridge_get_stats(BridgeStats *out);
  * Wi-Fi outage would trip the boot-loop protection. */
 bool bridge_consume_planned_restart(void);
 
+/* Reboot on request - /api/reboot, or after an OTA update was written. The
+ * next boot does not count as a failed boot (see main.cpp's boot-loop
+ * protection): it only counts boots that end on their own before running
+ * stably, and a reboot someone asked for is not such an end. Several
+ * requested reboots within a minute would otherwise drop the bridge into the
+ * provisioning portal. Unlike bridge_mark_planned_restart() this is not a
+ * watchdog restart and is not reported as one. Does not return. */
+void bridge_restart_requested(void);
+
+/* One-shot like bridge_consume_planned_restart(): true if the CURRENT boot
+ * was caused by bridge_restart_requested(). */
+bool bridge_consume_requested_restart(void);
+
 /* Restart the Ethernet driver (stop/start) WITHOUT rebooting the chip -
  * produces a real short link down/up for the attached client while Wi-Fi
  * stays completely untouched. Can be triggered manually from the portal

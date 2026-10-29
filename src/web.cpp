@@ -1871,7 +1871,7 @@ static esp_err_t h_autotune_get(httpd_req_t *r) {
 static esp_err_t h_reboot(httpd_req_t *r) {
   httpd_resp_send(r, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
   delay(400);
-  esp_restart();
+  bridge_restart_requested();
   return ESP_OK;
 }
 
@@ -2051,7 +2051,7 @@ static esp_err_t h_update(httpd_req_t *r) {
   httpd_resp_set_type(r, "application/json");
   httpd_resp_send(r, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
   delay(600);
-  esp_restart();
+  bridge_restart_requested();
   return ESP_OK;
 }
 

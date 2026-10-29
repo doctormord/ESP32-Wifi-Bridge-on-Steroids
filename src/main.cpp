@@ -215,6 +215,8 @@ static void bridge_setup(void) {
    * otherwise the one-shot magic word would be cleared without being
    * consumed. */
   const bool planned_restart = bridge_consume_planned_restart();
+  /* The same for a reboot someone asked for (/api/reboot, OTA). */
+  const bool requested_restart = bridge_consume_requested_restart();
 
   /* Log an unexpected reset of the previous boot (timestamp taken from the
    * RTC heartbeat) - in every mode, even if we go straight to the portal. */
@@ -223,7 +225,7 @@ static void bridge_setup(void) {
   if (s_boot_magic != BOOT_MAGIC) {
     s_boot_magic = BOOT_MAGIC;
     s_boot_failures = 0;
-  } else if (planned_restart) {
+  } else if (planned_restart || requested_restart) {
     /* s_boot_failures stays unchanged. */
   } else {
     s_boot_failures++;
