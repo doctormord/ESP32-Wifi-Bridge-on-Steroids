@@ -7,7 +7,7 @@
  * and waits for every SEND to complete inside transmit(), which is what the
  * Wi-Fi RX path calls; this one is built for throughput instead:
  *
- *   - transmit() only copies the frame into a ring of slots and returns. The
+ *   - transmit() only copies the frame into a byte ring and returns. The
  *     driver task moves the frames to the chip, writing the next frame into
  *     the W5500's TX memory while the previous one is still on the wire.
  *   - Reception reads as many queued frames as fit into one SPI transfer.
@@ -40,7 +40,7 @@ esp_eth_mac_t *w5500_mac_new(const eth_w5500_config_t *w5500_config,
 /* Counters for frames the driver itself had to give up on, for the status
  * API. All counts since boot. */
 typedef struct {
-  uint32_t tx_ring_full;   /* transmit() found all slots busy             */
+  uint32_t tx_ring_full;   /* transmit() found no room in the TX ring     */
   uint32_t tx_timeout;     /* a SEND did not complete in time             */
   uint32_t rx_bad_len;     /* corrupt frame header, RX buffer resynced    */
   uint32_t rx_no_mem;      /* no heap for a received frame                */

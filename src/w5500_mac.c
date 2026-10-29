@@ -48,12 +48,15 @@
 
 static const char *TAG = "w5500m";
 
-/* TX ring: number of frames transmit() can queue ahead of the chip. A Wi-Fi
- * A-MPDU delivers frames in bursts; slots absorb a burst instead of dropping
- * it while the SPI catches up. Must be a power of two (free-running
- * head/tail indices). 16 x 1.5 KB = 24 KB of internal RAM. */
-#define TX_SLOTS           16
-#define TX_SLOT_SIZE       1536    /* >= ETH_MAX_PACKET_SIZE, multiple of 4 */
+/* TX ring: bytes transmit() can queue ahead of the chip. The Wi-Fi task
+ * hands over a whole A-MPDU (up to the BA window, 32 frames) before the
+ * lower-priority driver task gets to run, so the ring must absorb a burst
+ * rather than a frame or two. Frames are packed (4-byte length header, data
+ * padded to 4 bytes), so 32 KB hold ~21 full-size frames or several hundred
+ * TCP ACKs - fixed 1.5 KB slots would waste most of their space on ACKs.
+ * Must be a power of two (free-running head/tail byte offsets). */
+#define TX_RING_SIZE       32768
+#define TX_RING_SKIP       0xFFFFFFFFu   /* header: rest of the ring unused, wrap */
 
 /* Bytes fetched from RX memory per SPI read: room for four full frames plus
  * the 2-byte headers. Larger reads save transactions, but delay the first
@@ -105,11 +108,6 @@ static const char *TAG = "w5500m";
 #define RX_STALL_MAX       200
 
 typedef struct {
-  uint8_t  data[TX_SLOT_SIZE];
-  uint32_t len;
-} tx_slot_t;
-
-typedef struct {
   esp_eth_mac_t       parent;
   esp_eth_mediator_t *eth;
   spi_device_handle_t spi;
@@ -122,8 +120,11 @@ typedef struct {
   uint8_t             addr[ETH_ADDR_LEN];
   volatile bool       running;     /* socket 0 open, data path live            */
 
-  /* TX ring: producers fill slots[head], the driver task drains slots[tail]. */
-  tx_slot_t          *slots;
+  /* TX ring: producers append at tx_head, the driver task consumes at
+   * tx_tail (free-running byte offsets, see TX_RING_SIZE). An entry never
+   * wraps: one that does not fit before the end is preceded by a
+   * TX_RING_SKIP header and starts at offset 0. */
+  uint8_t            *tx_ring;
   volatile uint32_t   tx_head;
   volatile uint32_t   tx_tail;
   uint16_t            tx_wr;       /* Sn_TX_WR as last committed               */
@@ -249,10 +250,17 @@ static bool tx_wait_send_done(w5500m_t *m) {
  * fails anywhere is dropped - there is no retransmission at this layer. */
 static void tx_service(w5500m_t *m) {
   for (int n = 0; n < TX_BURST && m->tx_tail != m->tx_head; n++) {
-    tx_slot_t *s = &m->slots[m->tx_tail % TX_SLOTS];
-    const uint16_t len = (uint16_t)s->len;
+    const uint32_t pos = m->tx_tail % TX_RING_SIZE;
+    const uint32_t hdr = *(const uint32_t *)(m->tx_ring + pos);
+    if (hdr == TX_RING_SKIP) {         /* wrap marker: next entry is at 0 */
+      m->tx_tail = m->tx_tail + (TX_RING_SIZE - pos);
+      n--;
+      continue;
+    }
+    const uint16_t len = (uint16_t)hdr;
+    const uint8_t *data = m->tx_ring + pos + 4;
 
-    bool ok = w_write(m, W5500_MEM_SOCK_TX(0, (uint32_t)m->tx_wr), s->data, len) == ESP_OK;
+    bool ok = w_write(m, W5500_MEM_SOCK_TX(0, (uint32_t)m->tx_wr), data, len) == ESP_OK;
     if (ok && m->tx_pending) ok = tx_wait_send_done(m);
     if (ok) {
       const uint16_t wr = (uint16_t)(m->tx_wr + len);
@@ -261,31 +269,40 @@ static void tx_service(w5500m_t *m) {
            w_cmd_fast(m, send, sizeof(send)) == ESP_OK;
       if (ok) { m->tx_wr = wr; m->tx_pending = true; }
     }
-    __sync_synchronize();          /* slot contents consumed before release */
-    m->tx_tail = m->tx_tail + 1;
+    __sync_synchronize();          /* entry consumed before its space is released */
+    m->tx_tail = m->tx_tail + 4 + ((len + 3u) & ~3u);
   }
 }
 
 /* esp_eth_mac_t::transmit - queue a frame for the driver task. Never touches
  * the SPI bus, so the caller (the Wi-Fi RX path in the bridge) is held up
- * only for one memcpy. Returns ESP_ERR_NO_MEM if all slots are taken. */
+ * only for one memcpy. Returns ESP_ERR_NO_MEM if the ring has no room. */
 static esp_err_t w5500m_transmit(esp_eth_mac_t *mac, uint8_t *buf, uint32_t length) {
   w5500m_t *m = __containerof(mac, w5500m_t, parent);
   ESP_RETURN_ON_FALSE(length <= ETH_MAX_PACKET_SIZE, ESP_ERR_INVALID_ARG, TAG,
                       "frame too big (%" PRIu32 ")", length);
   if (!m->running) return ESP_ERR_INVALID_STATE;
 
+  const uint32_t need = 4 + ((length + 3u) & ~3u);
   xSemaphoreTake(m->tx_lock, portMAX_DELAY);
-  if (m->tx_head - m->tx_tail >= TX_SLOTS) {
+  uint32_t head = m->tx_head;
+  const uint32_t pos = head % TX_RING_SIZE;
+  const uint32_t tail_room = TX_RING_SIZE - pos;          /* bytes before the end */
+  const uint32_t skip = tail_room < need ? tail_room : 0; /* wrap if it does not fit */
+  if (TX_RING_SIZE - (head - m->tx_tail) < skip + need) {
     m->stats.tx_ring_full++;
     xSemaphoreGive(m->tx_lock);
     return ESP_ERR_NO_MEM;
   }
-  tx_slot_t *s = &m->slots[m->tx_head % TX_SLOTS];
-  memcpy(s->data, buf, length);
-  s->len = length;
-  __sync_synchronize();            /* slot contents visible before publishing */
-  m->tx_head = m->tx_head + 1;
+  if (skip) {
+    *(uint32_t *)(m->tx_ring + pos) = TX_RING_SKIP;
+    head += skip;
+  }
+  uint8_t *e = m->tx_ring + head % TX_RING_SIZE;
+  *(uint32_t *)e = length;
+  memcpy(e + 4, buf, length);
+  __sync_synchronize();            /* entry visible before publishing it */
+  m->tx_head = head + need;
   xSemaphoreGive(m->tx_lock);
 
   xTaskNotifyGive(m->task);
@@ -694,7 +711,7 @@ static esp_err_t w5500m_del(esp_eth_mac_t *mac) {
   if (m->spi_lock) vSemaphoreDelete(m->spi_lock);
   if (m->op_lock) vSemaphoreDelete(m->op_lock);
   if (m->tx_lock) vSemaphoreDelete(m->tx_lock);
-  heap_caps_free(m->slots);
+  heap_caps_free(m->tx_ring);
   heap_caps_free(m->rx_buf);
   free(m);
   return ESP_OK;
@@ -740,12 +757,12 @@ esp_eth_mac_t *w5500_mac_new(const eth_w5500_config_t *w5500_config,
   m->parent.transmit               = w5500m_transmit;
   m->parent.receive                = w5500m_receive;
 
-  m->slots    = heap_caps_malloc(TX_SLOTS * sizeof(tx_slot_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+  m->tx_ring  = heap_caps_aligned_alloc(4, TX_RING_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
   m->rx_buf   = heap_caps_aligned_alloc(4, RX_CHUNK, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
   m->spi_lock = xSemaphoreCreateMutex();
   m->op_lock  = xSemaphoreCreateMutex();
   m->tx_lock  = xSemaphoreCreateMutex();
-  if (!m->slots || !m->rx_buf || !m->spi_lock || !m->op_lock || !m->tx_lock) {
+  if (!m->tx_ring || !m->rx_buf || !m->spi_lock || !m->op_lock || !m->tx_lock) {
     ESP_LOGE(TAG, "no mem for buffers");
     goto err;
   }
