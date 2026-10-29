@@ -350,6 +350,7 @@ All endpoints are served on the management IP (or `192.168.4.1` in provisioning 
 | `wifi_band` | 0 prefer 5 GHz, 1 5 GHz only, 2 2.4 GHz only, 3 strongest signal (ESP32-C5 target; `band5g` in `GET` says whether the hardware has 5 GHz) |
 | `thr_off` | 0 = temperature throttle LAN → Wi-Fi on (default), 1 = off. Live |
 | `e2w_max_mbit` | Fixed LAN → Wi-Fi limit in Mbit/s, 0 = none (default). Live |
+| `thr_temp_c` | Chip temperature in °C at which the throttle starts, 0 = default (79). ~90 with a separate 3.3 V supply. Live |
 
 Saving applies TX power and retries immediately; watchdog and roaming settings are read live; everything else takes effect after a reboot.
 
@@ -453,8 +454,8 @@ Home Assistant creates one device with sensors for signal strength, Wi-Fi channe
   | 38 Mbit/s **Wi-Fi → LAN** (download) | stable for 3 min |
 
   Reset reason power-on (sometimes panic) with RTC memory lost, never brownout, no core dump: the regulator gives up, not the firmware. The time to reset shrinks with load and when already warm — heat in the regulator, which heats far faster than the ESP32-C5 itself (the chip read 67 °C at a reset under heavy load and 83–84 °C under moderate load). Downloads are unaffected because the bridge then mostly *receives* over Wi-Fi and only transmits small TCP ACKs. Lower TX power (down to 8.5 dBm) does not help: what matters is how long the transmitter is on. Two things follow:
-  - **Hardware fix:** feed the W5500 from its own 3.3 V regulator (5 V in, common GND), or the whole board from a stronger 3.3 V supply.
-  - **Until then, the firmware protects itself:** `e2w_max_mbit` caps LAN → Wi-Fi (12 is the measured safe value on this hardware), and the temperature throttle (`thr_off` = 0, default) lowers the cap further in steps while the chip runs above 79 °C and lifts it again below 76 °C. Every change is logged (`[THR ] Ethernet->Wi-Fi limited to … kbit/s`), the portal shows the chip temperature and the limit in force. The temperature alone reacts too late at high rates, hence the fixed cap. Verified: 30 Mbit/s offered for 3 min with a 12 Mbit/s cap — no reset; the throttle held the chip at 78 °C at 7.9 Mbit/s and returned to 12 once it cooled.
+  - **Hardware fix — verified:** feed the board from an external 3.3 V DC/DC buck instead of the module's LDO (tested: buck mounted directly at the pins, ~3 mm to the board, 10 µF ceramic at its output, ≥ 400 kHz switching). Afterwards: a ramp to 40 Mbit/s LAN → Wi-Fi without a reset (39.5 Mbit/s forwarded), **5 min at 30 Mbit/s without a reset or drop**, `networkQuality` 31.8 up / 32.5 down Mbit/s, 80 MHz SPI unaffected. The chip idles ~15 °C cooler (51 instead of 65–67 °C) and settles at ~81 °C under sustained full load — normal for the chip, so raise `thr_temp_c` to ~90 and set `e2w_max_mbit` to 0 on such a board.
+  - **On the unmodified module, the firmware protects itself:** `e2w_max_mbit` caps LAN → Wi-Fi (12 is the measured safe value on this hardware), and the temperature throttle (`thr_off` = 0, default) lowers the cap further in steps while the chip runs at or above `thr_temp_c` (default 79 °C) and lifts it again once it is 3 °C cooler. Every change is logged (`[THR ] Ethernet->Wi-Fi limited to … kbit/s`), the portal shows the chip temperature and the limit in force. The temperature alone reacts too late at high rates, hence the fixed cap. Verified: 30 Mbit/s offered for 3 min with a 12 Mbit/s cap — no reset; the throttle held the chip at 78 °C at 7.9 Mbit/s and returned to 12 once it cooled.
   - A new firmware image confirms itself only after 30 s of network reachability; a supply reset before that rolls it back. Flash with the LAN side idle.
 - **Console and flashing over the USB-C port** (USB-Serial/JTAG, `/dev/cu.usbmodem*`). On macOS the port only delivers output while the host asserts DTR. esptool's automatic reset into download mode does not work on this board: it fails with "No serial data received" and leaves the board hung until it is power-cycled. Flash the first time with BOOT held while plugging in USB, then use OTA.
 
@@ -563,7 +564,7 @@ The single stream is limited by the camera's web server. Later, with the RX stal
 | 3 min sustained HTTP download | **36.5 Mbit/s** average, 38 peak | — |
 | Laptop's own Wi-Fi, same spot | 71.8 Mbit/s | 87.1 Mbit/s |
 
-¹ Short tests only: sustained uploads above ~12 Mbit/s reset this hardware (see *Power supply limit* in the hardware section).
+¹ Short tests only: sustained uploads above ~12 Mbit/s reset the unmodified module (see *Power supply limit* in the hardware section). With an external 3.3 V buck: `networkQuality` 31.8 up / 32.5 down, web 32.7 down / 18.7 up, and 30 Mbit/s sustained for 5 min.
 
 The download is limited by the SPI path: ~205 µs of SPI per full frame at 80 MHz, 151 µs of it payload. The W5500's 16 KB TX + 16 KB RX buffers are already all on socket 0 (the only one that does MACRAW), received frames are already fetched 9–16 per SPI burst, and the fixed-length (FDM) mode would be slower than the variable-length bursts used — there is little left on the W5500 side.
 
