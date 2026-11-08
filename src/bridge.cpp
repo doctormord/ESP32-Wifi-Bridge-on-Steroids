@@ -1637,12 +1637,9 @@ bool bridge_wifi_start(void) {
    * mode the single-band APIs esp_wifi_set_protocol/_bandwidth return
    * ESP_ERR_NOT_SUPPORTED, hence the plural variants. The 802.11b switch only
    * concerns 2.4 GHz; 5 GHz has no b rates. */
-  /* "Only" settings are enforced by the driver, so neither its own scans nor
-   * a reconnect can ever end up on the other band. */
-  const uint8_t band = band_setting();
-  esp_wifi_set_band_mode(band == WIFI_BAND_ONLY_5G ? WIFI_BAND_MODE_5G_ONLY :
-                         band == WIFI_BAND_ONLY_2G ? WIFI_BAND_MODE_2G_ONLY :
-                                                     WIFI_BAND_MODE_AUTO);
+  /* Protocols and bandwidths are set here, while the driver is still in its
+   * default auto band mode, so both bands get them; the band mode itself is
+   * set after esp_wifi_start() (see there). */
   wifi_protocols_t protos = {};
   protos.ghz_2g = g_cfg.no_11b
       ? (WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AX)
@@ -1664,8 +1661,9 @@ bool bridge_wifi_start(void) {
    * for coexistence reasons. Without AP support it silently stays at HT20,
    * which is not an error. */
 #if CONFIG_SOC_WIFI_SUPPORT_5G
-  /* The HT40 switch applies to both bands. On 5 GHz 40 MHz is the norm, as
-   * there is no 2.4 GHz coexistence restriction. */
+  /* The HT40 switch applies to both bands. While 11ax/11ac are enabled the
+   * driver only does 20 MHz (see esp_wifi_set_bandwidths()), so in practice
+   * HT40 only takes effect on an AP that ends up connected with 11n. */
   wifi_bandwidths_t bws = {};
   bws.ghz_2g = g_cfg.ht40 ? WIFI_BW_HT40 : WIFI_BW_HT20;
   bws.ghz_5g = g_cfg.ht40 ? WIFI_BW_HT40 : WIFI_BW_HT20;
@@ -1706,6 +1704,21 @@ bool bridge_wifi_start(void) {
     return false;
   }
   ESP_ERROR_CHECK(esp_wifi_start());
+
+#if CONFIG_SOC_WIFI_SUPPORT_5G
+  /* Band setting: the "only" settings are enforced by the driver, so neither
+   * its own scans nor a reconnect without a BSSID binding can end up on the
+   * other band. Needs a started driver - before esp_wifi_start() the call
+   * fails with ESP_ERR_WIFI_NOT_STARTED and the driver stays in auto band
+   * mode, which only our own scan filter (ap_allowed()) would then cover. */
+  {
+    const uint8_t band = band_setting();
+    esp_err_t bm = esp_wifi_set_band_mode(
+        band == WIFI_BAND_ONLY_5G ? WIFI_BAND_MODE_5G_ONLY :
+        band == WIFI_BAND_ONLY_2G ? WIFI_BAND_MODE_2G_ONLY : WIFI_BAND_MODE_AUTO);
+    if (bm != ESP_OK) printf("[WIFI] set_band_mode: %s\n", esp_err_to_name(bm));
+  }
+#endif
 
   /* Needs a started driver, like the TX power below. Purely diagnostic, so
    * a failure is only logged. */
