@@ -1885,8 +1885,10 @@ static esp_err_t h_eth_reset(httpd_req_t *r) {
 }
 
 /* GET /api/scan - blocking Wi-Fi scan, returns up to 20 networks as
- * [{"ssid":..,"rssi":..}]. Hidden networks are skipped. Counts as portal
- * activity. */
+ * [{"ssid":..,"rssi":..,"bssid":..,"ch":..}]. Hidden networks are skipped.
+ * BSSID and channel tell several APs of one SSID (mesh nodes) apart, e.g.
+ * to see which one the bridge is on (/api/status "bssid") and whether
+ * roaming has a better candidate. Counts as portal activity. */
 static esp_err_t h_scan(httpd_req_t *r) {
   s_last_activity_ms = millis();
   wifi_scan_config_t sc = {};
@@ -1912,14 +1914,18 @@ static esp_err_t h_scan(httpd_req_t *r) {
   httpd_resp_sendstr_chunk(r, "[");
   bool first = true;
   for (uint16_t i = 0; i < n; i++) {
-    char esc[80], item[128];
+    char esc[80], item[176];
     json_escape((const char *)recs[i].ssid, esc, sizeof(esc));
     if (!esc[0]) continue;
     /* Tie the comma to the entry actually emitted, not to i - otherwise
      * "[,{...}]" results as soon as the first hit is skipped, and the portal
      * can no longer parse the list. */
-    snprintf(item, sizeof(item), "%s{\"ssid\":\"%s\",\"rssi\":%d}",
-             first ? "" : ",", esc, (int)recs[i].rssi);
+    const uint8_t *b = recs[i].bssid;
+    snprintf(item, sizeof(item),
+             "%s{\"ssid\":\"%s\",\"rssi\":%d,"
+             "\"bssid\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"ch\":%u}",
+             first ? "" : ",", esc, (int)recs[i].rssi,
+             b[0], b[1], b[2], b[3], b[4], b[5], (unsigned)recs[i].primary);
     first = false;
     httpd_resp_sendstr_chunk(r, item);
   }

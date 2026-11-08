@@ -3339,10 +3339,23 @@ static void roam_tick(void) {
   const bool weak = g_cfg.roam_enable && ap.rssi < threshold;
   if (!want_5g && !weak) return;   /* nothing to look for - don't even scan */
 
+  /* Every scan is logged with its outcome (at most once per roam_check_s),
+   * so "why didn't it switch?" can be answered from the console log. */
   wifi_ap_record_t cand;
-  if (!roam_scan_best(ap.ssid, ap.bssid, &cand)) return;
+  if (!roam_scan_best(ap.ssid, ap.bssid, &cand)) {
+    printf("[ROAM] Current %02x:%02x:%02x:%02x:%02x:%02x %d dBm - no other AP of this SSID visible\n",
+           ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5],
+           (int)ap.rssi);
+    return;
+  }
 
   const uint8_t margin = g_cfg.roam_margin_db ? g_cfg.roam_margin_db : ROAM_MARGIN_DB_DEF;
+  printf("[ROAM] Current %02x:%02x:%02x:%02x:%02x:%02x %d dBm, best other "
+         "%02x:%02x:%02x:%02x:%02x:%02x %d dBm channel %u (margin %u dB)\n",
+         ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5],
+         (int)ap.rssi, cand.bssid[0], cand.bssid[1], cand.bssid[2], cand.bssid[3],
+         cand.bssid[4], cand.bssid[5], (int)cand.rssi, (unsigned)cand.primary,
+         (unsigned)margin);
   if (want_5g && ap_is_5g(&cand) && cand.rssi >= BAND_5G_MIN_RSSI) {
     printf("[ROAM] On 2.4 GHz (%d dBm), 5 GHz AP with %d dBm on channel %u - switching\n",
            (int)ap.rssi, (int)cand.rssi, (unsigned)cand.primary);
